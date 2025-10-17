@@ -559,14 +559,8 @@ public:
     viskoresdiy::load(bb, divisor);
     viskoresdiy::load(bb, buffer);
 
-    obj = viskores::cont::ArrayHandleStride<T>(buffer, numValues, stride, offset, modulo, divisor);
+    obj = viskores::cont::ArrayHandleStride<T>(buffer, stride, offset, modulo, divisor);
   }
-};
-
-template <typename ValueType>
-struct Serialization<viskores::cont::ArrayHandle<ValueType, viskores::cont::StorageTagStride>>
-  : Serialization<viskores::cont::ArrayHandleStride<ValueType>>
-{
 };
 
 } // namespace diy
