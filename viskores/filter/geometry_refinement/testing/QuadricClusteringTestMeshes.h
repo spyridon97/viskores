@@ -296,6 +296,271 @@ inline Mesh Torus(double major, double minor, int nu, int nv)
   return mesh;
 }
 
+inline Vec3 Centroid(const Mesh& mesh, const viskores::Id3& t)
+{
+  const Vec3 s = (mesh.Points[static_cast<std::size_t>(t[0])] + mesh.Points[static_cast<std::size_t>(t[1])]) +
+    mesh.Points[static_cast<std::size_t>(t[2])];
+  return Vec3(s[0] / 3, s[1] / 3, s[2] / 3);
+}
+
+/// Removes the triangles for which `remove` holds, and the points no triangle uses.
+inline Mesh RemoveTriangles(const Mesh& mesh, const std::function<bool(const viskores::Id3&)>& remove)
+{
+  std::vector<viskores::Id3> kept;
+  for (const auto& t : mesh.Triangles)
+  {
+    if (!remove(t))
+    {
+      kept.push_back(t);
+    }
+  }
+  std::vector<viskores::Id> remap(mesh.Points.size(), -1);
+  for (const auto& t : kept)
+  {
+    for (int c = 0; c < 3; ++c)
+    {
+      remap[static_cast<std::size_t>(t[c])] = 0;
+    }
+  }
+  Mesh result;
+  for (std::size_t v = 0; v < mesh.Points.size(); ++v)
+  {
+    if (remap[v] == 0)
+    {
+      remap[v] = static_cast<viskores::Id>(result.Points.size());
+      result.Points.push_back(mesh.Points[v]);
+    }
+  }
+  for (const auto& t : kept)
+  {
+    result.Triangles.push_back({ remap[static_cast<std::size_t>(t[0])],
+                                 remap[static_cast<std::size_t>(t[1])],
+                                 remap[static_cast<std::size_t>(t[2])] });
+  }
+  return result;
+}
+
+/// The open meshes of the reference: a sphere without a cap (a disk), without two caps (an
+/// annulus), and a voxel plate of genus two with an opening in its top face.
+inline Mesh Disk()
+{
+  const Mesh sphere = Icosphere(3);
+  return RemoveTriangles(sphere, [&](const viskores::Id3& t) { return Centroid(sphere, t)[2] > 0.6; });
+}
+
+inline Mesh Annulus()
+{
+  const Mesh sphere = Icosphere(3);
+  return RemoveTriangles(sphere,
+                         [&](const viskores::Id3& t)
+                         { return std::abs(Centroid(sphere, t)[2]) > 0.6; });
+}
+
+/// The torus (1, 0.35, 32, 14) of the reference with one or two holes: the triangles at the
+/// vertices of angle `|phi| < 0.3` with `z > 0.15`, and for the second hole of angle
+/// `|phi - 2| < 0.3` with `z < -0.15`, removed.
+inline Mesh TorusWithHoles(int holes)
+{
+  const Mesh torus = Torus(1.0, 0.35, 32, 14);
+  std::vector<bool> inHole(torus.Points.size());
+  for (std::size_t v = 0; v < torus.Points.size(); ++v)
+  {
+    const Vec3& p = torus.Points[v];
+    const double phi = std::atan2(p[1], p[0]);
+    inHole[v] = (std::abs(phi) < 0.3 && p[2] > 0.15) ||
+      (holes > 1 && std::abs(phi - 2.0) < 0.3 && p[2] < -0.15);
+  }
+  return RemoveTriangles(torus,
+                         [&](const viskores::Id3& t)
+                         {
+                           return inHole[static_cast<std::size_t>(t[0])] ||
+                             inHole[static_cast<std::size_t>(t[1])] ||
+                             inHole[static_cast<std::size_t>(t[2])];
+                         });
+}
+
+inline Mesh Genus2PlateWithOpening()
+{
+  const Mesh plate = VoxelSolid(PlateWithHoles(2), 1.0);
+  double zMax = -1e300, xMin = 1e300;
+  for (const auto& p : plate.Points)
+  {
+    zMax = std::max(zMax, p[2]);
+    xMin = std::min(xMin, p[0]);
+  }
+  return RemoveTriangles(plate,
+                         [&](const viskores::Id3& t)
+                         {
+                           const Vec3 c = Centroid(plate, t);
+                           return std::abs(c[2] - zMax) < 1e-9 && c[0] < xMin + 3.5;
+                         });
+}
+
+/// Appends the surface of the box `[lo, hi]` with an `n` by `n` grid on every face, outward, to
+/// `mesh`, sharing the points already in `index`, as `_box` of proofs/lib/nonmanifold.py.
+inline void AppendBox(const Vec3& lo,
+                      const Vec3& hi,
+                      int n,
+                      Mesh& mesh,
+                      std::map<std::array<double, 3>, viskores::Id>& index)
+{
+  auto vid = [&](const Vec3& p)
+  {
+    const std::array<double, 3> key = { p[0], p[1], p[2] };
+    const auto found = index.find(key);
+    if (found != index.end())
+    {
+      return found->second;
+    }
+    const viskores::Id id = static_cast<viskores::Id>(mesh.Points.size());
+    index.emplace(key, id);
+    mesh.Points.push_back(p);
+    return id;
+  };
+  for (int ax = 0; ax < 3; ++ax)
+  {
+    const int u = (ax + 1) % 3, w = (ax + 2) % 3;
+    for (int side = 0; side < 2; ++side)
+    {
+      std::vector<std::vector<viskores::Id>> g(static_cast<std::size_t>(n + 1),
+                                               std::vector<viskores::Id>(static_cast<std::size_t>(n + 1)));
+      for (int i = 0; i <= n; ++i)
+      {
+        for (int j = 0; j <= n; ++j)
+        {
+          Vec3 p = lo;
+          p[ax] = side ? hi[ax] : lo[ax];
+          p[u] = lo[u] + (hi[u] - lo[u]) * i / n;
+          p[w] = lo[w] + (hi[w] - lo[w]) * j / n;
+          g[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] = vid(p);
+        }
+      }
+      for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i)
+      {
+        for (std::size_t j = 0; j < static_cast<std::size_t>(n); ++j)
+        {
+          const viskores::Id a = g[i][j], b = g[i + 1][j], c = g[i + 1][j + 1], d = g[i][j + 1];
+          if (side)
+          {
+            mesh.Triangles.push_back({ a, b, c });
+            mesh.Triangles.push_back({ a, c, d });
+          }
+          else
+          {
+            mesh.Triangles.push_back({ a, c, b });
+            mesh.Triangles.push_back({ a, d, c });
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Two boxes that touch along one edge, every segment of which lies in four triangles: an
+/// embedded complex that is not a surface (proofs/lib/nonmanifold.boxes_sharing_edge).
+inline Mesh BoxesSharingAnEdge(int n = 5)
+{
+  Mesh mesh;
+  std::map<std::array<double, 3>, viskores::Id> index;
+  AppendBox(Vec3(0, 0, 0), Vec3(1, 1, 1), n, mesh, index);
+  AppendBox(Vec3(1, 1, 0), Vec3(2, 2, 1), n, mesh, index);
+  return mesh;
+}
+
+/// A plate `[0, L] x [0, W]` in the plane `z = 0` and a fin `[0, L] x [0, H]` in the plane
+/// `y = W / 2`, attached along the line `y = W / 2`: three sheets meet along `nx` edges of that
+/// line, a long straight singular curve (proofs/lib/arcs.t_joint).
+inline Mesh PlateWithFin(double length = 4.0,
+                         double width = 1.0,
+                         double height = 0.5,
+                         int nx = 40,
+                         int ny = 10,
+                         int nz = 5)
+{
+  Mesh mesh;
+  std::map<std::array<double, 3>, viskores::Id> index;
+  auto vid = [&](const Vec3& p)
+  {
+    const std::array<double, 3> key = { p[0], p[1], p[2] };
+    const auto found = index.find(key);
+    if (found != index.end())
+    {
+      return found->second;
+    }
+    const viskores::Id id = static_cast<viskores::Id>(mesh.Points.size());
+    index.emplace(key, id);
+    mesh.Points.push_back(p);
+    return id;
+  };
+  auto grid = [&](const Vec3& origin, const Vec3& du, const Vec3& dv, int nu, int nv)
+  {
+    std::vector<std::vector<viskores::Id>> ids(static_cast<std::size_t>(nu + 1));
+    for (int i = 0; i <= nu; ++i)
+    {
+      for (int j = 0; j <= nv; ++j)
+      {
+        Vec3 p;
+        for (int a = 0; a < 3; ++a)
+        {
+          p[a] = (origin[a] + (i * du[a]) / nu) + (j * dv[a]) / nv;
+        }
+        ids[static_cast<std::size_t>(i)].push_back(vid(p));
+      }
+    }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(nu); ++i)
+    {
+      for (std::size_t j = 0; j < static_cast<std::size_t>(nv); ++j)
+      {
+        const viskores::Id a = ids[i][j], b = ids[i + 1][j], c = ids[i + 1][j + 1], d = ids[i][j + 1];
+        mesh.Triangles.push_back({ a, b, c });
+        mesh.Triangles.push_back({ a, c, d });
+      }
+    }
+  };
+  grid(Vec3(0, 0, 0), Vec3(length, 0, 0), Vec3(0, width, 0), nx, ny);
+  grid(Vec3(0, width / 2, 0), Vec3(length, 0, 0), Vec3(0, 0, height), nx, nz);
+  return mesh;
+}
+
+/// Two icospheres whose centres are half a radius apart: a closed surface whose components
+/// cross each other, so not embedded.
+inline Mesh OverlappingIcospheres(int level)
+{
+  Mesh mesh = Icosphere(level);
+  const Mesh other = Icosphere(level);
+  const viskores::Id offset = static_cast<viskores::Id>(mesh.Points.size());
+  for (const Vec3& p : other.Points)
+  {
+    mesh.Points.push_back(p + Vec3(0.5, 0, 0));
+  }
+  for (const auto& t : other.Triangles)
+  {
+    mesh.Triangles.push_back({ t[0] + offset, t[1] + offset, t[2] + offset });
+  }
+  return mesh;
+}
+
+/// An icosphere with two more components away from it, which no merge can reduce: a small
+/// tetrahedron and a single triangle.
+inline Mesh IcosphereWithSmallComponents(int level)
+{
+  Mesh mesh = Icosphere(level);
+  const viskores::Id tetrahedron = static_cast<viskores::Id>(mesh.Points.size());
+  mesh.Points.insert(mesh.Points.end(),
+                     { Vec3(3, 0, 0), Vec3(3.1, 0, 0), Vec3(3, 0.1, 0), Vec3(3, 0, 0.1) });
+  for (const auto& t : { viskores::Id3(0, 2, 1),
+                         viskores::Id3(0, 1, 3),
+                         viskores::Id3(0, 3, 2),
+                         viskores::Id3(1, 2, 3) })
+  {
+    mesh.Triangles.push_back({ t[0] + tetrahedron, t[1] + tetrahedron, t[2] + tetrahedron });
+  }
+  const viskores::Id triangle = static_cast<viskores::Id>(mesh.Points.size());
+  mesh.Points.insert(mesh.Points.end(), { Vec3(0, 3, 0), Vec3(0.1, 3, 0), Vec3(0, 3.1, 0) });
+  mesh.Triangles.push_back({ triangle, triangle + 1, triangle + 2 });
+  return mesh;
+}
+
 /// The number of connected components of every cluster, by union-find over the input edges.
 inline std::vector<int> ComponentsPerLabel(const Mesh& mesh,
                                            const std::vector<viskores::Id>& labels,
@@ -334,6 +599,472 @@ inline std::vector<int> ComponentsPerLabel(const Mesh& mesh,
     counts.push_back(static_cast<int>(r.size()));
   }
   return counts;
+}
+
+/// Undirected edges of a triangle list, with the number of triangles of each.
+inline std::map<std::pair<viskores::Id, viskores::Id>, int> EdgeCounts(
+  const std::vector<viskores::Id3>& triangles)
+{
+  std::map<std::pair<viskores::Id, viskores::Id>, int> counts;
+  for (const auto& t : triangles)
+  {
+    for (int s = 0; s < 3; ++s)
+    {
+      const viskores::Id a = t[s], b = t[(s + 1) % 3];
+      ++counts[std::make_pair(std::min(a, b), std::max(a, b))];
+    }
+  }
+  return counts;
+}
+
+/// The number of boundary loops: connected components of the graph of boundary edges.
+inline int BoundaryLoops(const std::vector<viskores::Id3>& triangles)
+{
+  std::map<viskores::Id, std::vector<viskores::Id>> adjacency;
+  for (const auto& e : EdgeCounts(triangles))
+  {
+    if (e.second == 1)
+    {
+      adjacency[e.first.first].push_back(e.first.second);
+      adjacency[e.first.second].push_back(e.first.first);
+    }
+  }
+  std::set<viskores::Id> seen;
+  int loops = 0;
+  for (const auto& entry : adjacency)
+  {
+    if (seen.count(entry.first))
+    {
+      continue;
+    }
+    ++loops;
+    std::vector<viskores::Id> stack = { entry.first };
+    seen.insert(entry.first);
+    while (!stack.empty())
+    {
+      const viskores::Id x = stack.back();
+      stack.pop_back();
+      for (viskores::Id y : adjacency[x])
+      {
+        if (seen.insert(y).second)
+        {
+          stack.push_back(y);
+        }
+      }
+    }
+  }
+  return loops;
+}
+
+inline viskores::Id EulerCharacteristic(viskores::Id numVertices,
+                                        const std::vector<viskores::Id3>& triangles)
+{
+  return numVertices - static_cast<viskores::Id>(EdgeCounts(triangles).size()) +
+    static_cast<viskores::Id>(triangles.size());
+}
+
+/// The data a homeomorphism fixing the vertices must preserve, as `singular_structure` of
+/// proofs/lib/nonmanifold.py: the edges in three or more triangles, and the number of fans at
+/// every vertex, the triangles around it joined across its other edges.
+inline std::pair<std::set<std::pair<viskores::Id, viskores::Id>>, std::vector<int>> SingularStructure(
+  viskores::Id numVertices,
+  const std::vector<viskores::Id3>& triangles)
+{
+  std::set<std::pair<viskores::Id, viskores::Id>> singular;
+  for (const auto& e : EdgeCounts(triangles))
+  {
+    if (e.second >= 3)
+    {
+      singular.insert(e.first);
+    }
+  }
+  std::vector<int> fans(static_cast<std::size_t>(numVertices), 0);
+  std::vector<std::vector<std::size_t>> around(static_cast<std::size_t>(numVertices));
+  for (std::size_t t = 0; t < triangles.size(); ++t)
+  {
+    for (int k = 0; k < 3; ++k)
+    {
+      around[static_cast<std::size_t>(triangles[t][k])].push_back(t);
+    }
+  }
+  for (viskores::Id v = 0; v < numVertices; ++v)
+  {
+    const auto& ts = around[static_cast<std::size_t>(v)];
+    std::vector<std::size_t> parent(ts.size());
+    for (std::size_t i = 0; i < ts.size(); ++i)
+    {
+      parent[i] = i;
+    }
+    std::function<std::size_t(std::size_t)> find = [&](std::size_t x)
+    { return parent[x] == x ? x : parent[x] = find(parent[x]); };
+    for (std::size_t i = 0; i < ts.size(); ++i)
+    {
+      for (std::size_t j = i + 1; j < ts.size(); ++j)
+      {
+        // Joined across an edge at v that is not singular.
+        for (int a = 0; a < 3; ++a)
+        {
+          const viskores::Id x = triangles[ts[i]][a];
+          bool shared = false;
+          for (int b = 0; b < 3; ++b)
+          {
+            shared = shared || triangles[ts[j]][b] == x;
+          }
+          if (x != v && shared && !singular.count(std::make_pair(std::min(v, x), std::max(v, x))))
+          {
+            parent[find(i)] = find(j);
+          }
+        }
+      }
+    }
+    for (std::size_t i = 0; i < ts.size(); ++i)
+    {
+      fans[static_cast<std::size_t>(v)] += (find(i) == i) ? 1 : 0;
+    }
+  }
+  return std::make_pair(singular, fans);
+}
+
+/// Checks that `triangles` on `numVertices` vertices form a compact surface, consistently
+/// oriented: every edge in one or two triangles, in two once in each direction, and the
+/// triangles around every vertex a single cycle or a single path. Returns an empty string or
+/// the first problem found.
+inline std::string CheckSurface(viskores::Id numVertices, const std::vector<viskores::Id3>& triangles)
+{
+  std::set<std::pair<viskores::Id, viskores::Id>> directed;
+  std::vector<std::map<viskores::Id, viskores::Id>> successor(static_cast<std::size_t>(numVertices));
+  for (const auto& t : triangles)
+  {
+    for (int s = 0; s < 3; ++s)
+    {
+      if (t[s] < 0 || t[s] >= numVertices)
+      {
+        return "a triangle has an invalid vertex";
+      }
+      if (!directed.insert(std::make_pair(t[s], t[(s + 1) % 3])).second)
+      {
+        return "a directed edge appears twice";
+      }
+      auto& succ = successor[static_cast<std::size_t>(t[s])];
+      if (succ.count(t[(s + 1) % 3]))
+      {
+        return "a vertex link branches";
+      }
+      succ[t[(s + 1) % 3]] = t[(s + 2) % 3];
+    }
+  }
+  for (const auto& e : EdgeCounts(triangles))
+  {
+    if (e.second > 2)
+    {
+      return "an edge lies in more than two triangles";
+    }
+  }
+  for (viskores::Id v = 0; v < numVertices; ++v)
+  {
+    const auto& succ = successor[static_cast<std::size_t>(v)];
+    if (succ.empty())
+    {
+      return "a vertex lies in no triangle";
+    }
+    std::set<viskores::Id> targets;
+    for (const auto& p : succ)
+    {
+      targets.insert(p.second);
+    }
+    std::vector<viskores::Id> heads;
+    for (const auto& p : succ)
+    {
+      if (!targets.count(p.first))
+      {
+        heads.push_back(p.first);
+      }
+    }
+    if (heads.size() > 1)
+    {
+      return "a vertex is pinched";
+    }
+    viskores::Id current = heads.empty() ? succ.begin()->first : heads[0];
+    const viskores::Id start = current;
+    std::size_t steps = 0;
+    while (succ.count(current))
+    {
+      current = succ.at(current);
+      ++steps;
+      if (current == start || steps > succ.size())
+      {
+        break;
+      }
+    }
+    if (steps != succ.size())
+    {
+      return "a vertex link is not a single cycle or path";
+    }
+  }
+  return "";
+}
+
+/// The triangles of `K/ij`: `j` identified with `i`, degenerate triangles dropped, as sorted
+/// triples without repetition.
+inline std::vector<viskores::Id3> Contract(const std::vector<viskores::Id3>& triangles,
+                                           viskores::Id i,
+                                           viskores::Id j)
+{
+  std::set<std::array<viskores::Id, 3>> faces;
+  for (const auto& t : triangles)
+  {
+    std::array<viskores::Id, 3> f = { t[0] == j ? i : t[0], t[1] == j ? i : t[1], t[2] == j ? i : t[2] };
+    std::sort(f.begin(), f.end());
+    if (f[0] != f[1] && f[1] != f[2])
+    {
+      faces.insert(f);
+    }
+  }
+  std::vector<viskores::Id3> result;
+  for (const auto& f : faces)
+  {
+    result.push_back({ f[0], f[1], f[2] });
+  }
+  return result;
+}
+
+/// The type of an unoriented pure 2-complex, after surface_type of the reference: if every edge
+/// lies in one or two triangles, the link of every vertex is one cycle or one path, and the
+/// complex is connected and orientable, its Euler characteristic and number of boundary loops;
+/// otherwise (-1000, -1).
+inline std::pair<viskores::Id, int> SurfaceType(const std::vector<viskores::Id3>& input)
+{
+  const std::pair<viskores::Id, int> invalid(-1000, -1);
+  std::set<std::array<viskores::Id, 3>> unique;
+  for (const auto& t : input)
+  {
+    std::array<viskores::Id, 3> f = { t[0], t[1], t[2] };
+    std::sort(f.begin(), f.end());
+    if (f[0] == f[1] || f[1] == f[2])
+    {
+      return invalid;
+    }
+    unique.insert(f);
+  }
+  if (unique.empty())
+  {
+    return invalid;
+  }
+  std::vector<std::array<viskores::Id, 3>> faces(unique.begin(), unique.end());
+  std::map<std::pair<viskores::Id, viskores::Id>, std::vector<std::size_t>> edgeFaces;
+  std::map<viskores::Id, std::map<viskores::Id, std::vector<viskores::Id>>> links;
+  for (std::size_t f = 0; f < faces.size(); ++f)
+  {
+    const auto& t = faces[f];
+    for (int s = 0; s < 3; ++s)
+    {
+      const viskores::Id x = t[static_cast<std::size_t>(s)];
+      const viskores::Id y = t[static_cast<std::size_t>((s + 1) % 3)];
+      const viskores::Id z = t[static_cast<std::size_t>((s + 2) % 3)];
+      edgeFaces[std::make_pair(std::min(x, y), std::max(x, y))].push_back(f);
+      links[x][y].push_back(z);
+      links[x][z].push_back(y);
+    }
+  }
+  for (const auto& e : edgeFaces)
+  {
+    if (e.second.size() > 2)
+    {
+      return invalid;
+    }
+  }
+  for (const auto& link : links)
+  {
+    std::set<viskores::Id> seen;
+    std::vector<viskores::Id> stack = { link.second.begin()->first };
+    seen.insert(stack[0]);
+    for (const auto& n : link.second)
+    {
+      if (n.second.size() > 2)
+      {
+        return invalid;
+      }
+    }
+    while (!stack.empty())
+    {
+      const viskores::Id u = stack.back();
+      stack.pop_back();
+      for (viskores::Id w : link.second.at(u))
+      {
+        if (seen.insert(w).second)
+        {
+          stack.push_back(w);
+        }
+      }
+    }
+    if (seen.size() != link.second.size())
+    {
+      return invalid;
+    }
+  }
+  // Connected and orientable: propagate an orientation across shared edges.
+  std::vector<int> orientation(faces.size(), 0);
+  orientation[0] = 1;
+  std::vector<std::size_t> stack = { 0 };
+  auto directed = [&](std::size_t f, int o)
+  {
+    const auto& t = faces[f];
+    std::array<std::pair<viskores::Id, viskores::Id>, 3> d;
+    for (int s = 0; s < 3; ++s)
+    {
+      const viskores::Id a = t[static_cast<std::size_t>(s)], b = t[static_cast<std::size_t>((s + 1) % 3)];
+      d[static_cast<std::size_t>(s)] = (o == 1) ? std::make_pair(a, b) : std::make_pair(b, a);
+    }
+    return d;
+  };
+  while (!stack.empty())
+  {
+    const std::size_t f = stack.back();
+    stack.pop_back();
+    for (const auto& uw : directed(f, orientation[f]))
+    {
+      for (std::size_t g : edgeFaces[std::make_pair(std::min(uw.first, uw.second), std::max(uw.first, uw.second))])
+      {
+        if (g == f)
+        {
+          continue;
+        }
+        bool reversed = false;
+        for (const auto& d : directed(g, 1))
+        {
+          reversed = reversed || (d.first == uw.second && d.second == uw.first);
+        }
+        const int o = reversed ? 1 : -1;
+        if (orientation[g] == 0)
+        {
+          orientation[g] = o;
+          stack.push_back(g);
+        }
+        else if (orientation[g] != o)
+        {
+          return invalid;
+        }
+      }
+    }
+  }
+  for (int o : orientation)
+  {
+    if (o == 0)
+    {
+      return invalid;
+    }
+  }
+  std::vector<viskores::Id3> asTriangles;
+  for (const auto& f : faces)
+  {
+    asTriangles.push_back({ f[0], f[1], f[2] });
+  }
+  return std::make_pair(static_cast<viskores::Id>(links.size()) -
+                          static_cast<viskores::Id>(edgeFaces.size()) +
+                          static_cast<viskores::Id>(faces.size()),
+                        BoundaryLoops(asTriangles));
+}
+
+/// Distance from `p` to the triangle `abc`, after Ericson's closest point on a triangle.
+inline double PointTriangleDistance(const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c)
+{
+  auto dot = [](const Vec3& x, const Vec3& y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+  const Vec3 ab = b - a, ac = c - a, ap = p - a;
+  const double d1 = dot(ab, ap), d2 = dot(ac, ap);
+  if (d1 <= 0 && d2 <= 0)
+  {
+    return Norm(p - a);
+  }
+  const Vec3 bp = p - b;
+  const double d3 = dot(ab, bp), d4 = dot(ac, bp);
+  if (d3 >= 0 && d4 <= d3)
+  {
+    return Norm(p - b);
+  }
+  const double vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0)
+  {
+    return Norm(p - (a + (d1 / (d1 - d3)) * ab));
+  }
+  const Vec3 cp = p - c;
+  const double d5 = dot(ab, cp), d6 = dot(ac, cp);
+  if (d6 >= 0 && d5 <= d6)
+  {
+    return Norm(p - c);
+  }
+  const double vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0)
+  {
+    return Norm(p - (a + (d2 / (d2 - d6)) * ac));
+  }
+  const double va = d3 * d6 - d5 * d4;
+  if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0)
+  {
+    return Norm(p - (b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)));
+  }
+  const double denom = 1 / (va + vb + vc);
+  return Norm(p - (a + (vb * denom) * ab + (vc * denom) * ac));
+}
+
+/// Points on every triangle such that every point of it is within `spacing` of one of them.
+inline std::vector<Vec3> SampleTriangles(const std::vector<Vec3>& points,
+                                         const std::vector<viskores::Id3>& triangles,
+                                         double spacing)
+{
+  std::vector<Vec3> samples;
+  for (const auto& t : triangles)
+  {
+    const Vec3 a = points[static_cast<std::size_t>(t[0])];
+    const Vec3 b = points[static_cast<std::size_t>(t[1])];
+    const Vec3 c = points[static_cast<std::size_t>(t[2])];
+    const double longest = std::max({ Norm(b - a), Norm(c - b), Norm(a - c) });
+    const int m = std::max(1, static_cast<int>(std::ceil(longest / spacing)));
+    for (int i = 0; i <= m; ++i)
+    {
+      for (int j = 0; i + j <= m; ++j)
+      {
+        samples.push_back(a + (static_cast<double>(i) / m) * (b - a) +
+                          (static_cast<double>(j) / m) * (c - a));
+      }
+    }
+  }
+  return samples;
+}
+
+/// The sampled distance from the triangle mesh A to the triangle mesh B, by brute force: the
+/// largest distance from a sample of A to B.
+inline double SampledDistance(const std::vector<Vec3>& pointsA,
+                              const std::vector<viskores::Id3>& trianglesA,
+                              const std::vector<Vec3>& pointsB,
+                              const std::vector<viskores::Id3>& trianglesB,
+                              double spacing)
+{
+  double worst = 0;
+  for (const Vec3& p : SampleTriangles(pointsA, trianglesA, spacing))
+  {
+    double best = 1e300;
+    for (const auto& t : trianglesB)
+    {
+      best = std::min(best,
+                      PointTriangleDistance(p,
+                                            pointsB[static_cast<std::size_t>(t[0])],
+                                            pointsB[static_cast<std::size_t>(t[1])],
+                                            pointsB[static_cast<std::size_t>(t[2])]));
+    }
+    worst = std::max(worst, best);
+  }
+  return worst;
+}
+
+/// The sampled two-sided Hausdorff distance between two triangle meshes, by brute force.
+inline double SampledHausdorff(const std::vector<Vec3>& pointsA,
+                               const std::vector<viskores::Id3>& trianglesA,
+                               const std::vector<Vec3>& pointsB,
+                               const std::vector<viskores::Id3>& trianglesB,
+                               double spacing)
+{
+  return std::max(SampledDistance(pointsA, trianglesA, pointsB, trianglesB, spacing),
+                  SampledDistance(pointsB, trianglesB, pointsA, trianglesA, spacing));
 }
 
 } // namespace qcd_test

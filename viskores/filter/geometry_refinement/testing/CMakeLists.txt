@@ -11,6 +11,7 @@ set(unit_tests
   UnitTestConvertToPointCloud.cxx
   UnitTestExtrusionLinear.cxx
   UnitTestExtrusionRotational.cxx
+  UnitTestQuadricClusteringDecimationFilter.cxx
   UnitTestShrinkFilter.cxx
   UnitTestSplitSharpEdgesFilter.cxx
   UnitTestTetrahedralizeFilter.cxx
@@ -24,6 +25,7 @@ set(unit_tests_device
   UnitTestQuadricClusteringDecimationInitialization.cxx
   UnitTestQuadricClusteringDecimationPrecomputation.cxx
   UnitTestQuadricClusteringDecimationPredicates.cxx
+  UnitTestQuadricClusteringDecimationWorklet.cxx
   )
 
 set(libraries
