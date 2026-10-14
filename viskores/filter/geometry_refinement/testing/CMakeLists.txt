@@ -23,6 +23,7 @@ set(unit_tests_device
   UnitTestQuadricClusteringDecimationAssignment.cxx
   UnitTestQuadricClusteringDecimationInitialization.cxx
   UnitTestQuadricClusteringDecimationPrecomputation.cxx
+  UnitTestQuadricClusteringDecimationPredicates.cxx
   )
 
 set(libraries
