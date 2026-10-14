@@ -9,6 +9,8 @@
 
 set(headers
   Arithmetic.h
+  CurvatureSeeds.h
+  Initialization.h
   NonManifoldCut.h
   SurfaceMesh.h
   VertexQuadrics.h
