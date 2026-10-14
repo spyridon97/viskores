@@ -8,7 +8,10 @@
 
 
 set(headers
+  Arithmetic.h
   NonManifoldCut.h
+  SurfaceMesh.h
+  VertexQuadrics.h
   )
 
 #-----------------------------------------------------------------------------
