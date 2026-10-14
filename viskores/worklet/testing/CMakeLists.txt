@@ -14,6 +14,7 @@ set(headers
 set(unit_tests
   UnitTestAverageByKey.cxx
   UnitTestBoundingIntervalHierarchy.cxx
+  UnitTestBoundingVolumeHierarchy.cxx
   UnitTestCellDeepCopy.cxx
   UnitTestCosmoTools.cxx
   UnitTestDescriptiveStatistics.cxx
