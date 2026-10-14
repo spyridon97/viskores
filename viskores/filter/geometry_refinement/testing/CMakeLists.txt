@@ -20,6 +20,7 @@ set(unit_tests
   )
 
 set(unit_tests_device
+  UnitTestQuadricClusteringDecimationInitialization.cxx
   UnitTestQuadricClusteringDecimationPrecomputation.cxx
   )
 
