@@ -10,6 +10,7 @@
 set(headers
   Arithmetic.h
   Assignment.h
+  Clustering.h
   CurvatureSeeds.h
   Initialization.h
   NonManifoldCut.h
