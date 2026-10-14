@@ -11,6 +11,7 @@ set(geometry_refinement_headers
   ExtrusionAbstract.h
   ExtrusionLinear.h
   ExtrusionRotational.h
+  QuadricClusteringDecimation.h
   Shrink.h
   SplitSharpEdges.h
   Tetrahedralize.h
@@ -23,6 +24,7 @@ set(geometry_refinement_sources
   ConvertToPointCloud.cxx
   ExtrusionLinear.cxx
   ExtrusionRotational.cxx
+  QuadricClusteringDecimation.cxx
   Shrink.cxx
   SplitSharpEdges.cxx
   Tetrahedralize.cxx

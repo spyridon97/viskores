@@ -11,6 +11,7 @@ set(headers
   Extrusion.h
   ExtrusionLinear.h
   ExtrusionRotational.h
+  QuadricClusteringDecimation.h
   Shrink.h
   SplitSharpEdges.h
   Tetrahedralize.h

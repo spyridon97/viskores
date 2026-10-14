@@ -6,6 +6,7 @@ GROUPS
 DEPENDS
   viskores_filter_core
 PRIVATE_DEPENDS
+  viskores_filter_connected_components
   viskores_worklet
 TEST_DEPENDS
   viskores_filter_contour
