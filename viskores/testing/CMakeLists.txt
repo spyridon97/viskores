@@ -44,6 +44,7 @@ if(Viskores_ENABLE_TESTING)
   # Unit tests that have device-specific code to be tested
   set(unit_tests_device
     UnitTestAtomic.cxx
+    UnitTestExactPredicates.cxx
     UnitTestGeometry.cxx
     UnitTestLowerBound.cxx
     UnitTestMath.cxx
