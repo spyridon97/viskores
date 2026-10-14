@@ -19,6 +19,7 @@ set(headers
   VertexClustering.h
   )
 
+add_subdirectory(quadric_clustering)
 add_subdirectory(tetrahedralize)
 add_subdirectory(triangulate)
 
