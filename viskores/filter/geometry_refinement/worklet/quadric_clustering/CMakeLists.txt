@@ -13,6 +13,7 @@ set(headers
   Clustering.h
   CurvatureSeeds.h
   EmbeddingFlags.h
+  EnvelopeFlags.h
   ImproperPairs.h
   Initialization.h
   NonManifoldCut.h
