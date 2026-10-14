@@ -12,6 +12,8 @@ set(headers
   Assignment.h
   Clustering.h
   CurvatureSeeds.h
+  EmbeddingFlags.h
+  ImproperPairs.h
   Initialization.h
   NonManifoldCut.h
   SurfaceMesh.h
