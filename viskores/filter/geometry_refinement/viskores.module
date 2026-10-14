@@ -14,6 +14,7 @@ TEST_DEPENDS
   viskores_filter_vector_analysis
   viskores_io
   viskores_source
+  viskores_worklet
 TEST_OPTIONAL_DEPENDS
   viskores_rendering_testing
   viskores_rendering
