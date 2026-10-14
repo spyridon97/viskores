@@ -296,6 +296,46 @@ inline Mesh Torus(double major, double minor, int nu, int nv)
   return mesh;
 }
 
+/// The number of connected components of every cluster, by union-find over the input edges.
+inline std::vector<int> ComponentsPerLabel(const Mesh& mesh,
+                                           const std::vector<viskores::Id>& labels,
+                                           viskores::Id k)
+{
+  std::vector<viskores::Id> parent(mesh.Points.size());
+  std::iota(parent.begin(), parent.end(), 0);
+  std::function<viskores::Id(viskores::Id)> find = [&](viskores::Id x)
+  {
+    while (parent[static_cast<std::size_t>(x)] != x)
+    {
+      x = parent[static_cast<std::size_t>(x)] =
+        parent[static_cast<std::size_t>(parent[static_cast<std::size_t>(x)])];
+    }
+    return x;
+  };
+  for (const auto& t : mesh.Triangles)
+  {
+    for (int s = 0; s < 3; ++s)
+    {
+      const viskores::Id a = t[s], b = t[(s + 1) % 3];
+      if (labels[static_cast<std::size_t>(a)] == labels[static_cast<std::size_t>(b)])
+      {
+        parent[static_cast<std::size_t>(find(a))] = find(b);
+      }
+    }
+  }
+  std::vector<std::set<viskores::Id>> roots(static_cast<std::size_t>(k));
+  for (std::size_t v = 0; v < mesh.Points.size(); ++v)
+  {
+    roots[static_cast<std::size_t>(labels[v])].insert(find(static_cast<viskores::Id>(v)));
+  }
+  std::vector<int> counts;
+  for (const auto& r : roots)
+  {
+    counts.push_back(static_cast<int>(r.size()));
+  }
+  return counts;
+}
+
 } // namespace qcd_test
 
 #if defined(__clang__)
