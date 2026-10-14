@@ -18,6 +18,7 @@ set(headers
   Initialization.h
   IsotopyFlags.h
   NonManifoldCut.h
+  SingularCurves.h
   SurfaceMesh.h
   TopologyFlags.h
   VertexQuadrics.h
