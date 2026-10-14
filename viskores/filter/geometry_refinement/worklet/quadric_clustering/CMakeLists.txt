@@ -9,6 +9,7 @@
 
 set(headers
   Arithmetic.h
+  Assignment.h
   CurvatureSeeds.h
   Initialization.h
   NonManifoldCut.h
