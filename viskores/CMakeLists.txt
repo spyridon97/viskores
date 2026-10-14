@@ -27,6 +27,7 @@ set(headers
   CellTraits.h
   Deprecated.h
   ErrorCode.h
+  ExactPredicates.h
   Flags.h
   Geometry.h
   Hash.h
