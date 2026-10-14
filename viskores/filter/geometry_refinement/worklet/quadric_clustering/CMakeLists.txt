@@ -15,6 +15,7 @@ set(headers
   Initialization.h
   NonManifoldCut.h
   SurfaceMesh.h
+  TopologyFlags.h
   VertexQuadrics.h
   )
 
