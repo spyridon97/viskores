@@ -17,7 +17,9 @@ set(headers
   ImproperPairs.h
   Initialization.h
   IsotopyFlags.h
+  MergePhase.h
   NonManifoldCut.h
+  SegmentMerges.h
   SingularCurves.h
   SurfaceMesh.h
   TopologyFlags.h
