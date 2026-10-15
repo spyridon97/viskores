@@ -16,6 +16,7 @@ set(headers
   EnvelopeFlags.h
   ImproperPairs.h
   Initialization.h
+  IsotopyFlags.h
   NonManifoldCut.h
   SurfaceMesh.h
   TopologyFlags.h
