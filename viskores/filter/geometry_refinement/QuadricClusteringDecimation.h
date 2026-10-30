@@ -100,12 +100,17 @@ public:
     /// The output does not intersect itself; the input must not either. Requires `Topology`.
     /// Use it for meshing, simulation and 3D printing. It is the most expensive check after the
     /// error bound.
-    NoSelfIntersections = 1 << 3
+    NoSelfIntersections = 1 << 3,
+    /// Where three or more sheets of a non-manifold input meet along a curve, such as a fin on
+    /// a plate, the curve is decimated too, with every junction of curves kept in place.
+    /// Without it, those curves keep their input resolution. Requires `Topology`; it matters
+    /// only for inputs that are not surfaces.
+    SingularCurves = 1 << 4
   };
 
   /// @brief The guarantees of the output, as a combination of `Guarantee` bits.
   ///
-  /// The default is `Topology | TwoSidedError | NoSelfIntersections`. A
+  /// The default is `Topology | TwoSidedError | NoSelfIntersections | SingularCurves`. A
   /// combination that breaks a requirement of a bit is rejected when the filter runs.
   VISKORES_CONT void SetGuarantees(viskores::UInt32 guarantees) { this->Guarantees = guarantees; }
   /// @copydoc SetGuarantees
@@ -194,7 +199,7 @@ private:
 
   viskores::Float64 ErrorBound = 0;
   viskores::Id TargetNumberOfPoints = 0;
-  viskores::UInt32 Guarantees = Topology | TwoSidedError | NoSelfIntersections;
+  viskores::UInt32 Guarantees = Topology | TwoSidedError | NoSelfIntersections | SingularCurves;
   Initialization InitialClusters = Initialization::Curvature;
   viskores::Float64 Regularization = 0.02;
   viskores::Float64 FeatureAngle = 45;

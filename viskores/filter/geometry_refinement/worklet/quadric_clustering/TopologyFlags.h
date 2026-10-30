@@ -399,12 +399,15 @@ inline void FlagClusters(viskores::cont::ArrayHandle<viskores::Id>& listed,
 /// The topological flags (F2) and (F3) of Algorithm 4: (D0) per cluster, and the clusters with
 /// at least two vertices of the pairs violating (D1) and of the triples violating (D2), or with
 /// `d2ByCount` of the components violating it (Section 11). Sets the flags in `flags` and
-/// returns the violations found: for (D2), triples or components.
+/// returns the violations found: for (D2), triples or components. With `named`, also lists
+/// every label a violation names, of any size, with the triples of (D2) by sort, as
+/// `cbp_violations` of proofs/lib/topology.py.
 inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
                                     const viskores::cont::ArrayHandle<viskores::Id>& labels,
                                     const viskores::cont::ArrayHandle<viskores::Id>& sizes,
                                     viskores::cont::ArrayHandle<viskores::UInt8>& flags,
-                                    bool d2ByCount = false)
+                                    bool d2ByCount = false,
+                                    viskores::cont::ArrayHandle<viskores::Id>* named = nullptr)
 {
   using Algorithm = viskores::cont::Algorithm;
   viskores::cont::Invoker invoke;
@@ -451,14 +454,22 @@ inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
   ThreeLabelTriangles(mesh, labels, threeIndices, triples);
   report.NumberOfThreeLabelTriangles = triples.GetNumberOfValues();
   viskores::cont::ArrayHandle<viskores::Id> listed;
-  if (!d2ByCount && triples.GetNumberOfValues() > 0)
+  viskores::cont::ArrayHandle<viskores::Id> namedTriples;
+  if ((!d2ByCount || named) && triples.GetNumberOfValues() > 0)
   {
-    // By sort: the labels of the triples violating (D2), flagged.
+    // By sort: the labels of the triples violating (D2), flagged, or with `d2ByCount` only named.
     const viskores::cont::ArrayHandle<viskores::Id3> bad = detail::BadTriples(triples);
     viskores::cont::ArrayHandle<viskores::Id> badLabels;
     invoke(detail::TripleLabels{}, bad, viskores::cont::make_ArrayHandleGroupVec<3>(badLabels));
-    report.NumberOfD2 = bad.GetNumberOfValues();
-    listed = badLabels;
+    if (d2ByCount)
+    {
+      namedTriples = badLabels;
+    }
+    else
+    {
+      report.NumberOfD2 = bad.GetNumberOfValues();
+      listed = badLabels;
+    }
   }
   if (d2ByCount)
   {
@@ -516,6 +527,18 @@ inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
     Algorithm::CopySubRange(listed, 0, before, all, 0);
     Algorithm::CopySubRange(badLabels, 0, badLabels.GetNumberOfValues(), all, before);
     listed = all;
+  }
+  if (named)
+  {
+    // The clusters violating (D0), and the labels of the pairs and triples, of any size.
+    viskores::cont::ArrayHandle<viskores::Id> d0Labels;
+    Algorithm::CopyIf(viskores::cont::ArrayHandleIndex(k), d0, d0Labels);
+    const viskores::Id a = d0Labels.GetNumberOfValues(), b = listed.GetNumberOfValues(),
+                       c = namedTriples.GetNumberOfValues();
+    named->Allocate(a + b + c);
+    Algorithm::CopySubRange(d0Labels, 0, a, *named, 0);
+    Algorithm::CopySubRange(listed, 0, b, *named, a);
+    Algorithm::CopySubRange(namedTriples, 0, c, *named, a + b);
   }
   FlagClusters(listed, sizes, flags);
 

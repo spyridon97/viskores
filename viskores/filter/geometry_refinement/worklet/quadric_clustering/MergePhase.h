@@ -9,9 +9,11 @@
 #define viskores_worklet_quadric_clustering_MergePhase_h
 
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Clustering.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/CurveFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EmbeddingFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EnvelopeFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SingularCurves.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/VertexQuadrics.h>
 
@@ -97,8 +99,15 @@ struct MergeParameters
   /// glues the output for (F4), and the frozen copies; empty otherwise.
   viskores::cont::ArrayHandle<viskores::Id> Canonical;
   viskores::cont::ArrayHandle<viskores::UInt8> FrozenVertices;
-  /// The input vertex of every copy.
+  /// With the singular curves decimated (Proposition "Decimating the singular curves"): their
+  /// segments, which glue the output in place of `Canonical`, with (d') in place of (d) in the
+  /// full test, and the input vertex of every copy; null otherwise.
+  const SingularCurves* Curves = nullptr;
   viskores::cont::ArrayHandle<viskores::Id> Original;
+  /// With the curves decimated: the tolerance `eps_c` of the curve test (Fc) of Proposition
+  /// "curvetol", or 0 for none, and its subdivision depth.
+  Real CurveTolerance = 0;
+  viskores::IdComponent CurveDepth = 10;
 };
 
 struct MergeDiagnostics
@@ -113,6 +122,12 @@ struct MergeDiagnostics
   /// Local tests evaluated, and verdicts of earlier rounds reused instead.
   viskores::Id Evaluated = 0;
   viskores::Id Reused = 0;
+  /// With the singular curves decimated: the rounds of segment merges, and the candidates
+  /// tested.
+  viskores::Id SegmentRounds = 0;
+  viskores::Id SegmentCandidates = 0;
+  /// The rounds of segment merges that merged a candidate deferred as a culprit, tried alone.
+  viskores::Id SegmentRetried = 0;
   /// Wall-clock seconds: the local tests, and the full tests of the merged labellings.
   double SecondsLocalTests = 0;
   double SecondsFullTests = 0;
@@ -1840,10 +1855,16 @@ struct CandidatePair : viskores::worklet::WorkletMapField
 } // namespace detail
 
 /// The vertex of the glued output `K` of every label: the copies of every frozen vertex
-/// identified; empty for an input that is a surface.
+/// identified, or with the singular curves decimated, the pieces of every segment; empty for an
+/// input that is a surface.
 inline viskores::cont::ArrayHandle<viskores::Id> OutputGlue(const MergeParameters& parameters,
                                                             const Clustering& clusters)
 {
+  if (parameters.Curves)
+  {
+    return SegmentGlueMap(
+      *parameters.Curves, parameters.FrozenVertices, parameters.Original, clusters);
+  }
   return GlueMap(parameters.Canonical, clusters);
 }
 
@@ -2423,6 +2444,31 @@ inline void EvaluateMerges(const viskores::cont::ArrayHandle<viskores::Id2>& pai
 namespace detail
 {
 
+/// A vertex of a label of a region: `(candidate, vertex, label, new label)`.
+struct RegionVertex : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn item,
+                                WholeArrayIn itemOffsets,
+                                WholeArrayIn records,
+                                WholeArrayIn memberOffsets,
+                                WholeArrayIn members,
+                                FieldOut vertex);
+  using ExecutionSignature = _6(_1, _2, _3, _4, _5);
+
+  template <typename IdPortal, typename RecordPortal>
+  VISKORES_EXEC viskores::Vec<viskores::Id, 4> operator()(viskores::Id item,
+                                                          const IdPortal& itemOffsets,
+                                                          const RecordPortal& records,
+                                                          const IdPortal& memberOffsets,
+                                                          const IdPortal& members) const
+  {
+    const viskores::Id r = OwnerOf(itemOffsets, item);
+    const viskores::Id3 record = records.Get(r);
+    const viskores::Id v = members.Get(memberOffsets.Get(record[1]) + item - itemOffsets.Get(r));
+    return viskores::Vec<viskores::Id, 4>(record[0], v, record[1], record[2]);
+  }
+};
+
 struct ScatterAdmissible : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn rank, FieldIn admissible, WholeArrayInOut memo);
@@ -2510,9 +2556,29 @@ struct MergeInto : viskores::worklet::WorkletMapField
 
 } // namespace detail
 
+/// The placement step, and with the singular curves decimated, the generators of the vertices
+/// of `K` on the curves.
+inline void PlaceGlued(const SurfaceMesh& mesh,
+                       const VertexQuadrics& quadrics,
+                       const MergeParameters& parameters,
+                       Clustering& clusters)
+{
+  Place(mesh, quadrics.M, clusters);
+  if (parameters.Curves)
+  {
+    PlaceCurveGenerators(mesh,
+                         *parameters.Curves,
+                         parameters.FrozenVertices,
+                         parameters.Original,
+                         OutputGlue(parameters, clusters),
+                         clusters);
+  }
+}
+
 /// Merges the pairs `pairs` (each `(i, j)` merging `j` into `i`) and places the generators.
 inline Clustering ApplyMerges(const SurfaceMesh& mesh,
                               const VertexQuadrics& quadrics,
+                              const MergeParameters& parameters,
                               const Clustering& clusters,
                               const viskores::cont::ArrayHandle<viskores::Id2>& pairs)
 {
@@ -2522,7 +2588,7 @@ inline Clustering ApplyMerges(const SurfaceMesh& mesh,
   invoke(detail::MergeInto{}, pairs, map);
   Clustering merged;
   invoke(GatherValue{}, clusters.Labels, map, merged.Labels);
-  Place(mesh, quadrics.M, merged);
+  PlaceGlued(mesh, quadrics, parameters, merged);
   return merged;
 }
 
@@ -2761,7 +2827,7 @@ inline bool NewImproper(const SurfaceMesh& mesh,
 }
 
 /// Whether any flag in use fires on a placed labelling, evaluated in full: the discrete
-/// closed-ball property, the glue condition, (F0), (F4) and (F5). With `bases`,
+/// closed-ball property, the glue condition, (Fc), (F0), (F4) and (F5). With `bases`,
 /// (F5) tests only the triangles whose verdicts can differ from a base's
 /// (`MergeEnvelopeFlags`); with `verdicts`, its verdicts are stored there, for a caller that
 /// commits the labelling or keeps it as a base.
@@ -2790,12 +2856,36 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
     {
       return true;
     }
-    if (GlueFlags(mesh,
-                  clusters.Labels,
-                  parameters.FrozenVertices,
-                  parameters.Canonical,
-                  clusters.Sizes,
-                  flags) > 0)
+    if (parameters.Curves)
+    {
+      // (d'): any violation fires.
+      if (GlueViolations(mesh,
+                         clusters.Labels,
+                         parameters.Original,
+                         *parameters.Curves,
+                         OutputGlue(parameters, clusters))
+            .GetNumberOfValues() > 0)
+      {
+        return true;
+      }
+      // (Fc)
+      if (parameters.CurveTolerance > 0 &&
+          CurveTestFails(mesh,
+                         *parameters.Curves,
+                         parameters.Original,
+                         clusters,
+                         parameters.CurveTolerance,
+                         parameters.CurveDepth))
+      {
+        return true;
+      }
+    }
+    else if (GlueFlags(mesh,
+                       clusters.Labels,
+                       parameters.FrozenVertices,
+                       parameters.Canonical,
+                       clusters.Sizes,
+                       flags) > 0)
     {
       return true;
     }
@@ -2888,16 +2978,19 @@ struct FailingItems
 };
 
 /// The clusters that the flags in use flag on a placed labelling, as `flagged_clusters` of
-/// proofs/lib/vqc.py: (F0), the glue condition, (F4) and (F5). Returns
+/// proofs/lib/vqc.py: (F0), the glue condition, (Fc), (F4) and (F5). Returns
 /// false, with no flags, if the discrete closed-ball property fails, which Lemma
-/// "mergeindependent" excludes for a committed set of cluster merges. With `items`, stores the
-/// failing items that the region blame reads.
+/// "mergeindependent" excludes for a committed set of cluster merges; with `blameTopology`, for
+/// a batch of segment merges, which can break it, flags every cluster a violation names, of any
+/// size, and the others as well (`blame_cbp`). With `items`, stores the failing items that the
+/// region blame reads.
 inline bool FlaggedClusters(const SurfaceMesh& mesh,
                             const VertexQuadrics& quadrics,
                             const DistanceMesh& inputDistance,
                             const Clustering& clusters,
                             const MergeParameters& parameters,
                             viskores::cont::ArrayHandle<viskores::UInt8>& flags,
+                            bool blameTopology = false,
                             const EnvelopeBases* bases = nullptr,
                             const EnvelopeVerdicts* known = nullptr,
                             FailingItems* items = nullptr)
@@ -2908,19 +3001,52 @@ inline bool FlaggedClusters(const SurfaceMesh& mesh,
   if (parameters.Topological)
   {
     other.AllocateAndFill(k, 0);
-    const TopologyReport report =
-      TopologyFlags(mesh, clusters.Labels, clusters.Sizes, other, parameters.D2ByCount);
+    viskores::cont::ArrayHandle<viskores::Id> named;
+    const TopologyReport report = TopologyFlags(mesh,
+                                                clusters.Labels,
+                                                clusters.Sizes,
+                                                other,
+                                                parameters.D2ByCount,
+                                                blameTopology ? &named : nullptr);
     if (report.NumberOfD0 + report.NumberOfD1 + report.NumberOfD2 > 0)
     {
-      return false;
+      if (!blameTopology)
+      {
+        return false;
+      }
+      viskores::cont::Invoker invoke;
+      invoke(MarkIndex{}, named, flags);
     }
     other.AllocateAndFill(k, 0);
-    GlueFlags(mesh,
-              clusters.Labels,
-              parameters.FrozenVertices,
-              parameters.Canonical,
-              clusters.Sizes,
-              other);
+    if (parameters.Curves)
+    {
+      viskores::cont::ArrayHandle<viskores::Id> listed =
+        GlueViolations(mesh,
+                       clusters.Labels,
+                       parameters.Original,
+                       *parameters.Curves,
+                       OutputGlue(parameters, clusters));
+      FlagClusters(listed, clusters.Sizes, other);
+      if (parameters.CurveTolerance > 0)
+      {
+        CurveFlags(mesh,
+                   *parameters.Curves,
+                   parameters.Original,
+                   clusters,
+                   parameters.CurveTolerance,
+                   parameters.CurveDepth,
+                   other);
+      }
+    }
+    else
+    {
+      GlueFlags(mesh,
+                clusters.Labels,
+                parameters.FrozenVertices,
+                parameters.Canonical,
+                clusters.Sizes,
+                other);
+    }
     OrFlags(flags, other);
   }
   if (parameters.MaxClusterRadius < std::numeric_limits<Real>::infinity())
@@ -3257,13 +3383,16 @@ void MergePhase(const SurfaceMesh& mesh,
   using Algorithm = viskores::cont::Algorithm;
   viskores::cont::Invoker invoke;
   const bool geometric = parameters.GeometricFlags();
+  // With the singular curves decimated, the local test checks (d) and not (d'), so the full test
+  // runs even with no geometric flag in use.
+  const bool fullTest = geometric || parameters.Curves != nullptr;
   viskores::cont::Timer timer, roundTimer;
   VerdictCache verdicts;
   // The labellings every full test compares with: the last one committed and the last one
   // rejected, whose (F5) verdicts are known, so that a full test retests only the triangles a
   // change can reach.
   EnvelopeBases envelopeBases;
-  const bool incremental = geometric && parameters.ErrorBound > 0;
+  const bool incremental = fullTest && parameters.ErrorBound > 0;
   auto setEnvelopeBase =
     [&](EnvelopeBase& base, const Clustering& labelling, const EnvelopeVerdicts& verdictsOf)
   {
@@ -3534,7 +3663,7 @@ void MergePhase(const SurfaceMesh& mesh,
           const viskores::Id rank = viskores::cont::ArrayGetValue(t, deferredRanks);
           viskores::cont::ArrayHandle<viskores::Id2> single;
           Algorithm::Copy(viskores::cont::make_ArrayHandleView(pairs, rank, 1), single);
-          Clustering one = ApplyMerges(mesh, quadrics, clusters, single);
+          Clustering one = ApplyMerges(mesh, quadrics, parameters, clusters, single);
           const viskores::cont::ArrayHandle<viskores::UInt8> oneChanged =
             MergedClusters(clusters, one, single);
           EnvelopeVerdicts oneVerdicts;
@@ -3557,11 +3686,11 @@ void MergePhase(const SurfaceMesh& mesh,
           viskores::cont::make_ArrayHandleView(committedRanks, 0, numCommitted), pairs),
         committedPairs);
       timer.Start();
-      Clustering merged = ApplyMerges(mesh, quadrics, clusters, committedPairs);
+      Clustering merged = ApplyMerges(mesh, quadrics, parameters, clusters, committedPairs);
       const viskores::cont::ArrayHandle<viskores::UInt8> mergedChanged =
         MergedClusters(clusters, merged, committedPairs);
       EnvelopeVerdicts mergedVerdicts;
-      const bool fires = geometric &&
+      const bool fires = fullTest &&
         FlagsFire(mesh,
                   quadrics,
                   inputDistance,
@@ -3602,6 +3731,7 @@ void MergePhase(const SurfaceMesh& mesh,
                             merged,
                             parameters,
                             flags,
+                            false,
                             bases,
                             &mergedVerdicts,
                             region ? &items : nullptr))
@@ -3655,7 +3785,7 @@ void MergePhase(const SurfaceMesh& mesh,
       const viskores::Id first = viskores::cont::ArrayGetValue(0, committedRanks);
       viskores::cont::ArrayHandle<viskores::Id2> single;
       Algorithm::Copy(viskores::cont::make_ArrayHandleView(pairs, first, 1), single);
-      Clustering one = ApplyMerges(mesh, quadrics, clusters, single);
+      Clustering one = ApplyMerges(mesh, quadrics, parameters, clusters, single);
       const viskores::cont::ArrayHandle<viskores::UInt8> oneChanged =
         MergedClusters(clusters, one, single);
       EnvelopeVerdicts oneVerdicts;

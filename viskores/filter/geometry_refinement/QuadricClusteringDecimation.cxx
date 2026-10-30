@@ -88,14 +88,14 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
     reject("the target number of points must not be negative.");
   }
   const viskores::UInt32 guarantees = this->Guarantees;
-  const viskores::UInt32 all = Topology | TwoSidedError | NoSelfIntersections;
+  const viskores::UInt32 all = Topology | TwoSidedError | NoSelfIntersections | SingularCurves;
   if ((guarantees & ~all) != 0)
   {
     reject("unknown guarantee bits.");
   }
-  if (!(guarantees & Topology) && (guarantees & NoSelfIntersections))
+  if (!(guarantees & Topology) && (guarantees & (NoSelfIntersections | SingularCurves)))
   {
-    reject("the NoSelfIntersections guarantee requires Topology.");
+    reject("the NoSelfIntersections and SingularCurves guarantees require Topology.");
   }
   if (this->ErrorBound > 0 && !(guarantees & TwoSidedError))
   {
@@ -132,6 +132,7 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
   parameters.TargetNumberOfPoints = this->TargetNumberOfPoints;
   parameters.GeometricOnly = !(guarantees & Topology);
   parameters.Embedding = (guarantees & NoSelfIntersections) != 0;
+  parameters.DecimateSingularCurves = (guarantees & SingularCurves) != 0;
   using Sides = viskores::worklet::quadric_clustering::EnvelopeSides;
   const viskores::UInt32 sides = guarantees & TwoSidedError;
   parameters.ErrorSides = (sides == ErrorOutputToInput) ? Sides::OutputToInput

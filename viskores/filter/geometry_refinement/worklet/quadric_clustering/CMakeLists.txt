@@ -12,13 +12,18 @@ set(headers
   Assignment.h
   Clustering.h
   CurvatureSeeds.h
+  CurveFlags.h
   EmbeddingFlags.h
   EnvelopeFlags.h
   ImproperPairs.h
+  GlueItems.h
   Initialization.h
   MergePhase.h
   NonManifoldCut.h
   QuadricClusteringCommonWorklets.h
+  SegmentFlags.h
+  SegmentMerges.h
+  SingularCurves.h
   SurfaceMesh.h
   TopologyFlags.h
   VertexQuadrics.h

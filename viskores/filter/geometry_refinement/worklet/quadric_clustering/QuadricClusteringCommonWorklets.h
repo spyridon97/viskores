@@ -246,6 +246,73 @@ struct SplitPair : viskores::worklet::WorkletMapField
   }
 };
 
+/// Predicates for `CopyIf`.
+struct IsNonNegative
+{
+  VISKORES_EXEC_CONT bool operator()(viskores::Id x) const { return x >= 0; }
+
+  /// A record whose first component is not negative.
+  template <viskores::IdComponent N>
+  VISKORES_EXEC_CONT bool operator()(const viskores::Vec<viskores::Id, N>& r) const
+  {
+    return r[0] >= 0;
+  }
+};
+
+/// One round of pointer jumping: twice as far, or to the terminal.
+struct Jump : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn next,
+                                FieldIn distance,
+                                WholeArrayIn nexts,
+                                WholeArrayIn distances,
+                                FieldOut jumped,
+                                FieldOut jumpedDistance,
+                                FieldOut changed);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7);
+
+  template <typename IdPortal>
+  VISKORES_EXEC void operator()(viskores::Id next,
+                                viskores::Id distance,
+                                const IdPortal& nexts,
+                                const IdPortal& distances,
+                                viskores::Id& jumped,
+                                viskores::Id& jumpedDistance,
+                                viskores::Id& changed) const
+  {
+    jumped = nexts.Get(next);
+    jumpedDistance = distance + distances.Get(next);
+    changed = (jumped != next) ? 1 : 0;
+  }
+};
+
+/// The terminal of every item of a set of lists and its distance to it, by pointer jumping, from
+/// the successor `next` of every item (itself for a terminal) and the distance to it: enough
+/// rounds for lists of all the items, or until nothing changes. An item on a cycle without a
+/// terminal ends on the cycle.
+inline void RankLists(viskores::cont::ArrayHandle<viskores::Id>& next,
+                      viskores::cont::ArrayHandle<viskores::Id>& distance)
+{
+  const viskores::Id count = next.GetNumberOfValues();
+  viskores::Id rounds = 1;
+  while ((viskores::Id(1) << (rounds - 1)) < count + 1)
+  {
+    ++rounds;
+  }
+  viskores::cont::Invoker invoke;
+  for (viskores::Id round = 0; round < rounds; ++round)
+  {
+    viskores::cont::ArrayHandle<viskores::Id> jumped, jumpedDistance, changed;
+    invoke(Jump{}, next, distance, next, distance, jumped, jumpedDistance, changed);
+    next = jumped;
+    distance = jumpedDistance;
+    if (viskores::cont::Algorithm::Reduce(changed, viskores::Id(0)) == 0)
+    {
+      break;
+    }
+  }
+}
+
 /// `value / Divisor`: the owner of an item in blocks of `Divisor` items.
 struct DivideBy : viskores::worklet::WorkletMapField
 {
@@ -485,6 +552,38 @@ struct FirstComponent : viskores::worklet::WorkletMapField
   }
 };
 
+/// The offsets of `records`, sorted by their first component (an owner in `[0, n)`), per owner,
+/// with one more entry at the end.
+template <typename RecordArray>
+inline viskores::cont::ArrayHandle<viskores::Id> RecordOffsets(const RecordArray& records,
+                                                               viskores::Id n)
+{
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::Id> owners, offsets;
+  invoke(FirstComponent{}, records, owners);
+  viskores::cont::Algorithm::LowerBounds(owners, viskores::cont::ArrayHandleIndex(n + 1), offsets);
+  return offsets;
+}
+
+/// `table[record[K]]`.
+template <viskores::IdComponent K>
+struct GatherComponent : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn record, WholeArrayIn table, FieldOut value);
+  using ExecutionSignature = _3(_1, _2);
+
+  template <typename Record, typename Portal>
+  VISKORES_EXEC typename Portal::ValueType operator()(const Record& r, const Portal& table) const
+  {
+    return table.Get(r[K]);
+  }
+};
+
+struct IsZero
+{
+  VISKORES_EXEC_CONT bool operator()(viskores::UInt8 x) const { return x == 0; }
+};
+
 /// 1 where a state equals `State`.
 struct IsState : viskores::worklet::WorkletMapField
 {
@@ -502,6 +601,20 @@ struct IsState : viskores::worklet::WorkletMapField
   }
 
   viskores::UInt8 State;
+};
+
+/// The owner of an item: the last of `offsets` (non-decreasing) that is at most `item`.
+template <typename IdPortal>
+VISKORES_EXEC_CONT viskores::Id OwnerOf(const IdPortal& offsets, viskores::Id item)
+{
+  return PartitionPoint(
+           0, offsets.GetNumberOfValues(), [&](viskores::Id i) { return offsets.Get(i) <= item; }) -
+    1;
+}
+
+struct IsPositive
+{
+  VISKORES_EXEC_CONT bool operator()(viskores::Id x) const { return x > 0; }
 };
 
 /// The scatter of a heavy worklet over `n` items: every item is visited `k` times, of which

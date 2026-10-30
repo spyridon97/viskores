@@ -39,6 +39,8 @@ struct CutComplex
   /// The copies of the vertices on an edge of `X` and of the vertices with several fans, which
   /// stay singleton clusters.
   viskores::cont::ArrayHandle<viskores::UInt8> Frozen;
+  /// The edges of `X`, as sorted vertex pairs in lexicographic order.
+  viskores::cont::ArrayHandle<viskores::Id2> CutEdges;
 };
 
 namespace cut_detail
@@ -527,11 +529,10 @@ inline CutComplex CutAlongSingularEdges(const viskores::cont::ArrayHandle<viskor
          cornerRoots,
          copyOfRoot,
          cut.Triangles);
-  viskores::cont::ArrayHandle<viskores::Id2> cutEdges;
-  Algorithm::CopyIf(edges, finalInX, cutEdges);
+  Algorithm::CopyIf(edges, finalInX, cut.CutEdges);
   viskores::cont::ArrayHandle<viskores::UInt8> onCut;
   onCut.AllocateAndFill(numVertices, 0);
-  invoke(cd::MarkOnCut{}, cutEdges, onCut);
+  invoke(cd::MarkOnCut{}, cut.CutEdges, onCut);
   invoke(cd::IsFrozenCopy{},
          viskores::cont::ArrayHandleIndex(cut.Original.GetNumberOfValues()),
          cut.Original,

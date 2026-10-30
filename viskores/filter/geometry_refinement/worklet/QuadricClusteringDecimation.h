@@ -17,6 +17,7 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/MergePhase.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/NonManifoldCut.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SegmentMerges.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SurfaceMesh.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/VertexQuadrics.h>
@@ -344,6 +345,14 @@ public:
     /// surface that is not orientable, such as a Moebius band, takes the cut with no edge cut
     /// and no frozen copy.
     bool Seams = true;
+    /// For an input cut into surfaces: decimate its singular curves too, by merging consecutive
+    /// segments of them in the merge phase (Proposition "Decimating the singular curves");
+    /// otherwise they keep their input resolution (Theorem "Inputs that are not surfaces").
+    bool DecimateSingularCurves = true;
+    /// With the curves decimated: the tolerance `eps_c` of the curve test (Fc) of Proposition
+    /// "curvetol", a length, or 0 for none. Every output curve then stays within `eps_c` of its
+    /// input curve, and every input curve within `eps_c` of its output curve.
+    Real CurveTolerance = 0;
   };
 
   /// The points of the run at which an observer is called.
@@ -398,6 +407,9 @@ public:
     /// Clusters found adjacent to two copies of a frozen vertex of a cut input, over the loop;
     /// they are flagged with (F2) and (F3).
     viskores::Id GlueViolations = 0;
+    /// With the curves decimated, the arcs and the junctions.
+    viskores::Id Arcs = 0;
+    viskores::Id Junctions = 0;
     /// Output triangles given to (F4), and pieces examined by the envelope tests, over the run:
     /// machine-independent measures of the two most expensive steps.
     viskores::Id EmbeddingTriangles = 0;
@@ -476,6 +488,8 @@ public:
     this->Canonical.ReleaseResources();
     this->FrozenCopies.ReleaseResources();
     this->CopyOriginals.ReleaseResources();
+    this->HasCurves = false;
+    this->Curves = quadric_clustering::SingularCurves{};
     if (this->Params.Embedding && !geometric)
     {
       this->CheckEmbedded(points, triangles);
@@ -501,6 +515,11 @@ public:
           ".");
       }
       this->CutInput(points, triangles);
+      if (this->HasCurves)
+      {
+        this->Diag.Arcs = this->Curves.NumberOfArcs;
+        this->Diag.Junctions = qc::NumberOfJunctions(this->Curves);
+      }
     }
     const qc::SurfaceMesh& mesh = this->Mesh;
     const viskores::Id n = mesh.NumberOfPoints;
@@ -597,6 +616,15 @@ public:
     auto place = [&]()
     {
       qc::Place(mesh, this->Quadrics.M, clusters);
+      if (this->HasCurves)
+      {
+        qc::PlaceCurveGenerators(mesh,
+                                 this->Curves,
+                                 this->FrozenCopies,
+                                 this->CopyOriginals,
+                                 this->Glue(clusters),
+                                 clusters);
+      }
       frozenLabels = qc::FrozenLabels(this->FrozenCopies, clusters);
       observe(Stage::Placed, State{ mesh, this->Quadrics, clusters });
     };
@@ -687,12 +715,23 @@ public:
                 topologyFlags.AllocateAndFill(k, 0);
                 topologyReport = qc::TopologyFlags(
                   mesh, clusters.Labels, clusters.Sizes, topologyFlags, this->Params.D2ByCount);
-                this->Diag.GlueViolations += qc::GlueFlags(mesh,
-                                                           clusters.Labels,
-                                                           this->FrozenCopies,
-                                                           this->Canonical,
-                                                           clusters.Sizes,
-                                                           topologyFlags);
+                if (this->HasCurves)
+                {
+                  // (d') of Proposition "Decimating the singular curves".
+                  viskores::cont::ArrayHandle<viskores::Id> listed = qc::GlueViolations(
+                    mesh, clusters.Labels, this->CopyOriginals, this->Curves, this->Glue(clusters));
+                  this->Diag.GlueViolations += listed.GetNumberOfValues();
+                  qc::FlagClusters(listed, clusters.Sizes, topologyFlags);
+                }
+                else
+                {
+                  this->Diag.GlueViolations += qc::GlueFlags(mesh,
+                                                             clusters.Labels,
+                                                             this->FrozenCopies,
+                                                             this->Canonical,
+                                                             clusters.Sizes,
+                                                             topologyFlags);
+                }
                 this->Diag.FlaggedTopology += qc::OrFlags(flags, topologyFlags);
               });
       }
@@ -781,6 +820,7 @@ public:
       merge.Order = this->Params.MergeOrder;
       merge.DeferFlagged = this->Params.DeferFlaggedMerges;
       merge.Blame = this->Params.MergeBlame;
+      merge.CurveTolerance = this->HasCurves ? this->Params.CurveTolerance : 0;
       auto merged =
         [&](const qc::Clustering&, const viskores::cont::ArrayHandle<viskores::Id2>& pairs)
       {
@@ -788,7 +828,16 @@ public:
         state.MergedPairs = &pairs;
         observe(Stage::Merged, state);
       };
-      qc::MergePhase(mesh, this->Quadrics, inputDistance, merge, clusters, this->MergeDiag, merged);
+      if (this->HasCurves)
+      {
+        qc::SegmentMerger(mesh, this->Quadrics, inputDistance, merge, this->Curves)
+          .Run(clusters, this->MergeDiag, merged);
+      }
+      else
+      {
+        qc::MergePhase(
+          mesh, this->Quadrics, inputDistance, merge, clusters, this->MergeDiag, merged);
+      }
     }
     timer.Stop();
     seconds.Merge += timer.GetElapsedTime();
@@ -876,6 +925,11 @@ public:
   {
     return this->FrozenCopies;
   }
+  /// For a cut input with its singular curves decimated: the arcs and their segments.
+  VISKORES_CONT const quadric_clustering::SingularCurves& GetSingularCurves() const
+  {
+    return this->Curves;
+  }
 
 private:
   /// Hypothesis "embedded", checked as Section 11 says: the test of the embedding flag applied
@@ -916,13 +970,24 @@ private:
     qc::BuildSurfaceMesh(copyPoints, cut.Triangles, true, this->Mesh, !this->Params.Seams);
     this->FrozenCopies = cut.Frozen;
     this->CopyOriginals = cut.Original;
+    if (this->Params.DecimateSingularCurves)
+    {
+      this->HasCurves = true;
+      this->Curves =
+        qc::FindSingularCurves(cut.CutEdges, this->Mesh, cut.Original, cut.Frozen, numPoints);
+    }
   }
 
   /// The vertex of the glued output of every label of a cut input: the copies of every frozen
-  /// vertex identified.
+  /// vertex identified, and with the singular curves decimated, the pieces of every segment.
   VISKORES_CONT viskores::cont::ArrayHandle<viskores::Id> Glue(
     const quadric_clustering::Clustering& clusters) const
   {
+    if (this->HasCurves)
+    {
+      return quadric_clustering::SegmentGlueMap(
+        this->Curves, this->FrozenCopies, this->CopyOriginals, clusters);
+    }
     return quadric_clustering::GlueMap(this->Canonical, clusters);
   }
 
@@ -1088,6 +1153,8 @@ private:
   viskores::cont::ArrayHandle<viskores::UInt8> FrozenCopies;
   viskores::cont::ArrayHandle<viskores::Id> CopyOriginals;
   viskores::cont::ArrayHandle<viskores::Id> Canonical;
+  bool HasCurves = false;
+  quadric_clustering::SingularCurves Curves;
   viskores::Id ClustersAfterLoop = 0;
   Diagnostics Diag;
   quadric_clustering::MergeDiagnostics MergeDiag;
