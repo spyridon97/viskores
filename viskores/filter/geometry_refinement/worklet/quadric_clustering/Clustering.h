@@ -43,8 +43,13 @@ struct Clustering
 
   /// Groups the vertices by label, each group in increasing vertex order.
   viskores::worklet::Keys<viskores::Id> Keys;
-  /// `Q_C = sum M_v`.
+  /// The member of smallest index of every cluster, the anchor of its sums.
+  viskores::cont::ArrayHandle<viskores::Id> Anchors;
+  /// `Q_C = sum M_v`, `b_C = sum M_v (v - o_C)` and `s_C = sum (v - o_C)^T M_v (v - o_C)`, so
+  /// that `Phi_C(c_C) = s_C - b_C^T Q_C^{-1} b_C`.
   viskores::cont::ArrayHandle<Mat3> Q;
+  viskores::cont::ArrayHandle<Vec3> B;
+  viskores::cont::ArrayHandle<Real> S;
   viskores::cont::ArrayHandle<viskores::Id> Sizes;
 };
 
@@ -77,25 +82,32 @@ struct Place : viskores::worklet::WorkletReduceByKey
                                 ValuesIn vertices,
                                 WholeArrayIn points,
                                 WholeArrayIn m,
+                                ReducedValuesOut anchor,
                                 ReducedValuesOut q,
+                                ReducedValuesOut b,
+                                ReducedValuesOut s,
                                 ReducedValuesOut generator,
                                 ReducedValuesOut size);
-  using ExecutionSignature = void(_2, _3, _4, _5, _6, _7);
+  using ExecutionSignature = void(_2, _3, _4, _5, _6, _7, _8, _9, _10);
   using InputDomain = _1;
 
   template <typename VerticesVec, typename PointsPortal, typename MatPortal>
   VISKORES_EXEC void operator()(const VerticesVec& vertices,
                                 const PointsPortal& points,
                                 const MatPortal& m,
+                                viskores::Id& anchor,
                                 Mat3& q,
+                                Vec3& b,
+                                Real& s,
                                 Vec3& generator,
                                 viskores::Id& size) const
   {
     size = vertices.GetNumberOfComponents();
-    const viskores::Id anchor = vertices[0];
+    anchor = vertices[0];
     const Vec3 o = points.Get(anchor);
     TreeSum<Mat3> qSum;
     TreeSum<Vec3> bSum;
+    TreeSum<Real> sSum;
     for (viskores::IdComponent i = 0; i < size; ++i)
     {
       const viskores::Id v = vertices[i];
@@ -103,9 +115,11 @@ struct Place : viskores::worklet::WorkletReduceByKey
       const Vec3 w = Sub(points.Get(v), o);
       qSum.Push(mv);
       bSum.Push(MatVec(mv, w));
+      sSum.Push(Quad(w, mv));
     }
     q = qSum.Result();
-    const Vec3 b = bSum.Result();
+    b = bSum.Result();
+    s = sSum.Result();
     generator = Add(o, SolveSPD(q, b));
   }
 };
@@ -127,7 +141,10 @@ inline void Place(const SurfaceMesh& mesh,
          viskores::cont::ArrayHandleIndex(mesh.NumberOfPoints),
          mesh.Points,
          m,
+         clustering.Anchors,
          clustering.Q,
+         clustering.B,
+         clustering.S,
          clustering.Generators,
          clustering.Sizes);
 }
@@ -567,10 +584,11 @@ inline void SplitInTwo(const SurfaceMesh& mesh,
     // Stable: every side in increasing vertex order, as step (b) sums.
     viskores::worklet::Keys<viskores::Id> sides;
     sides.BuildArrays(keys, viskores::worklet::KeysSortType::Stable);
-    viskores::cont::ArrayHandle<viskores::Id> sizes;
+    viskores::cont::ArrayHandle<viskores::Id> anchors, sizes;
     viskores::cont::ArrayHandle<Mat3> q;
-    viskores::cont::ArrayHandle<Vec3> placed;
-    invoke(detail::Place{}, sides, vertices, mesh.Points, m, q, placed, sizes);
+    viskores::cont::ArrayHandle<Vec3> b, placed;
+    viskores::cont::ArrayHandle<Real> s;
+    invoke(detail::Place{}, sides, vertices, mesh.Points, m, anchors, q, b, s, placed, sizes);
     present.AllocateAndFill(2 * numFlagged, 0);
     invoke(detail::ScatterSide{}, sides.GetUniqueKeys(), placed, centres0, centres1, present);
   }

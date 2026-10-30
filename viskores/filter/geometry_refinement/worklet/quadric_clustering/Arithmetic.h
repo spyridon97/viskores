@@ -202,6 +202,14 @@ VISKORES_EXEC_CONT inline viskores::UInt64 HashIndex(viskores::Id index)
   return z ^ (z >> 31);
 }
 
+/// A key of the unordered pair `{a, b}`: `HashIndex(HashIndex(min) xor max)`.
+VISKORES_EXEC_CONT inline viskores::UInt64 HashPair(viskores::Id a, viskores::Id b)
+{
+  const viskores::UInt64 lo = static_cast<viskores::UInt64>(viskores::Min(a, b));
+  const viskores::UInt64 hi = static_cast<viskores::UInt64>(viskores::Max(a, b));
+  return HashIndex(static_cast<viskores::Id>(HashIndex(static_cast<viskores::Id>(lo)) ^ hi));
+}
+
 }
 }
 } // namespace viskores::worklet::quadric_clustering

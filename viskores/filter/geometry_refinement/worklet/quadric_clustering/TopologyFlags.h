@@ -35,6 +35,8 @@ struct TopologyReport
 {
   /// Whether the flags were evaluated.
   bool Valid = false;
+  viskores::Id NumberOfD0 = 0;
+  viskores::Id NumberOfD1 = 0;
   viskores::Id NumberOfD2 = 0;
   /// `sum_C chi(M[C])`.
   viskores::Id SumOfClusterEuler = 0;
@@ -419,6 +421,7 @@ inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
          boundaryEdgesInside,
          euler,
          d0);
+  report.NumberOfD0 = Algorithm::Reduce(d0, viskores::Id(0));
   report.SumOfClusterEuler = Algorithm::Reduce(euler, viskores::Id(0));
   // A cluster violating (D0) has at least two vertices: a singleton never does.
   OrFlags(flags, d0);
@@ -484,6 +487,7 @@ inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
   invoke(detail::D1{}, pairKeys, records, d1);
   viskores::cont::ArrayHandle<viskores::Id2> badPairs;
   Algorithm::CopyIf(pairKeys.GetUniqueKeys(), d1, badPairs);
+  report.NumberOfD1 = badPairs.GetNumberOfValues();
   {
     viskores::cont::ArrayHandle<viskores::Id> badLabels;
     invoke(detail::PairLabels{}, badPairs, viskores::cont::make_ArrayHandleGroupVec<2>(badLabels));

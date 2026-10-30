@@ -13,6 +13,7 @@ set(headers
   Clustering.h
   CurvatureSeeds.h
   Initialization.h
+  MergePhase.h
   QuadricClusteringCommonWorklets.h
   SurfaceMesh.h
   TopologyFlags.h

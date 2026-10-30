@@ -132,6 +132,7 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
   parameters.Quadric.FeatureAngle = this->FeatureAngle;
   parameters.Quadric.FeatureWeight = this->FeatureWeight;
   parameters.Quadric.BoundaryWeight = this->BoundaryWeight;
+  parameters.Merge = this->Merge;
   parameters.MaxSweeps = this->MaxSweeps;
   worklet.SetParameters(parameters);
   worklet.Run(points, triangles);

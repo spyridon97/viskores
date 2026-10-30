@@ -16,6 +16,7 @@
 #include <viskores/cont/Algorithm.h>
 #include <viskores/cont/ArrayHandle.h>
 #include <viskores/cont/Invoker.h>
+#include <viskores/worklet/ScatterCounting.h>
 #include <viskores/worklet/WorkletMapField.h>
 
 
@@ -107,6 +108,15 @@ struct GatherTriple : viskores::worklet::WorkletMapField
   }
 };
 
+/// 1 for a label, 0 for a slot marked invalid by a negative value.
+struct IsValidLabel : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn label, FieldOut valid);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::Id label) const { return label >= 0 ? 1 : 0; }
+};
+
 /// Component-wise minimum and maximum of two points, for `Reduce`.
 struct ComponentMin
 {
@@ -121,6 +131,37 @@ struct ComponentMax
   VISKORES_EXEC_CONT Vec3 operator()(const Vec3& a, const Vec3& b) const
   {
     return Vec3(viskores::Max(a[0], b[0]), viskores::Max(a[1], b[1]), viskores::Max(a[2], b[2]));
+  }
+};
+
+/// The two components of a pair.
+struct SplitPair : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn pair, FieldOut first, FieldOut second);
+  using ExecutionSignature = void(_1, _2, _3);
+
+  VISKORES_EXEC void operator()(const viskores::Id2& pair,
+                                viskores::Id& first,
+                                viskores::Id& second) const
+  {
+    first = pair[0];
+    second = pair[1];
+  }
+};
+
+/// The three edges of a triangle, each as `SortedEdge`.
+struct SortedTriangleEdges : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle, FieldOut edges);
+  using ExecutionSignature = void(_1, _2);
+
+  template <typename EdgeVec>
+  VISKORES_EXEC void operator()(const viskores::Id3& t, EdgeVec& edges) const
+  {
+    for (viskores::IdComponent s = 0; s < 3; ++s)
+    {
+      edges[s] = SortedEdge(t[s], t[(s + 1) % 3]);
+    }
   }
 };
 
@@ -156,6 +197,39 @@ VISKORES_EXEC_CONT viskores::Id PartitionPoint(viskores::Id lo, viskores::Id hi,
   }
   return lo;
 }
+
+/// The first index in `[lo, hi)` of the sorted `sorted` whose value is not below `value`.
+template <typename Portal, typename Value>
+VISKORES_EXEC_CONT viskores::Id LowerBound(const Portal& sorted,
+                                           viskores::Id lo,
+                                           viskores::Id hi,
+                                           const Value& value)
+{
+  return PartitionPoint(lo, hi, [&](viskores::Id i) { return sorted.Get(i) < value; });
+}
+
+/// The position of `value` in the sorted `sorted`, or -1.
+template <typename Portal, typename Value>
+VISKORES_EXEC_CONT viskores::Id FindSorted(const Portal& sorted, const Value& value)
+{
+  const viskores::Id n = sorted.GetNumberOfValues();
+  const viskores::Id lo = LowerBound(sorted, 0, n, value);
+  return (lo < n && sorted.Get(lo) == value) ? lo : -1;
+}
+
+/// Both directions of an edge.
+struct BothDirections : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn edge, FieldOut directed);
+  using ExecutionSignature = void(_1, _2);
+
+  template <typename OutVec>
+  VISKORES_EXEC void operator()(const viskores::Id2& e, OutVec& out) const
+  {
+    out[0] = e;
+    out[1] = viskores::Id2(e[1], e[0]);
+  }
+};
 
 /// The range `[offsets[i], offsets[i + 1])` of item `i`.
 struct OffsetRange : viskores::worklet::WorkletMapField
@@ -225,6 +299,39 @@ struct MarkIndex : viskores::worklet::WorkletMapField
 
   viskores::UInt8 Value;
 };
+
+/// 1 where a state equals `State`.
+struct IsState : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn state, FieldOut match);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_CONT explicit IsState(viskores::UInt8 state)
+    : State(state)
+  {
+  }
+
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::UInt8 state) const
+  {
+    return (state == this->State) ? 1 : 0;
+  }
+
+  viskores::UInt8 State;
+};
+
+/// The scatter of a heavy worklet over `n` items: every item is visited `k` times, of which
+/// only the first works, with `k` (1 to 1024) such that the launch has about 64 Ki visits. The
+/// TBB device schedules at least 1024 visits per task, so a launch of a few hundred items would
+/// otherwise run on one thread.
+inline viskores::worklet::ScatterCounting SpreadScatterOver(viskores::Id n)
+{
+  constexpr viskores::Id visits = viskores::Id(1) << 16;
+  const viskores::Id k = viskores::Max(
+    viskores::Id(1), viskores::Min(viskores::Id(1024), visits / viskores::Max(n, viskores::Id(1))));
+  viskores::cont::ArrayHandle<viskores::Int32> counts;
+  counts.AllocateAndFill(n, static_cast<viskores::Int32>(k));
+  return viskores::worklet::ScatterCounting(counts);
+}
 
 }
 }

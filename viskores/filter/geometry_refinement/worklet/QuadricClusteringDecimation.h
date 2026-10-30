@@ -12,6 +12,7 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Clustering.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/CurvatureSeeds.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Initialization.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/MergePhase.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SurfaceMesh.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
@@ -124,6 +125,19 @@ public:
     viskores::Id MaxLloydIterations = 100;
     /// The insertion of step (d).
     Insertion InsertionRule = Insertion::Worst;
+    /// The merge phase after the loop, down to `k*` in budget mode and as far as the flags allow
+    /// without a target.
+    bool Merge = true;
+    /// The floor `D_0` of the degree key of the merge priority, or a negative value to order
+    /// merges by the increase of the objective alone.
+    viskores::Id MergeDegreeFloor = 12;
+    /// The key of the merge priority after the degree: the increase of the objective, or a hash
+    /// of the anchors of the two clusters.
+    quadric_clustering::MergeOrder MergeOrder = quadric_clustering::MergeOrder::Cost;
+    /// When the merges of a round fail the full test together: defer those whose merged cluster
+    /// is flagged and test the others again, or, if false, merge only the one of highest
+    /// priority.
+    bool DeferFlaggedMerges = true;
   };
 
   /// The points of the run at which an observer is called.
@@ -136,7 +150,9 @@ public:
     /// After the scan, with the flags of the round.
     Scanned,
     /// After the insertion and split steps.
-    Split
+    Split,
+    /// After a round of the merge phase, with the merged pairs.
+    Merged
   };
 
   struct State
@@ -152,6 +168,8 @@ public:
     /// assignment step.
     const viskores::cont::ArrayHandle<viskores::Id>* SweepLabels = nullptr;
     const viskores::cont::ArrayHandle<viskores::Id>* Changes = nullptr;
+    /// In `Merged`: the pairs `(i, j)` of the round, in the labels before it.
+    const viskores::cont::ArrayHandle<viskores::Id2>* MergedPairs = nullptr;
   };
 
   using Observer = std::function<void(Stage, const State&)>;
@@ -180,6 +198,7 @@ public:
       double Scan = 0;
       double Topology = 0;
       double InsertSplit = 0;
+      double Merge = 0;
       double Output = 0;
     } Seconds;
   };
@@ -403,7 +422,31 @@ public:
             });
       observe(Stage::Split, State{ mesh, this->Quadrics, clusters });
     }
+    this->ClustersAfterLoop = clusters.NumberOfClusters;
 
+    // The merge phase.
+    this->MergeDiag = qc::MergeDiagnostics{};
+    timer.Start();
+    if (this->Params.Merge && clusters.NumberOfClusters > budget)
+    {
+      qc::MergeParameters merge;
+      merge.Budget = budget;
+      merge.MaxClusterRadius = maxRadius;
+      merge.D2ByCount = this->Params.D2ByCount;
+      merge.DegreeFloor = this->Params.MergeDegreeFloor;
+      merge.Order = this->Params.MergeOrder;
+      merge.DeferFlagged = this->Params.DeferFlaggedMerges;
+      auto merged =
+        [&](const qc::Clustering&, const viskores::cont::ArrayHandle<viskores::Id2>& pairs)
+      {
+        State state{ mesh, this->Quadrics, clusters };
+        state.MergedPairs = &pairs;
+        observe(Stage::Merged, state);
+      };
+      qc::MergePhase(mesh, this->Quadrics, merge, clusters, this->MergeDiag, merged);
+    }
+    timer.Stop();
+    seconds.Merge += timer.GetElapsedTime();
     timed(seconds.Output, [&] { this->ExtractOutput(numInputPoints); });
   }
 
@@ -433,7 +476,15 @@ public:
     return this->Clusters.Keys;
   }
   VISKORES_CONT viskores::Id GetNumberOfClusters() const { return this->Clusters.NumberOfClusters; }
+  VISKORES_CONT viskores::Id GetNumberOfClustersAfterLoop() const
+  {
+    return this->ClustersAfterLoop;
+  }
   VISKORES_CONT const Diagnostics& GetDiagnostics() const { return this->Diag; }
+  VISKORES_CONT const quadric_clustering::MergeDiagnostics& GetMergeDiagnostics() const
+  {
+    return this->MergeDiag;
+  }
   VISKORES_CONT const quadric_clustering::SurfaceMesh& GetMesh() const { return this->Mesh; }
   VISKORES_CONT const quadric_clustering::VertexQuadrics& GetQuadrics() const
   {
@@ -524,7 +575,9 @@ private:
   viskores::cont::ArrayHandle<viskores::Id> OutputCellSources;
   viskores::cont::ArrayHandle<Vec3> OutputPoints;
   viskores::cont::ArrayHandle<viskores::Id> OutputPointMap;
+  viskores::Id ClustersAfterLoop = 0;
   Diagnostics Diag;
+  quadric_clustering::MergeDiagnostics MergeDiag;
 };
 
 } // namespace worklet

@@ -22,7 +22,8 @@ namespace geometry_refinement
 ///
 /// The input points are partitioned into connected clusters, and every cluster becomes one
 /// output point, placed where it minimises the cluster's quadric error plus a regularisation
-/// term. A refinement loop splits clusters until none breaks a requirement. The output is a
+/// term. A refinement loop splits clusters until none breaks a requirement, and a merge phase
+/// then merges adjacent clusters as long as every requirement still holds. The output is a
 /// deterministic function of the input as numbered: it does not depend on the device or on the
 /// number of threads.
 ///
@@ -30,7 +31,7 @@ namespace geometry_refinement
 /// points. The guarantees, as bits of
 /// `SetGuarantees`: by default the output is a surface of the input's type. Choices that
 /// change only the output size: the initialisation and the terms of the cost. How the work is
-/// done: the sweep cap.
+/// done: the merge phase and the sweep cap.
 ///
 /// Point fields are averaged over every cluster, and every output cell takes the cell fields
 /// of the first input triangle that produced it. The output coordinates are in double
@@ -40,7 +41,8 @@ namespace geometry_refinement
 /// cluster. An *assignment step* repeats sweeps until nothing moves, or `MaxSweeps` times. A
 /// *Lloyd iteration*, up to 100 right after seeding, is an assignment step and the placement of
 /// the output points. A *round* is an assignment step, the placement, the checks of the
-/// guarantees, and the splitting of the clusters that fail them.
+/// guarantees, and the splitting of the clusters that fail them. A *merge round* merges one
+/// parallel batch of adjacent clusters.
 class VISKORES_FILTER_GEOMETRY_REFINEMENT_EXPORT QuadricClusteringDecimation
   : public viskores::filter::Filter
 {
@@ -48,7 +50,7 @@ public:
   /// @brief The number of output points to aim for, or 0 for none.
   ///
   /// The output has at least as many points as the target and as the topology of the input
-  /// needs. Use it
+  /// needs, and exactly the target when the merges allow. Use it
   /// for a fixed size, such as levels of detail or transmission. The default is 0.
   VISKORES_CONT void SetTargetNumberOfPoints(viskores::Id target)
   {
@@ -133,6 +135,15 @@ public:
   /// @copydoc SetBoundaryWeight
   VISKORES_CONT viskores::Float64 GetBoundaryWeight() const { return this->BoundaryWeight; }
 
+  /// @brief Whether adjacent clusters are merged after the refinement while every guarantee
+  /// still holds.
+  ///
+  /// Needed to reach the target number of points. Turn it off only to save time. The
+  /// default is true.
+  VISKORES_CONT void SetMerge(bool merge) { this->Merge = merge; }
+  /// @copydoc SetMerge
+  VISKORES_CONT bool GetMerge() const { return this->Merge; }
+
   /// @brief A cap on the sweeps of every assignment step, or 0 for none.
   ///
   /// It bounds the depth of a round, for example on a GPU. Every guarantee holds for any cap,
@@ -151,6 +162,7 @@ private:
   viskores::Float64 FeatureAngle = 45;
   viskores::Float64 FeatureWeight = 1;
   viskores::Float64 BoundaryWeight = 1;
+  bool Merge = true;
   viskores::Id MaxSweeps = 0;
 };
 } // namespace geometry_refinement
