@@ -11,6 +11,7 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Assignment.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Clustering.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/CurvatureSeeds.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EnvelopeFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Initialization.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/MergePhase.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
@@ -84,12 +85,12 @@ public:
   {
     /// One cluster per connected component.
     Single,
-    /// Seeds evenly spaced by vertex count along the Morton order: `k*` in budget mode, and
-    /// without a target as many as the curvature initialisation would place.
+    /// Seeds evenly spaced by vertex count along the Morton order: `k*` in budget mode, and in
+    /// error mode as many as the curvature initialisation would place.
     Morton,
-    /// Seeds spread along the Morton order by a density that follows the curvature: `k*` in
-    /// budget mode, and without a target as many as the density asks for, within the
-    /// topological floor and a quarter of the vertices.
+    /// Seeds spread along the Morton order by a density that follows the curvature against the
+    /// error bound: `k*` in budget mode, and in error mode as many as the density asks for,
+    /// within the topological floor and a quarter of the vertices.
     Curvature
   };
 
@@ -108,6 +109,9 @@ public:
     quadric_clustering::QuadricParameters Quadric;
     /// The target vertex count `k*` of budget mode, or 0.
     viskores::Id TargetNumberOfPoints = 0;
+    /// The bound `epsilon_H` on the Hausdorff distance between input and output of error mode,
+    /// enforced by the envelope flag (F5), or 0.
+    Real ErrorBound = 0;
     /// A cap on the cluster radius, flag (F0).
     Real MaxClusterRadius = std::numeric_limits<Real>::infinity();
     /// The topological flags (F2) and (F3). Turning them off voids every topological guarantee;
@@ -117,6 +121,8 @@ public:
     /// the label triples. The guarantees are the same; rounds with other violations flag fewer
     /// clusters.
     bool D2ByCount = false;
+    /// The halves of the envelope flag (F5) with an error bound.
+    quadric_clustering::EnvelopeSides ErrorSides = quadric_clustering::EnvelopeSides::Both;
     /// The cap `T` on the propose/commit sweeps of each assignment step, or 0 for none.
     viskores::Id MaxSweeps = 0;
     /// The initial clusters. Seeds are followed by a Lloyd phase.
@@ -126,7 +132,7 @@ public:
     /// The insertion of step (d).
     Insertion InsertionRule = Insertion::Worst;
     /// The merge phase after the loop, down to `k*` in budget mode and as far as the flags allow
-    /// without a target.
+    /// in error mode.
     bool Merge = true;
     /// The floor `D_0` of the degree key of the merge priority, or a negative value to order
     /// merges by the increase of the objective alone.
@@ -138,6 +144,10 @@ public:
     /// is flagged and test the others again, or, if false, merge only the one of highest
     /// priority.
     bool DeferFlaggedMerges = true;
+    /// Which merges are deferred: those whose merged cluster is flagged, or also those whose
+    /// changed output triangles meet the region read by a failing item that flags no merged
+    /// cluster (the default).
+    quadric_clustering::MergeBlame MergeBlame = quadric_clustering::MergeBlame::Region;
   };
 
   /// The points of the run at which an observer is called.
@@ -183,10 +193,14 @@ public:
     viskores::Id LloydIterations = 0;
     viskores::Id Sweeps = 0;
     /// Clusters flagged by each test over the whole loop, each counted once per round by the
-    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3).
+    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F5).
     viskores::Id FlaggedRadius = 0;
     viskores::Id FlaggedBudget = 0;
     viskores::Id FlaggedTopology = 0;
+    viskores::Id FlaggedEnvelope = 0;
+    /// Pieces examined by the envelope tests, over the run: a machine-independent measure of
+    /// the most expensive step.
+    viskores::Id EnvelopePieces = 0;
     /// Wall-clock seconds spent in each step, the device synchronised.
     struct
     {
@@ -197,6 +211,7 @@ public:
       double Placement = 0;
       double Scan = 0;
       double Topology = 0;
+      double Envelope = 0;
       double InsertSplit = 0;
       double Merge = 0;
       double Output = 0;
@@ -229,6 +244,11 @@ public:
       throw viskores::cont::ErrorBadValue(
         "QuadricClusteringDecimation: the target number of points is negative.");
     }
+    if (this->Params.ErrorBound < 0)
+    {
+      throw viskores::cont::ErrorBadValue(
+        "QuadricClusteringDecimation: the error bound is negative.");
+    }
     this->Diag = Diagnostics{};
     auto& seconds = this->Diag.Seconds;
     viskores::cont::Timer timer;
@@ -245,6 +265,7 @@ public:
 
     // The input: a surface.
     qc::BuildSurfaceMesh(points, triangles, this->Mesh);
+    const qc::EnvelopeSides sides = this->Params.ErrorSides;
     const qc::SurfaceMesh& mesh = this->Mesh;
     const viskores::Id n = mesh.NumberOfPoints;
     const qc::QuadricParameters quadric = this->Params.Quadric;
@@ -269,6 +290,12 @@ public:
     const viskores::cont::ArrayHandle<viskores::UInt8>& isBoundary = mesh.IsBoundaryVertex;
     const viskores::cont::ArrayHandle<viskores::Id2> ringRanges =
       qc::MakeRingRanges(ringOffsets, n);
+    const Real errorBound = this->Params.ErrorBound;
+    qc::DistanceMesh inputDistance;
+    if (errorBound > 0)
+    {
+      inputDistance = qc::BuildDistanceMesh(mesh.Points, mesh.Triangles);
+    }
     const bool topology = this->Params.Topology;
     qc::Clustering& clusters = this->Clusters;
     clusters = qc::Clustering{};
@@ -330,7 +357,8 @@ public:
       }
       else
       {
-        const qc::CurvatureDensity density = qc::ComputeCurvatureDensity(mesh, Real(0), maxRadius);
+        const qc::CurvatureDensity density =
+          qc::ComputeCurvatureDensity(mesh, (budget > 0) ? Real(0) : errorBound, maxRadius);
         const viskores::Id k = (budget > 0) ? budget : qc::CurvatureClusterCount(mesh, density);
         clusters.Labels = (initialization == Initialization::Morton)
           ? qc::SeedLabels(mesh, ringRanges, rings, k)
@@ -400,6 +428,28 @@ public:
                 this->Diag.FlaggedTopology += qc::OrFlags(flags, topologyFlags);
               });
       }
+      // The envelope test needs the discrete closed-ball property, so it runs only when nothing
+      // else is flagged, the topological flags in particular.
+      if (errorBound > 0 && qc::CountFlags(flags) == 0)
+      {
+        timer.Start();
+        viskores::cont::ArrayHandle<viskores::UInt8> envelopeFlags;
+        envelopeFlags.AllocateAndFill(k, 0);
+        const qc::EnvelopeReport envelopeReport =
+          qc::EnvelopeFlags(mesh,
+                            inputDistance,
+                            clusters.Labels,
+                            clusters.Generators,
+                            qc::OutputTriangles(mesh, clusters.Labels),
+                            clusters.Sizes,
+                            errorBound,
+                            sides,
+                            envelopeFlags);
+        this->Diag.EnvelopePieces += envelopeReport.Pieces;
+        this->Diag.FlaggedEnvelope += qc::OrFlags(flags, envelopeFlags);
+        timer.Stop();
+        seconds.Envelope += timer.GetElapsedTime();
+      }
 
       State state{ mesh, this->Quadrics, clusters };
       state.Scan = &scan;
@@ -432,10 +482,13 @@ public:
       qc::MergeParameters merge;
       merge.Budget = budget;
       merge.MaxClusterRadius = maxRadius;
+      merge.ErrorBound = errorBound;
+      merge.Sides = sides;
       merge.D2ByCount = this->Params.D2ByCount;
       merge.DegreeFloor = this->Params.MergeDegreeFloor;
       merge.Order = this->Params.MergeOrder;
       merge.DeferFlagged = this->Params.DeferFlaggedMerges;
+      merge.Blame = this->Params.MergeBlame;
       auto merged =
         [&](const qc::Clustering&, const viskores::cont::ArrayHandle<viskores::Id2>& pairs)
       {
@@ -443,7 +496,7 @@ public:
         state.MergedPairs = &pairs;
         observe(Stage::Merged, state);
       };
-      qc::MergePhase(mesh, this->Quadrics, merge, clusters, this->MergeDiag, merged);
+      qc::MergePhase(mesh, this->Quadrics, inputDistance, merge, clusters, this->MergeDiag, merged);
     }
     timer.Stop();
     seconds.Merge += timer.GetElapsedTime();

@@ -577,6 +577,31 @@ inline viskores::cont::ArrayHandle<viskores::Id3> OutputTriangles(
   return result;
 }
 
+/// Flags, among the clusters with at least two vertices, the cluster of every vertex of a
+/// triangle of `mesh` that `failed` marks. Returns the number of marked triangles.
+inline viskores::Id FlagClustersOfTriangles(
+  const SurfaceMesh& mesh,
+  const viskores::cont::ArrayHandle<viskores::Id>& labels,
+  const viskores::cont::ArrayHandle<viskores::UInt8>& failed,
+  const viskores::cont::ArrayHandle<viskores::Id>& sizes,
+  viskores::cont::ArrayHandle<viskores::UInt8>& flags)
+{
+  using Algorithm = viskores::cont::Algorithm;
+  viskores::cont::ArrayHandle<viskores::Id> failing;
+  Algorithm::CopyIf(viskores::cont::ArrayHandleIndex(mesh.NumberOfTriangles), failed, failing);
+  const viskores::Id numFailing = failing.GetNumberOfValues();
+  if (numFailing > 0)
+  {
+    viskores::cont::Invoker invoke;
+    viskores::cont::ArrayHandle<viskores::Id3> triples;
+    invoke(detail::TriangleLabels{}, failing, mesh.Triangles, labels, triples);
+    viskores::cont::ArrayHandle<viskores::Id> listed;
+    auto grouped = viskores::cont::make_ArrayHandleGroupVec<3>(listed);
+    Algorithm::Copy(triples, grouped);
+    FlagClusters(listed, sizes, flags);
+  }
+  return numFailing;
+}
 }
 }
 } // namespace viskores::worklet::quadric_clustering

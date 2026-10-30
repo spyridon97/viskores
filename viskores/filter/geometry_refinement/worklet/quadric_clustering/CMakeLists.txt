@@ -12,6 +12,7 @@ set(headers
   Assignment.h
   Clustering.h
   CurvatureSeeds.h
+  EnvelopeFlags.h
   Initialization.h
   MergePhase.h
   QuadricClusteringCommonWorklets.h

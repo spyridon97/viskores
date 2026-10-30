@@ -117,6 +117,26 @@ struct IsValidLabel : viskores::worklet::WorkletMapField
   VISKORES_EXEC viskores::UInt8 operator()(viskores::Id label) const { return label >= 0 ? 1 : 0; }
 };
 
+/// The bounding box of a triangle on `points`.
+struct TriangleBox : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                WholeArrayIn points,
+                                FieldOut lower,
+                                FieldOut upper);
+  using ExecutionSignature = void(_1, _2, _3, _4);
+
+  template <typename PointsPortal>
+  VISKORES_EXEC void operator()(const viskores::Id3& triangle,
+                                const PointsPortal& points,
+                                Vec3& lower,
+                                Vec3& upper) const
+  {
+    TriangleBounds(
+      points.Get(triangle[0]), points.Get(triangle[1]), points.Get(triangle[2]), lower, upper);
+  }
+};
+
 /// Component-wise minimum and maximum of two points, for `Reduce`.
 struct ComponentMin
 {
@@ -134,6 +154,28 @@ struct ComponentMax
   }
 };
 
+/// The largest absolute coordinate of a point.
+struct PointMaxAbs : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn point, FieldOut value);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_EXEC Real operator()(const Vec3& p) const { return MaxAbs(p); }
+};
+
+/// The largest absolute coordinate of `points`, 0 for none.
+inline Real MaxAbsCoordinate(const viskores::cont::ArrayHandle<Vec3>& points)
+{
+  if (points.GetNumberOfValues() == 0)
+  {
+    return 0;
+  }
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<Real> values;
+  invoke(PointMaxAbs{}, points, values);
+  return viskores::cont::Algorithm::Reduce(values, Real(0), viskores::Maximum());
+}
+
 /// The two components of a pair.
 struct SplitPair : viskores::worklet::WorkletMapField
 {
@@ -147,6 +189,22 @@ struct SplitPair : viskores::worklet::WorkletMapField
     first = pair[0];
     second = pair[1];
   }
+};
+
+/// `value / Divisor`: the owner of an item in blocks of `Divisor` items.
+struct DivideBy : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn value, FieldOut quotient);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_CONT explicit DivideBy(viskores::Id divisor)
+    : Divisor(divisor)
+  {
+  }
+
+  VISKORES_EXEC viskores::Id operator()(viskores::Id value) const { return value / this->Divisor; }
+
+  viskores::Id Divisor;
 };
 
 /// The three edges of a triangle, each as `SortedEdge`.
@@ -299,6 +357,12 @@ struct MarkIndex : viskores::worklet::WorkletMapField
 
   viskores::UInt8 Value;
 };
+
+/// Whether three labels are distinct: those of a 3-label triangle.
+VISKORES_EXEC_CONT inline bool AllDistinct(viskores::Id a, viskores::Id b, viskores::Id c)
+{
+  return a != b && b != c && a != c;
+}
 
 /// 1 where a state equals `State`.
 struct IsState : viskores::worklet::WorkletMapField

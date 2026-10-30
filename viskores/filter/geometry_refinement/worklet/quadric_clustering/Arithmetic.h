@@ -52,6 +52,20 @@ using Mat3 = viskores::Vec<Real, 9>;
 /// The functions below evaluate their operations in the order written, summing left to right,
 /// so that results are reproducible bit for bit. `viskores::Dot` and friends make no such promise.
 
+/// The bounding box of three points.
+VISKORES_EXEC_CONT inline void TriangleBounds(const Vec3& a,
+                                              const Vec3& b,
+                                              const Vec3& c,
+                                              Vec3& lower,
+                                              Vec3& upper)
+{
+  for (viskores::IdComponent k = 0; k < 3; ++k)
+  {
+    lower[k] = viskores::Min(viskores::Min(a[k], b[k]), c[k]);
+    upper[k] = viskores::Max(viskores::Max(a[k], b[k]), c[k]);
+  }
+}
+
 VISKORES_EXEC_CONT inline Vec3 Cross(const Vec3& a, const Vec3& b)
 {
   return Vec3(a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]);
@@ -75,6 +89,18 @@ VISKORES_EXEC_CONT inline Real Norm(const Vec3& a)
 VISKORES_EXEC_CONT inline Vec3 Add(const Vec3& a, const Vec3& b)
 {
   return Vec3(a[0] + b[0], a[1] + b[1], a[2] + b[2]);
+}
+
+VISKORES_EXEC_CONT inline Vec3 Scale(Real s, const Vec3& a)
+{
+  return Vec3(s * a[0], s * a[1], s * a[2]);
+}
+
+/// The largest absolute coordinate of a point.
+VISKORES_EXEC_CONT inline Real MaxAbs(const Vec3& p)
+{
+  return viskores::Max(viskores::Max(viskores::Abs(p[0]), viskores::Abs(p[1])),
+                       viskores::Abs(p[2]));
 }
 
 VISKORES_EXEC_CONT inline Mat3 MatAdd(const Mat3& a, const Mat3& b)

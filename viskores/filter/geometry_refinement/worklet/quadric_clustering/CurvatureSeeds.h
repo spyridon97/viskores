@@ -31,7 +31,7 @@ namespace quadric_clustering
 {
 
 // The curvature initialisation: seeds spread along the Morton order by a density that follows
-// the curvature of the surface, so that a flat region gets few clusters
+// the curvature of the surface against the error bound, so that a flat region gets few clusters
 // and a curved one many. The weights are integers, and every quantity that decides a seed is an
 // integer or a fixed sequence of IEEE operations, so the seeds are the same on every device and
 // thread count.
@@ -159,7 +159,7 @@ struct CurvatureWeight : viskores::worklet::WorkletMapField
 
 } // namespace detail
 
-/// The curvature weights of the vertices for `epsilon`, or, if it is 0, for 1%
+/// The curvature weights of the vertices for the error bound `epsilon`, or, if it is 0, for 1%
 /// of the largest side of the bounding box: in budget mode only their ratios matter. The radii
 /// are capped by the largest cluster radius `maxRadius`.
 inline CurvatureDensity ComputeCurvatureDensity(
@@ -333,7 +333,7 @@ inline viskores::Id TopologicalFloor(const SurfaceMesh& mesh)
   return Algorithm::Reduce(floors, viskores::Id(0));
 }
 
-/// The number of seeds without a target: `round(total / 2^20)`, half to even, clamped to
+/// The number of seeds of error mode: `round(total / 2^20)`, half to even, clamped to
 /// `[k_lo, max(k_lo, n / 4)]`.
 inline viskores::Id CurvatureClusterCount(const SurfaceMesh& mesh, const CurvatureDensity& density)
 {

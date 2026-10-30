@@ -9,6 +9,7 @@
 #define viskores_worklet_quadric_clustering_MergePhase_h
 
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Clustering.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EnvelopeFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/VertexQuadrics.h>
@@ -21,9 +22,9 @@
 #include <viskores/cont/ArrayHandleIndex.h>
 #include <viskores/cont/ArrayHandlePermutation.h>
 #include <viskores/cont/ArrayHandleView.h>
-#include <viskores/cont/ExecutionObjectBase.h>
 #include <viskores/cont/Timer.h>
 #include <viskores/worklet/Keys.h>
+#include <viskores/worklet/ScatterUniform.h>
 #include <viskores/worklet/WorkletReduceByKey.h>
 
 #include <limits>
@@ -48,17 +49,30 @@ enum class MergeOrder
   Hash
 };
 
+/// Which merges of a batch that fails the full test are deferred.
+enum class MergeBlame
+{
+  /// Those whose merged cluster is flagged.
+  Merged,
+  /// Those, and those with a changed output triangle that meets the region read by a failing item
+  /// that flags no merged cluster (`merge_blame="region"` of proofs/lib/vqc.py).
+  Region
+};
+
 /// What the merge test and the full test of a merge check.
 struct MergeParameters
 {
   bool GeometricFlags() const
   {
-    return this->MaxClusterRadius < std::numeric_limits<Real>::infinity();
+    return this->ErrorBound > 0 || this->MaxClusterRadius < std::numeric_limits<Real>::infinity();
   }
 
-  /// `k*`, or 0 without a target.
+  /// `k*`, or 0 in error mode.
   viskores::Id Budget = 0;
   Real MaxClusterRadius = std::numeric_limits<Real>::infinity();
+  Real ErrorBound = 0;
+  /// The halves of the envelope flag (F5) in use.
+  EnvelopeSides Sides = EnvelopeSides::Both;
   /// (D2) by count of the clusters per closed component instead of by sort of the label triples.
   bool D2ByCount = false;
   /// The floor `D_0` of the degree key of the priority, or a negative value to order the
@@ -70,6 +84,8 @@ struct MergeParameters
   /// flagged and test the others again, or, if false, merge only the candidate of highest
   /// priority.
   bool DeferFlagged = true;
+  /// Which merges `DeferFlagged` defers.
+  MergeBlame Blame = MergeBlame::Region;
 };
 
 struct MergeDiagnostics
@@ -79,6 +95,8 @@ struct MergeDiagnostics
   viskores::Id Fallbacks = 0;
   /// Merges deferred to a later round because their merged cluster was flagged.
   viskores::Id Deferred = 0;
+  /// Of those, the merges deferred by the region blame alone.
+  viskores::Id BlameDeferred = 0;
   /// Local tests evaluated, and verdicts of earlier rounds reused instead.
   viskores::Id Evaluated = 0;
   viskores::Id Reused = 0;
@@ -91,6 +109,27 @@ struct MergeDiagnostics
   std::vector<double> RoundSeconds;
 };
 
+/// The largest absolute coordinate of the generators with clusters `i` and `j` replaced by one
+/// at `mergedAbs`: the one term of a local test that reads the whole labelling. It keeps the
+/// three largest absolute coordinates of the generators, with their clusters.
+struct MergedScale
+{
+  VISKORES_EXEC_CONT Real operator()(viskores::Id i, viskores::Id j, Real mergedAbs) const
+  {
+    for (int slot = 0; slot < 3; ++slot)
+    {
+      if (this->TopLabel[slot] >= 0 && this->TopLabel[slot] != i && this->TopLabel[slot] != j)
+      {
+        return viskores::Max(mergedAbs, this->TopAbs[slot]);
+      }
+    }
+    return mergedAbs;
+  }
+
+  viskores::Vec<Real, 3> TopAbs;
+  viskores::Vec<viskores::Id, 3> TopLabel;
+};
+
 /// The data the local test of a merge reads, in the execution environment.
 struct MergeContextPortals
 {
@@ -98,12 +137,108 @@ struct MergeContextPortals
   using IdPortal = viskores::cont::ArrayHandle<viskores::Id>::ReadPortalType;
   using Id3Portal = viskores::cont::ArrayHandle<viskores::Id3>::ReadPortalType;
   using MatPortal = viskores::cont::ArrayHandle<Mat3>::ReadPortalType;
+  using FlagPortal = viskores::cont::ArrayHandle<viskores::UInt8>::ReadPortalType;
+  using Distance = DistanceMeshPortals<
+    VecPortal,
+    Id3Portal,
+    viskores::worklet::spatialstructure::BoundingVolumeHierarchy::ExecObjectType>;
 
-  /// The local test of a merge of Section 11.5: (F0) on the merged
+  /// Calls `visit(P, labels, t)` for every triangle of `K/ij` at the merged vertex `i`, realised
+  /// with `i` at `merged`: the triangles at `i` or `j`, relabelled, but not those at both, which
+  /// degenerate. They are visited in the order of the fans of `i`, then of `j`.
+  template <typename Visit>
+  VISKORES_EXEC bool ForEachNewTriangle(viskores::Id i,
+                                        viskores::Id j,
+                                        const Vec3& merged,
+                                        Visit&& visit) const
+  {
+    for (int which = 0; which < 2; ++which)
+    {
+      const viskores::Id c = (which == 0) ? i : j;
+      for (viskores::Id f = this->FanOffsets.Get(c); f < this->FanOffsets.Get(c + 1); ++f)
+      {
+        const viskores::Id t = this->Fans.Get(f);
+        viskores::Id3 labels = this->OutputTriangles.Get(t);
+        bool hasI = false, hasJ = false;
+        for (int k = 0; k < 3; ++k)
+        {
+          hasI = hasI || labels[k] == i;
+          hasJ = hasJ || labels[k] == j;
+        }
+        if (hasI && hasJ)
+        {
+          continue;
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+          if (labels[k] == j)
+          {
+            labels[k] = i;
+          }
+        }
+        Vec3 p[3];
+        for (int k = 0; k < 3; ++k)
+        {
+          p[k] = (labels[k] == i) ? merged : this->Generators.Get(labels[k]);
+        }
+        if (!visit(p, labels, t))
+        {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  VISKORES_EXEC bool Incident(viskores::Id t, viskores::Id i, viskores::Id j) const
+  {
+    const viskores::Id3 tri = this->OutputTriangles.Get(t);
+    for (int c = 0; c < 3; ++c)
+    {
+      if (tri[c] == i || tri[c] == j)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// The local test of a merge of Section 11.5 but for the envelope: (F0) on the merged
   /// cluster. Sets `merged` to the position of the merged generator.
   VISKORES_EXEC bool Admissible(viskores::Id i, viskores::Id j, Vec3& merged) const;
 
+  /// Visits the input triangles the envelope part of the local test reads, as `visit(t, tri,
+  /// tests)`, with the tests each needs: bit 0, its simplex in the merged labelling against the
+  /// input ((F5)(i), the 3-label triangles with a vertex in the merged cluster); bit 1, the
+  /// triangle against `K/ij` ((F5)(ii), the triangles with a vertex in the merged cluster and
+  /// those whose box meets the box of the removed output triangles grown by epsilon). Only the
+  /// triangles with `D(t) > epsilon` are visited. `parts` selects the triangles with a vertex
+  /// in the merged cluster (bit 0) and the others (bit 1).
+  template <typename Visit>
+  VISKORES_EXEC void ForEachEnvelopeItem(viskores::Id i,
+                                         viskores::Id j,
+                                         const Vec3& merged,
+                                         viskores::UInt8 parts,
+                                         bool& complete,
+                                         Visit&& visit) const;
+
+  /// The tests `tests` of `ForEachEnvelopeItem` on input triangle `t`. `scaleInput` and
+  /// `scaleOutput` are `S (1 + 16 u)` of the two batches of tests of the merge.
+  VISKORES_EXEC bool TestEnvelopeItem(viskores::Id i,
+                                      viskores::Id j,
+                                      const Vec3& merged,
+                                      viskores::Id t,
+                                      viskores::UInt8 tests,
+                                      Real scaleInput,
+                                      Real scaleOutput,
+                                      bool& complete) const;
+
   VecPortal Points;
+  Id3Portal InputTriangles;
+  IdPortal CornerOffsets;
+  IdPortal Corners;
+  viskores::Id NumberOfInputTriangles;
+  IdPortal Labels;
   IdPortal MemberOffsets;
   IdPortal Members;
   IdPortal Anchors;
@@ -113,7 +248,14 @@ struct MergeContextPortals
   Id3Portal OutputTriangles;
   IdPortal FanOffsets;
   IdPortal Fans;
+  Distance Input;
+  Distance Output;
   Real MaxRadius;
+  Real Epsilon;
+  /// The halves of (F5) in use, as the bits of the tests of `ForEachEnvelopeItem`.
+  viskores::UInt8 SideTests;
+  /// The largest absolute coordinate of the generators with two clusters replaced.
+  MergedScale Scale;
 };
 
 VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
@@ -165,6 +307,246 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
   return true;
 }
 
+/// Grows the box `[lower, upper]` by `epsilon`, with a margin for the rounding of the bounds,
+/// `size` the largest coordinate they come from.
+VISKORES_EXEC_CONT inline void GrowBox(Vec3& lower, Vec3& upper, Real epsilon, Real size)
+{
+  const Real grow = epsilon * (1 + Real(1e-9)) + 64 * UnitRoundoff * size;
+  for (int a = 0; a < 3; ++a)
+  {
+    lower[a] = lower[a] - grow;
+    upper[a] = upper[a] + grow;
+  }
+}
+
+template <typename Visit>
+VISKORES_EXEC inline void MergeContextPortals::ForEachEnvelopeItem(viskores::Id i,
+                                                                   viskores::Id j,
+                                                                   const Vec3& merged,
+                                                                   viskores::UInt8 parts,
+                                                                   bool& complete,
+                                                                   Visit&& visit) const
+{
+  const Real epsilon = this->Epsilon;
+  // Only the tests of the halves in use.
+  auto emit = [&](viskores::Id t, const viskores::Id3& tri, viskores::UInt8 tests)
+  {
+    tests = static_cast<viskores::UInt8>(tests & this->SideTests);
+    if (tests != 0)
+    {
+      visit(t, tri, tests);
+    }
+  };
+  auto inMerged = [&](viskores::Id v)
+  {
+    const viskores::Id l = this->Labels.Get(v);
+    return l == i || l == j;
+  };
+  auto generator = [&](viskores::Id l)
+  { return (l == i || l == j) ? merged : this->Generators.Get(l); };
+  auto newLabel = [&](viskores::Id l) { return (l == j) ? i : l; };
+  auto displacementExceeds = [&](const viskores::Id3& tri)
+  {
+    Real d = 0;
+    for (int k = 0; k < 3; ++k)
+    {
+      const Vec3 p = this->Points.Get(tri[k]);
+      d = viskores::Max(d, Norm(Sub(generator(this->Labels.Get(tri[k])), p)));
+    }
+    return DisplacementExceeds(d, epsilon);
+  };
+  // The input triangles with a vertex in the merged cluster, each from its smallest vertex there.
+  for (int which = 0; which < 2 && (parts & 1) != 0; ++which)
+  {
+    const viskores::Id c = (which == 0) ? i : j;
+    for (viskores::Id k = this->MemberOffsets.Get(c); k < this->MemberOffsets.Get(c + 1); ++k)
+    {
+      const viskores::Id v = this->Members.Get(k);
+      for (viskores::Id r = this->CornerOffsets.Get(v); r < this->CornerOffsets.Get(v + 1); ++r)
+      {
+        const viskores::Id t = this->Corners.Get(r) % this->NumberOfInputTriangles;
+        const viskores::Id3 tri = this->InputTriangles.Get(t);
+        viskores::Id first = -1;
+        for (int a = 0; a < 3; ++a)
+        {
+          if (inMerged(tri[a]) && (first < 0 || tri[a] < first))
+          {
+            first = tri[a];
+          }
+        }
+        if (first != v || !displacementExceeds(tri))
+        {
+          continue;
+        }
+        const viskores::Id a = newLabel(this->Labels.Get(tri[0]));
+        const viskores::Id b = newLabel(this->Labels.Get(tri[1]));
+        const viskores::Id d = newLabel(this->Labels.Get(tri[2]));
+        emit(t, tri, viskores::UInt8((a != b && b != d && a != d) ? 3 : 2));
+      }
+    }
+  }
+  if ((parts & 2) == 0)
+  {
+    return;
+  }
+  // The input triangles away from the merged cluster near a removed output triangle.
+  Vec3 lo(std::numeric_limits<Real>::infinity()), hi(-std::numeric_limits<Real>::infinity());
+  for (int which = 0; which < 2; ++which)
+  {
+    const viskores::Id c = (which == 0) ? i : j;
+    for (viskores::Id f = this->FanOffsets.Get(c); f < this->FanOffsets.Get(c + 1); ++f)
+    {
+      const viskores::Id3 tri = this->OutputTriangles.Get(this->Fans.Get(f));
+      for (int k = 0; k < 3; ++k)
+      {
+        const Vec3 p = this->Generators.Get(tri[k]);
+        for (int a = 0; a < 3; ++a)
+        {
+          lo[a] = viskores::Min(lo[a], p[a]);
+          hi[a] = viskores::Max(hi[a], p[a]);
+        }
+      }
+    }
+  }
+  // Grown by epsilon with a margin for the rounding of the bounds, as proofs/lib/vqc.py: the
+  // largest coordinate of the removed triangles and of the input.
+  Real size = this->Input.MaxAbsCoordinate;
+  for (int a = 0; a < 3; ++a)
+  {
+    size = viskores::Max(size, viskores::Max(viskores::Abs(lo[a]), viskores::Abs(hi[a])));
+  }
+  GrowBox(lo, hi, epsilon, size);
+  const bool done = this->Input.Hierarchy.ForEachOverlap(
+    lo,
+    hi,
+    [&](viskores::Id t)
+    {
+      const viskores::Id3 tri = this->InputTriangles.Get(t);
+      if (!inMerged(tri[0]) && !inMerged(tri[1]) && !inMerged(tri[2]) && displacementExceeds(tri))
+      {
+        emit(t, tri, viskores::UInt8(2));
+      }
+      return true;
+    });
+  complete = complete && done;
+}
+
+/// The distance to `K/ij`: the triangles of `K` not at `i` or `j`, and the new triangles at the
+/// merged vertex.
+struct MergedOutputDistance
+{
+  /// The distance when it is at most `cutoff`, and otherwise some value above `cutoff`.
+  VISKORES_EXEC Real DistanceUpTo(const Vec3& p,
+                                  Real cutoff,
+                                  bool& complete,
+                                  const CentroidSeeds* seeds = nullptr) const
+  {
+    Real best = this->Context.Output.DistanceSkipping(
+      p,
+      [&](viskores::Id t) { return this->Context.Incident(t, this->I, this->J); },
+      cutoff,
+      complete,
+      seeds);
+    this->Context.ForEachNewTriangle(this->I,
+                                     this->J,
+                                     this->Merged,
+                                     [&](const Vec3* q, const viskores::Id3&, viskores::Id)
+                                     {
+                                       best = viskores::Min(
+                                         best, PointTriangleDistanceUpper(p, q[0], q[1], q[2]));
+                                       return true;
+                                     });
+    return best;
+  }
+
+  using Seeds = CentroidSeeds;
+
+  VISKORES_EXEC bool WithinOneTriangle(const Vec3* s,
+                                       Real bound,
+                                       Real margin,
+                                       bool& complete,
+                                       CentroidSeeds& seeds) const
+  {
+    // The candidates among the triangles of K/ij, ties broken by their index in K.
+    const Vec3 q = TriangleCentroid(s[0], s[1], s[2]);
+    CentroidCandidates candidates;
+    this->Context.Output.NearestCentroids(
+      q,
+      [&](viskores::Id t) { return this->Context.Incident(t, this->I, this->J); },
+      candidates,
+      complete,
+      &seeds);
+    this->Context.ForEachNewTriangle(this->I,
+                                     this->J,
+                                     this->Merged,
+                                     [&](const Vec3* p, const viskores::Id3&, viskores::Id t)
+                                     {
+                                       candidates.Offer(
+                                         Norm(Sub(TriangleCentroid(p[0], p[1], p[2]), q)),
+                                         viskores::Id3(t, 0, 0),
+                                         p[0],
+                                         p[1],
+                                         p[2]);
+                                       return true;
+                                     });
+    seeds.Keep(candidates);
+    return candidates.Passes(s, bound, margin);
+  }
+
+  const MergeContextPortals& Context;
+  viskores::Id I;
+  viskores::Id J;
+  Vec3 Merged;
+};
+
+VISKORES_EXEC inline bool MergeContextPortals::TestEnvelopeItem(viskores::Id i,
+                                                                viskores::Id j,
+                                                                const Vec3& merged,
+                                                                viskores::Id t,
+                                                                viskores::UInt8 tests,
+                                                                Real scaleInput,
+                                                                Real scaleOutput,
+                                                                bool& complete) const
+{
+  const viskores::Id3 tri = this->InputTriangles.Get(t);
+  viskores::Id pieces = 0;
+  auto generator = [&](viskores::Id l)
+  { return (l == i || l == j) ? merged : this->Generators.Get(l); };
+  bool done = true;
+  if ((tests & 1) != 0)
+  {
+    const CertifiedWithin test{ this->Epsilon, scaleInput };
+    const bool within = test(generator(this->Labels.Get(tri[0])),
+                             generator(this->Labels.Get(tri[1])),
+                             generator(this->Labels.Get(tri[2])),
+                             this->Input,
+                             pieces,
+                             done);
+    complete = complete && done;
+    if (!within)
+    {
+      return false;
+    }
+  }
+  if ((tests & 2) != 0)
+  {
+    const CertifiedWithin test{ this->Epsilon, scaleOutput };
+    const MergedOutputDistance distance{ *this, i, j, merged };
+    const bool within = test(this->Points.Get(tri[0]),
+                             this->Points.Get(tri[1]),
+                             this->Points.Get(tri[2]),
+                             distance,
+                             pieces,
+                             done);
+    complete = complete && done;
+    if (!within)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// The output complex `K` of a labelling, with the incidences the merge phase reads.
 struct OutputComplex
 {
@@ -194,6 +576,11 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
   {
     MergeContextPortals portals;
     portals.Points = this->Mesh->Points.PrepareForInput(device, token);
+    portals.InputTriangles = this->Mesh->Triangles.PrepareForInput(device, token);
+    portals.CornerOffsets = this->Mesh->VertexCornerOffsets.PrepareForInput(device, token);
+    portals.Corners = this->Mesh->VertexCorners.PrepareForInput(device, token);
+    portals.NumberOfInputTriangles = this->Mesh->NumberOfTriangles;
+    portals.Labels = this->Clusters->Labels.PrepareForInput(device, token);
     portals.MemberOffsets = this->Clusters->Keys.GetOffsets().PrepareForInput(device, token);
     portals.Members = this->Clusters->Keys.GetSortedValuesMap().PrepareForInput(device, token);
     portals.Anchors = this->Clusters->Anchors.PrepareForInput(device, token);
@@ -202,7 +589,12 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
     portals.OutputTriangles = this->Complex->Triangles.PrepareForInput(device, token);
     portals.FanOffsets = this->Complex->FanOffsets.PrepareForInput(device, token);
     portals.Fans = this->Complex->Fans.PrepareForInput(device, token);
+    portals.Input = DistanceMeshObject(this->Input).PrepareForExecution(device, token);
+    portals.Output = DistanceMeshObject(this->Output).PrepareForExecution(device, token);
     portals.MaxRadius = this->MaxRadius;
+    portals.Epsilon = this->Epsilon;
+    portals.SideTests = static_cast<viskores::UInt8>(this->Sides);
+    portals.Scale = this->Scale;
     return portals;
   }
 
@@ -210,7 +602,12 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
   const Clustering* Clusters;
   const OutputComplex* Complex;
   viskores::cont::ArrayHandle<Mat3> VertexMatrices;
+  DistanceMesh Input;
+  DistanceMesh Output;
   Real MaxRadius;
+  Real Epsilon;
+  EnvelopeSides Sides = EnvelopeSides::Both;
+  MergedScale Scale;
 };
 
 namespace detail
@@ -230,15 +627,19 @@ struct ReuseVerdict : viskores::worklet::WorkletMapField
   using ControlSignature = void(FieldIn pair,
                                 WholeArrayIn anchors,
                                 WholeArrayIn keys,
+                                WholeArrayIn mergedAbs,
+                                WholeArrayIn scales,
                                 WholeArrayIn admissible,
                                 FieldInOut memo,
                                 FieldOut reused);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8);
 
-  template <typename IdPortal, typename KeyPortal, typename FlagPortal>
+  template <typename IdPortal, typename KeyPortal, typename RealPortal, typename FlagPortal>
   VISKORES_EXEC void operator()(const viskores::Id2& pair,
                                 const IdPortal& anchors,
                                 const KeyPortal& keys,
+                                const RealPortal& mergedAbs,
+                                const RealPortal& scales,
                                 const FlagPortal& admissible,
                                 viskores::UInt8& memo,
                                 viskores::Id& reused) const
@@ -246,27 +647,42 @@ struct ReuseVerdict : viskores::worklet::WorkletMapField
     reused = 0;
     const viskores::Id e =
       FindSorted(keys, viskores::Id2(anchors.Get(pair[0]), anchors.Get(pair[1])));
-    if (e >= 0)
+    if (e >= 0 && this->Scale(pair[0], pair[1], mergedAbs.Get(e)) == scales.Get(e))
     {
       memo = admissible.Get(e) ? Admissible : Inadmissible;
       reused = 1;
     }
   }
+
+  MergedScale Scale;
 };
 
-/// The key of an evaluated candidate.
+/// The key, the largest absolute coordinate of the merged generator and the scale of an
+/// evaluated candidate.
 struct VerdictEntry : viskores::worklet::WorkletMapField
 {
-  using ControlSignature = void(FieldIn pair, WholeArrayIn anchors, FieldOut key);
-  using ExecutionSignature = void(_1, _2, _3);
+  using ControlSignature = void(FieldIn pair,
+                                FieldIn merged,
+                                WholeArrayIn anchors,
+                                FieldOut key,
+                                FieldOut mergedAbs,
+                                FieldOut scale);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
 
   template <typename IdPortal>
   VISKORES_EXEC void operator()(const viskores::Id2& pair,
+                                const Vec3& merged,
                                 const IdPortal& anchors,
-                                viskores::Id2& key) const
+                                viskores::Id2& key,
+                                Real& mergedAbs,
+                                Real& scale) const
   {
     key = viskores::Id2(anchors.Get(pair[0]), anchors.Get(pair[1]));
+    mergedAbs = MaxAbs(merged);
+    scale = this->Scale(pair[0], pair[1], mergedAbs);
   }
+
+  MergedScale Scale;
 };
 
 /// The key of an entry with its position, so that a sort keeps insertion order among equal keys.
@@ -426,15 +842,17 @@ struct VerdictHolds : viskores::worklet::WorkletMapField
 } // namespace detail
 
 /// The verdicts of the local tests, kept across the rounds of the merge phase. A local test
-/// reads only what lies in the box of `EvaluateMerge`; its verdict holds while neither cluster
-/// merges and no merge changes anything in the box. The clusters are
+/// reads only what lies in the box of `EvaluateMerge`, and the largest coordinate of the
+/// generators away from the two clusters; its verdict holds while neither cluster merges, no
+/// merge changes anything in the box, and that coordinate stays the same. The clusters are
 /// known by their anchors, which the renumbering of the labels keeps. The entries are kept
 /// sorted by the anchors of the two clusters.
 class VerdictCache
 {
 public:
   /// Sets `memo` of the candidates `pairs` whose verdicts hold. Returns how many.
-  viskores::Id Reuse(const Clustering& clusters,
+  viskores::Id Reuse(const MergeContextObject& context,
+                     const Clustering& clusters,
                      const viskores::cont::ArrayHandle<viskores::Id2>& pairs,
                      viskores::cont::ArrayHandle<viskores::UInt8>& memo) const
   {
@@ -443,24 +861,38 @@ public:
       return 0;
     }
     viskores::cont::Invoker invoke;
+    detail::ReuseVerdict reuse;
+    reuse.Scale = context.Scale;
     viskores::cont::ArrayHandle<viskores::Id> reused;
-    invoke(
-      detail::ReuseVerdict{}, pairs, clusters.Anchors, this->Keys, this->Admissible, memo, reused);
+    invoke(reuse,
+           pairs,
+           clusters.Anchors,
+           this->Keys,
+           this->MergedAbs,
+           this->Scales,
+           this->Admissible,
+           memo,
+           reused);
     return viskores::cont::Algorithm::Reduce(reused, viskores::Id(0));
   }
 
   /// Keeps the verdicts of the local tests of `pairs`, in place of earlier ones of the same
   /// clusters.
-  void Remember(const Clustering& clusters,
+  void Remember(const MergeContextObject& context,
+                const Clustering& clusters,
                 const viskores::cont::ArrayHandle<viskores::Id2>& pairs,
                 const viskores::cont::ArrayHandle<viskores::UInt8>& admissible,
+                const viskores::cont::ArrayHandle<Vec3>& merged,
                 const viskores::cont::ArrayHandle<Vec3>& lower,
                 const viskores::cont::ArrayHandle<Vec3>& upper)
   {
     using Algorithm = viskores::cont::Algorithm;
     viskores::cont::Invoker invoke;
+    detail::VerdictEntry entry;
+    entry.Scale = context.Scale;
     viskores::cont::ArrayHandle<viskores::Id2> keys;
-    invoke(detail::VerdictEntry{}, pairs, clusters.Anchors, keys);
+    viskores::cont::ArrayHandle<Real> mergedAbs, scales;
+    invoke(entry, pairs, merged, clusters.Anchors, keys, mergedAbs, scales);
     // The old entries, then the new; the last entry of every key wins.
     auto allKeys = viskores::cont::make_ArrayHandleConcatenate(this->Keys, keys);
     viskores::cont::ArrayHandle<viskores::Id3> ordered;
@@ -478,6 +910,8 @@ public:
                  allKeys,
                  viskores::cont::make_ArrayHandleConcatenate(this->Lower, lower),
                  viskores::cont::make_ArrayHandleConcatenate(this->Upper, upper),
+                 viskores::cont::make_ArrayHandleConcatenate(this->MergedAbs, mergedAbs),
+                 viskores::cont::make_ArrayHandleConcatenate(this->Scales, scales),
                  viskores::cont::make_ArrayHandleConcatenate(this->Admissible, admissible));
   }
 
@@ -529,37 +963,325 @@ public:
     viskores::cont::ArrayHandle<viskores::Id> kept;
     Algorithm::CopyIf(
       viskores::cont::ArrayHandleIndex(this->Keys.GetNumberOfValues()), holds, kept);
-    this->Gather(kept, this->Keys, this->Lower, this->Upper, this->Admissible);
+    this->Gather(
+      kept, this->Keys, this->Lower, this->Upper, this->MergedAbs, this->Scales, this->Admissible);
   }
 
 private:
   /// Replaces the entries by the entries `kept` of the given arrays, in order.
-  template <typename KeyArray, typename LowerArray, typename UpperArray, typename FlagArray>
+  template <typename KeyArray,
+            typename LowerArray,
+            typename UpperArray,
+            typename AbsArray,
+            typename ScaleArray,
+            typename FlagArray>
   void Gather(const viskores::cont::ArrayHandle<viskores::Id>& kept,
               const KeyArray& keys,
               const LowerArray& lower,
               const UpperArray& upper,
+              const AbsArray& mergedAbs,
+              const ScaleArray& scales,
               const FlagArray& admissible)
   {
     using Algorithm = viskores::cont::Algorithm;
     viskores::cont::ArrayHandle<viskores::Id2> newKeys;
     viskores::cont::ArrayHandle<Vec3> newLower, newUpper;
+    viskores::cont::ArrayHandle<Real> newAbs, newScales;
     viskores::cont::ArrayHandle<viskores::UInt8> newAdmissible;
     Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(kept, keys), newKeys);
     Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(kept, lower), newLower);
     Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(kept, upper), newUpper);
+    Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(kept, mergedAbs), newAbs);
+    Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(kept, scales), newScales);
     Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(kept, admissible), newAdmissible);
     this->Keys = newKeys;
     this->Lower = newLower;
     this->Upper = newUpper;
+    this->MergedAbs = newAbs;
+    this->Scales = newScales;
     this->Admissible = newAdmissible;
   }
 
   viskores::cont::ArrayHandle<viskores::Id2> Keys;
   viskores::cont::ArrayHandle<Vec3> Lower;
   viskores::cont::ArrayHandle<Vec3> Upper;
+  viskores::cont::ArrayHandle<Real> MergedAbs;
+  viskores::cont::ArrayHandle<Real> Scales;
   viskores::cont::ArrayHandle<viskores::UInt8> Admissible;
 };
+
+/// A labelling whose envelope verdicts are known, against which the merge phase tests the
+/// labellings it tries: the clusters, their output triangles and the verdicts.
+struct EnvelopeBase
+{
+  Clustering Clusters;
+  viskores::cont::ArrayHandle<viskores::Id3> Triangles;
+  EnvelopeVerdicts Verdicts;
+};
+
+/// The bases of the merge phase: the last labelling committed, and the last whose full test
+/// fired with every envelope verdict known. In a run of rounds that fall back to one merge, the
+/// set tried next differs from the one that fired by a few merges, and from the committed
+/// labelling by all of them.
+struct EnvelopeBases
+{
+  EnvelopeBase Committed;
+  EnvelopeBase Rejected;
+};
+
+namespace detail
+{
+
+/// Whether the cluster with `anchor` is not the base cluster of its anchor, with the same
+/// members and the bit-identical generator, as far as the size and the generator tell;
+/// `LeavesBaseCluster` checks the members.
+struct ChangedCluster : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn anchor,
+                                FieldIn size,
+                                FieldIn generator,
+                                WholeArrayIn baseLabels,
+                                WholeArrayIn baseSizes,
+                                WholeArrayIn baseGenerators,
+                                FieldOut changed);
+  using ExecutionSignature = _7(_1, _2, _3, _4, _5, _6);
+
+  template <typename IdPortal, typename VecPortal>
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::Id anchor,
+                                           viskores::Id size,
+                                           const Vec3& generator,
+                                           const IdPortal& baseLabels,
+                                           const IdPortal& baseSizes,
+                                           const VecPortal& baseGenerators) const
+  {
+    const viskores::Id b = baseLabels.Get(anchor);
+    const Vec3 g = baseGenerators.Get(b);
+    return (baseSizes.Get(b) != size || std::memcmp(&g, &generator, sizeof(Vec3)) != 0) ? 1 : 0;
+  }
+};
+
+/// Marks the cluster of a vertex changed if the vertex is in another base cluster than the
+/// anchor of its cluster. A cluster whose members all lie in one base cluster, of its size, is
+/// that cluster. The committed base is refined by every labelling tried, so this marks nothing
+/// against it; a rejected one is not, and two clusters of the same anchor and size may differ.
+struct LeavesBaseCluster : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn label,
+                                FieldIn baseLabel,
+                                WholeArrayIn anchors,
+                                WholeArrayIn baseLabels,
+                                WholeArrayInOut changed);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5);
+
+  template <typename IdPortal, typename FlagPortal>
+  VISKORES_EXEC void operator()(viskores::Id label,
+                                viskores::Id baseLabel,
+                                const IdPortal& anchors,
+                                const IdPortal& baseLabels,
+                                FlagPortal& changed) const
+  {
+    if (baseLabel != baseLabels.Get(anchors.Get(label)))
+    {
+      changed.Set(label, 1);
+    }
+  }
+};
+
+/// Whether the cluster of a base anchor is changed in the labelling tried.
+struct ChangedBaseCluster : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn anchor,
+                                WholeArrayIn labels,
+                                WholeArrayIn changed,
+                                FieldOut out);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename IdPortal, typename FlagPortal>
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::Id anchor,
+                                           const IdPortal& labels,
+                                           const FlagPortal& changed) const
+  {
+    return changed.Get(labels.Get(anchor));
+  }
+};
+
+/// The box of an output triangle with a changed label, and whether it has one.
+struct ChangedTriangleBox : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                WholeArrayIn changed,
+                                WholeArrayIn generators,
+                                FieldOut isChanged,
+                                FieldOut lower,
+                                FieldOut upper);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+
+  template <typename FlagPortal, typename VecPortal>
+  VISKORES_EXEC void operator()(const viskores::Id3& t,
+                                const FlagPortal& changed,
+                                const VecPortal& generators,
+                                viskores::UInt8& isChanged,
+                                Vec3& lower,
+                                Vec3& upper) const
+  {
+    isChanged = (changed.Get(t[0]) || changed.Get(t[1]) || changed.Get(t[2])) ? 1 : 0;
+    TriangleBounds(generators.Get(t[0]), generators.Get(t[1]), generators.Get(t[2]), lower, upper);
+  }
+};
+
+/// Whether the envelope test of an input triangle may read something that differs from the base:
+/// a vertex in a changed cluster, or a changed output triangle whose box meets, closed, the
+/// region of the output that its test read.
+struct AffectedTriangle : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                FieldIn lower,
+                                FieldIn upper,
+                                WholeArrayIn labels,
+                                WholeArrayIn changed,
+                                ExecObject changedTriangles,
+                                FieldOut affected);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7);
+
+  template <typename IdPortal, typename FlagPortal, typename Hierarchy>
+  VISKORES_EXEC void operator()(const viskores::Id3& t,
+                                const Vec3& lower,
+                                const Vec3& upper,
+                                const IdPortal& labels,
+                                const FlagPortal& changed,
+                                const Hierarchy& changedTriangles,
+                                viskores::UInt8& affected) const
+  {
+    affected = 0;
+    for (int k = 0; k < 3; ++k)
+    {
+      if (changed.Get(labels.Get(t[k])))
+      {
+        affected = 1;
+        return;
+      }
+    }
+    changedTriangles.ForEachOverlap(lower,
+                                    upper,
+                                    [&](viskores::Id)
+                                    {
+                                      affected = 1;
+                                      return false;
+                                    });
+  }
+};
+
+} // namespace detail
+
+/// The input triangles whose envelope test on `clusters`, with output triangles `triangles`, may
+/// read something that differs from its test on `base`. A cluster is changed unless it has the
+/// members and the bit-identical generator of a base cluster; an output triangle is changed if
+/// one of its labels is. Every other output triangle is in both outputs with the same points, and
+/// its relative order, which breaks the ties of the single-triangle candidates, is the same: the
+/// output triangles are ordered by their first input triangle, and the labels are renumbered in
+/// order. A test reads the output only through its distance queries, which reach the triangles
+/// whose boxes meet the ball of radius epsilon around the query, and its single-triangle
+/// candidates, which a centroid farther than the last candidate kept cannot enter or leave.
+inline viskores::cont::ArrayHandle<viskores::UInt8> AffectedTriangles(
+  const SurfaceMesh& mesh,
+  const EnvelopeBase& base,
+  const Clustering& clusters,
+  const viskores::cont::ArrayHandle<viskores::Id3>& triangles)
+{
+  using Algorithm = viskores::cont::Algorithm;
+  viskores::cont::Invoker invoke;
+  const Clustering& previous = base.Clusters;
+  viskores::cont::ArrayHandle<viskores::UInt8> changed, changedBefore;
+  invoke(detail::ChangedCluster{},
+         clusters.Anchors,
+         clusters.Sizes,
+         clusters.Generators,
+         previous.Labels,
+         previous.Sizes,
+         previous.Generators,
+         changed);
+  invoke(detail::LeavesBaseCluster{},
+         clusters.Labels,
+         previous.Labels,
+         clusters.Anchors,
+         previous.Labels,
+         changed);
+  invoke(detail::ChangedBaseCluster{}, previous.Anchors, clusters.Labels, changed, changedBefore);
+  // The boxes of the changed output triangles, removed and new.
+  viskores::cont::ArrayHandle<viskores::UInt8> isChanged;
+  viskores::cont::ArrayHandle<Vec3> lower, upper, removedLower, removedUpper, newLower, newUpper;
+  invoke(detail::ChangedTriangleBox{},
+         base.Triangles,
+         changedBefore,
+         previous.Generators,
+         isChanged,
+         lower,
+         upper);
+  Algorithm::CopyIf(lower, isChanged, removedLower);
+  Algorithm::CopyIf(upper, isChanged, removedUpper);
+  invoke(
+    detail::ChangedTriangleBox{}, triangles, changed, clusters.Generators, isChanged, lower, upper);
+  Algorithm::CopyIf(lower, isChanged, newLower);
+  Algorithm::CopyIf(upper, isChanged, newUpper);
+  Algorithm::Copy(viskores::cont::make_ArrayHandleConcatenate(removedLower, newLower), lower);
+  Algorithm::Copy(viskores::cont::make_ArrayHandleConcatenate(removedUpper, newUpper), upper);
+  const viskores::worklet::spatialstructure::BoundingVolumeHierarchy changedTriangles(lower, upper);
+  viskores::cont::ArrayHandle<viskores::UInt8> affected;
+  invoke(detail::AffectedTriangle{},
+         mesh.Triangles,
+         base.Verdicts.Lower,
+         base.Verdicts.Upper,
+         clusters.Labels,
+         changed,
+         changedTriangles,
+         affected);
+  return affected;
+}
+
+/// (F5) on a labelling of the merge phase: in full, or with `bases` only on the triangles whose
+/// verdicts can differ from those of the base that leaves the fewest (`AffectedTriangles`), with
+/// the verdicts of the whole test. Stores the verdicts in `verdicts`.
+inline void MergeEnvelopeFlags(const SurfaceMesh& mesh,
+                               const DistanceMesh& inputDistance,
+                               const Clustering& clusters,
+                               const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
+                               const MergeParameters& parameters,
+                               viskores::cont::ArrayHandle<viskores::UInt8>& flags,
+                               const EnvelopeBases* bases,
+                               EnvelopeVerdicts* verdicts)
+{
+  const EnvelopeBase* base = bases ? &bases->Committed : nullptr;
+  viskores::cont::ArrayHandle<viskores::UInt8> affected;
+  if (base)
+  {
+    affected = AffectedTriangles(mesh, *base, clusters, triangles);
+    if (bases->Rejected.Verdicts.FailedOutput.GetNumberOfValues() > 0)
+    {
+      viskores::cont::ArrayHandle<viskores::UInt8> affectedRejected =
+        AffectedTriangles(mesh, bases->Rejected, clusters, triangles);
+      if (viskores::cont::Algorithm::Reduce(affectedRejected, viskores::Id(0)) <
+          viskores::cont::Algorithm::Reduce(affected, viskores::Id(0)))
+      {
+        base = &bases->Rejected;
+        affected = affectedRejected;
+      }
+    }
+  }
+  EnvelopeVerdicts local;
+  EnvelopeVerdicts& out = verdicts ? *verdicts : local;
+  EnvelopeFlags(mesh,
+                inputDistance,
+                clusters.Labels,
+                clusters.Generators,
+                triangles,
+                clusters.Sizes,
+                parameters.ErrorBound,
+                parameters.Sides,
+                flags,
+                &out,
+                base ? &base->Verdicts : nullptr,
+                base ? &affected : nullptr);
+}
 
 namespace detail
 {
@@ -926,6 +1648,59 @@ struct CandidatePair : viskores::worklet::WorkletMapField
 };
 
 
+/// Up to three largest absolute coordinates with their labels, by value descending and then
+/// label ascending; empty slots hold -1.
+using TopThree = viskores::Pair<viskores::Vec<Real, 3>, viskores::Vec<viskores::Id, 3>>;
+
+VISKORES_EXEC_CONT inline TopThree NoTop()
+{
+  return TopThree(viskores::Vec<Real, 3>(-1), viskores::Vec<viskores::Id, 3>(-1));
+}
+
+/// The largest absolute coordinate of a generator, as a list of one.
+struct GeneratorTop : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn generator, FieldOut top);
+  using ExecutionSignature = _2(_1, WorkIndex);
+
+  VISKORES_EXEC TopThree operator()(const Vec3& p, viskores::Id label) const
+  {
+    TopThree top = NoTop();
+    top.first[0] = MaxAbs(p);
+    top.second[0] = label;
+    return top;
+  }
+};
+
+/// Merges two lists of `TopThree`: associative and commutative, so any order of reduction gives
+/// the list of the sequential scan with strict comparisons.
+struct MergeTops
+{
+  VISKORES_EXEC_CONT TopThree operator()(const TopThree& a, const TopThree& b) const
+  {
+    auto before = [](Real va, viskores::Id la, Real vb, viskores::Id lb)
+    { return va > vb || (va == vb && la >= 0 && (lb < 0 || la < lb)); };
+    TopThree merged = NoTop();
+    viskores::IdComponent i = 0, j = 0;
+    for (viskores::IdComponent slot = 0; slot < 3; ++slot)
+    {
+      if (j >= 3 || (i < 3 && before(a.first[i], a.second[i], b.first[j], b.second[j])))
+      {
+        merged.first[slot] = a.first[i];
+        merged.second[slot] = a.second[i];
+        ++i;
+      }
+      else
+      {
+        merged.first[slot] = b.first[j];
+        merged.second[slot] = b.second[j];
+        ++j;
+      }
+    }
+    return merged;
+  }
+};
+
 enum : viskores::UInt8
 {
   Alive = 0,
@@ -1034,39 +1809,45 @@ struct NeedsEvaluation : viskores::worklet::WorkletMapField
   }
 };
 
-/// Grows the box `[lower, upper]` by a margin for the rounding of the bounds, `size` the largest
-/// coordinate they come from.
-VISKORES_EXEC_CONT inline void GrowBox(Vec3& lower, Vec3& upper, Real size)
-{
-  const Real grow = 64 * UnitRoundoff * size;
-  for (int a = 0; a < 3; ++a)
-  {
-    lower[a] = lower[a] - grow;
-    upper[a] = upper[a] + grow;
-  }
-}
+/// The scatter of the envelope items of the merge phase: 16 visits per item, of which only the
+/// first works. The TBB device schedules at least 1024 visits per task, so a launch of a few
+/// thousand envelope items would otherwise run on one or a few threads; the idle visits cost
+/// about 5% of the local tests on the Serial device.
+using SpreadScatter = viskores::worklet::ScatterUniform<16>;
 
-/// The local test of a merge. Also a box that holds everything the local test reads: the
-/// members of the two clusters, the generators of their triangles of `K` and the merged
-/// generator. Nothing else of `K` or of the labelling is read.
+/// The local test of a merge but for the envelope, and the work of its envelope part: the
+/// numbers of input triangles to test with a vertex in the merged cluster and away from it, and
+/// `S (1 + 16 u)` of the two batches of tests. Also a box that holds everything the whole local
+/// test reads: the members of the two clusters, the generators of their triangles of `K`, the
+/// merged generator and the input triangles of the envelope test, grown by epsilon, since the
+/// distances it computes are exact only up to epsilon. Nothing else of `K` or of the labelling
+/// is read, but the largest coordinate of the generators.
 struct EvaluateMerge : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn pair,
                                 ExecObject context,
                                 WholeArrayOut admissibleOut,
                                 WholeArrayOut mergedOut,
+                                WholeArrayOut numItemsOut,
+                                WholeArrayOut scalesOut,
                                 WholeArrayOut lowerOut,
                                 WholeArrayOut upperOut);
-  using ExecutionSignature = void(InputIndex, VisitIndex, _1, _2, _3, _4, _5, _6);
+  using ExecutionSignature = void(InputIndex, VisitIndex, _1, _2, _3, _4, _5, _6, _7, _8);
   using ScatterType = viskores::worklet::ScatterCounting;
 
-  template <typename Context, typename FlagPortal, typename VecPortal>
+  template <typename Context,
+            typename FlagPortal,
+            typename VecPortal,
+            typename Id2Portal,
+            typename ScalePortal>
   VISKORES_EXEC void operator()(viskores::Id index,
                                 viskores::IdComponent visit,
                                 const viskores::Id2& pair,
                                 const Context& context,
                                 const FlagPortal& admissibleOut,
                                 const VecPortal& mergedOut,
+                                const Id2Portal& numItemsOut,
+                                const ScalePortal& scalesOut,
                                 const VecPortal& lowerOut,
                                 const VecPortal& upperOut) const
   {
@@ -1076,9 +1857,13 @@ struct EvaluateMerge : viskores::worklet::WorkletMapField
     }
     viskores::UInt8 admissible;
     Vec3 merged, lower, upper;
-    this->Evaluate(pair, context, admissible, merged, lower, upper);
+    viskores::Id2 numItems;
+    viskores::Vec<Real, 2> scales;
+    this->Evaluate(pair, context, admissible, merged, numItems, scales, lower, upper);
     admissibleOut.Set(index, admissible);
     mergedOut.Set(index, merged);
+    numItemsOut.Set(index, numItems);
+    scalesOut.Set(index, scales);
     lowerOut.Set(index, lower);
     upperOut.Set(index, upper);
   }
@@ -1088,11 +1873,16 @@ struct EvaluateMerge : viskores::worklet::WorkletMapField
                               const Context& context,
                               viskores::UInt8& admissible,
                               Vec3& merged,
+                              viskores::Id2& numItems,
+                              viskores::Vec<Real, 2>& scales,
                               Vec3& lower,
                               Vec3& upper) const
   {
     const viskores::Id i = pair[0], j = pair[1];
+    bool complete = true;
     admissible = context.Admissible(i, j, merged) ? 1 : 0;
+    numItems = viskores::Id2(0, 0);
+    scales = viskores::Vec<Real, 2>(0, 0);
     lower = merged;
     upper = merged;
     auto extend = [&](const Vec3& p)
@@ -1119,19 +1909,212 @@ struct EvaluateMerge : viskores::worklet::WorkletMapField
         }
       }
     }
+    if (admissible != 0 && context.Epsilon > 0)
+    {
+      Real sInput = context.Input.MaxAbsCoordinate;
+      Real sOutput = context.Scale(i, j, MaxAbs(merged));
+      for (viskores::IdComponent part = 0; part < 2; ++part)
+      {
+        context.ForEachEnvelopeItem(
+          i,
+          j,
+          merged,
+          viskores::UInt8(1 << part),
+          complete,
+          [&](viskores::Id, const viskores::Id3& tri, viskores::UInt8 tests)
+          {
+            ++numItems[part];
+            for (int k = 0; k < 3; ++k)
+            {
+              extend(context.Points.Get(tri[k]));
+              if ((tests & 1) != 0)
+              {
+                const viskores::Id l = context.Labels.Get(tri[k]);
+                sInput = viskores::Max(
+                  sInput, MaxAbs((l == i || l == j) ? merged : context.Generators.Get(l)));
+              }
+              if ((tests & 2) != 0)
+              {
+                sOutput = viskores::Max(sOutput, MaxAbs(context.Points.Get(tri[k])));
+              }
+            }
+          });
+      }
+      const Real scaleFactor = 1 + 16 * UnitRoundoff;
+      scales = viskores::Vec<Real, 2>(sInput * scaleFactor, sOutput * scaleFactor);
+    }
     Real size = 0;
     for (int a = 0; a < 3; ++a)
     {
       size = viskores::Max(size, viskores::Max(viskores::Abs(lower[a]), viskores::Abs(upper[a])));
     }
-    GrowBox(lower, upper, size);
+    GrowBox(lower, upper, context.Epsilon, size);
+    if (!complete)
+    {
+      this->RaiseError("QuadricClusteringDecimation: bounding volume hierarchy too deep.");
+    }
+  }
+};
+
+/// The number of input triangles of part `Part` to test for a merge, none once it has failed.
+struct PartCount : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn numItems, FieldIn failed, FieldOut count);
+  using ExecutionSignature = _3(_1, _2);
+
+  VISKORES_CONT explicit PartCount(viskores::IdComponent part)
+    : Part(part)
+  {
+  }
+
+  VISKORES_EXEC viskores::Id operator()(const viskores::Id2& numItems,
+                                        viskores::UInt32 failed) const
+  {
+    return failed != 0 ? 0 : numItems[this->Part];
+  }
+
+private:
+  viskores::IdComponent Part;
+};
+
+/// Lists the input triangles of part `Part` of the envelope tests of the merges `First` to
+/// `Last`, from position `offset - Base` on.
+struct FillEnvelopeItems : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn pair,
+                                FieldIn merged,
+                                FieldIn numItems,
+                                FieldIn offset,
+                                ExecObject context,
+                                WholeArrayOut candidates,
+                                WholeArrayOut triangles,
+                                WholeArrayOut tests);
+  using ExecutionSignature = void(WorkIndex, _1, _2, _3, _4, _5, _6, _7, _8);
+
+  VISKORES_CONT FillEnvelopeItems(viskores::UInt8 part,
+                                  viskores::Id first,
+                                  viskores::Id last,
+                                  viskores::Id base)
+    : Part(part)
+    , First(first)
+    , Last(last)
+    , Base(base)
+  {
+  }
+
+  template <typename Context, typename IdPortal, typename FlagPortal>
+  VISKORES_EXEC void operator()(viskores::Id index,
+                                const viskores::Id2& pair,
+                                const Vec3& merged,
+                                viskores::Id numItems,
+                                viskores::Id offset,
+                                const Context& context,
+                                const IdPortal& candidates,
+                                const IdPortal& triangles,
+                                const FlagPortal& tests) const
+  {
+    if (index < this->First || index >= this->Last || numItems == 0)
+    {
+      return;
+    }
+    viskores::Id k = offset - this->Base;
+    bool complete = true;
+    context.ForEachEnvelopeItem(pair[0],
+                                pair[1],
+                                merged,
+                                this->Part,
+                                complete,
+                                [&](viskores::Id t, const viskores::Id3&, viskores::UInt8 flags)
+                                {
+                                  candidates.Set(k, index);
+                                  triangles.Set(k, t);
+                                  tests.Set(k, flags);
+                                  ++k;
+                                });
+  }
+
+private:
+  viskores::UInt8 Part;
+  viskores::Id First;
+  viskores::Id Last;
+  viskores::Id Base;
+};
+
+/// One input triangle of the envelope test of a merge. Marks the merge failed if a test fails,
+/// and skips the triangle if the merge has already failed: the outcome is the conjunction over
+/// the triangles, whatever the order.
+struct TestEnvelopeItems : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn candidate,
+                                FieldIn triangle,
+                                FieldIn tests,
+                                WholeArrayIn pairs,
+                                WholeArrayIn merged,
+                                WholeArrayIn scales,
+                                ExecObject context,
+                                AtomicArrayInOut failed);
+  using ExecutionSignature = void(VisitIndex, _1, _2, _3, _4, _5, _6, _7, _8);
+  using ScatterType = SpreadScatter;
+
+  template <typename PairPortal,
+            typename VecPortal,
+            typename ScalePortal,
+            typename Context,
+            typename AtomicPortal>
+  VISKORES_EXEC void operator()(viskores::IdComponent visit,
+                                viskores::Id c,
+                                viskores::Id t,
+                                viskores::UInt8 tests,
+                                const PairPortal& pairs,
+                                const VecPortal& merged,
+                                const ScalePortal& scales,
+                                const Context& context,
+                                const AtomicPortal& failed) const
+  {
+    if (visit != 0)
+    {
+      return;
+    }
+    if (failed.Get(c) == 0)
+    {
+      const viskores::Id2 pair = pairs.Get(c);
+      const viskores::Vec<Real, 2> scale = scales.Get(c);
+      bool complete = true;
+      if (!context.TestEnvelopeItem(
+            pair[0], pair[1], merged.Get(c), t, tests, scale[0], scale[1], complete))
+      {
+        failed.Set(c, 1);
+      }
+      if (!complete)
+      {
+        this->RaiseError("QuadricClusteringDecimation: bounding volume hierarchy too deep.");
+      }
+    }
+  }
+};
+
+struct ClearFailed : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn failed, FieldInOut admissible);
+  using ExecutionSignature = void(_1, _2);
+
+  VISKORES_EXEC void operator()(viskores::UInt32 failed, viskores::UInt8& admissible) const
+  {
+    if (failed != 0)
+    {
+      admissible = 0;
+    }
   }
 };
 
 } // namespace detail
 
 /// The local tests of the merges `pairs`, with the merged generators and the boxes of what every
-/// test reads (`EvaluateMerge`).
+/// test reads (`EvaluateMerge`). The test but for the envelope runs per merge; the
+/// envelope tests run per input triangle, in batches of at most `maxItems` triangles, so that a
+/// few merges of large clusters keep every thread busy: first the triangles with a vertex in
+/// the merged cluster, where a merge that fails mostly fails, then the others, for the merges
+/// still standing.
 inline void EvaluateMerges(const viskores::cont::ArrayHandle<viskores::Id2>& pairs,
                            const MergeContextObject& context,
                            viskores::cont::ArrayHandle<viskores::UInt8>& admissible,
@@ -1139,10 +2122,16 @@ inline void EvaluateMerges(const viskores::cont::ArrayHandle<viskores::Id2>& pai
                            viskores::cont::ArrayHandle<Vec3>& lower,
                            viskores::cont::ArrayHandle<Vec3>& upper)
 {
+  constexpr viskores::Id maxItems = viskores::Id(1) << 24;
+  using Algorithm = viskores::cont::Algorithm;
   viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::Id2> numItems;
+  viskores::cont::ArrayHandle<viskores::Vec<Real, 2>> scales;
   const viskores::Id n = pairs.GetNumberOfValues();
   admissible.Allocate(n);
   merged.Allocate(n);
+  numItems.Allocate(n);
+  scales.Allocate(n);
   lower.Allocate(n);
   upper.Allocate(n);
   invoke(detail::EvaluateMerge{},
@@ -1151,8 +2140,66 @@ inline void EvaluateMerges(const viskores::cont::ArrayHandle<viskores::Id2>& pai
          context,
          admissible,
          merged,
+         numItems,
+         scales,
          lower,
          upper);
+  viskores::cont::ArrayHandle<viskores::UInt32> failed;
+  failed.AllocateAndFill(n, 0);
+  viskores::cont::ArrayHandle<viskores::Id> counts, offsets, candidates, triangles;
+  viskores::cont::ArrayHandle<viskores::UInt8> tests;
+  for (viskores::IdComponent part = 0; part < 2; ++part)
+  {
+    invoke(detail::PartCount(part), numItems, failed, counts);
+    const viskores::Id total = Algorithm::ScanExclusive(counts, offsets);
+    if (total == 0)
+    {
+      continue;
+    }
+    // Batches of candidates by the offset of their first item; the items of one test are
+    // independent, so the batches change nothing but the memory in use.
+    viskores::cont::ArrayHandle<viskores::Id> batchOf, batchStarts;
+    invoke(DivideBy(maxItems), offsets, batchOf);
+    const viskores::Id numBatches = (total - 1) / maxItems + 1;
+    Algorithm::LowerBounds(batchOf, viskores::cont::ArrayHandleIndex(numBatches + 1), batchStarts);
+    for (viskores::Id batch = 0; batch < numBatches; ++batch)
+    {
+      const viskores::Id first = viskores::cont::ArrayGetValue(batch, batchStarts);
+      const viskores::Id last = viskores::cont::ArrayGetValue(batch + 1, batchStarts);
+      if (first == last)
+      {
+        continue;
+      }
+      const viskores::Id base = viskores::cont::ArrayGetValue(first, offsets);
+      const viskores::Id size =
+        ((last < n) ? viskores::cont::ArrayGetValue(last, offsets) : total) - base;
+      if (size > 0)
+      {
+        candidates.Allocate(size);
+        triangles.Allocate(size);
+        tests.Allocate(size);
+        invoke(detail::FillEnvelopeItems(viskores::UInt8(1 << part), first, last, base),
+               pairs,
+               merged,
+               counts,
+               offsets,
+               context,
+               candidates,
+               triangles,
+               tests);
+        invoke(detail::TestEnvelopeItems{},
+               candidates,
+               triangles,
+               tests,
+               pairs,
+               merged,
+               scales,
+               context,
+               failed);
+      }
+    }
+  }
+  invoke(detail::ClearFailed{}, failed, admissible);
 }
 
 namespace detail
@@ -1262,11 +2309,17 @@ inline Clustering ApplyMerges(const SurfaceMesh& mesh,
 }
 
 /// Whether any flag in use fires on a placed labelling, evaluated in full: the discrete
-/// closed-ball property and (F0).
+/// closed-ball property, (F0) and (F5). With `bases`,
+/// (F5) tests only the triangles whose verdicts can differ from a base's
+/// (`MergeEnvelopeFlags`); with `verdicts`, its verdicts are stored there, for a caller that
+/// commits the labelling or keeps it as a base.
 inline bool FlagsFire(const SurfaceMesh& mesh,
                       const VertexQuadrics& quadrics,
+                      const DistanceMesh& inputDistance,
                       const Clustering& clusters,
-                      const MergeParameters& parameters)
+                      const MergeParameters& parameters,
+                      const EnvelopeBases* bases = nullptr,
+                      EnvelopeVerdicts* verdicts = nullptr)
 {
   const viskores::Id k = clusters.NumberOfClusters;
   viskores::cont::ArrayHandle<viskores::UInt8> flags;
@@ -1285,18 +2338,43 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
       return true;
     }
   }
+  const viskores::cont::ArrayHandle<viskores::Id3> triangles =
+    OutputTriangles(mesh, clusters.Labels);
+  if (parameters.ErrorBound > 0)
+  {
+    flags.AllocateAndFill(k, 0);
+    MergeEnvelopeFlags(
+      mesh, inputDistance, clusters, triangles, parameters, flags, bases, verdicts);
+    if (CountFlags(flags) > 0)
+    {
+      return true;
+    }
+  }
   return false;
 }
 
+/// The failing items of the full test on a labelling that the region blame reads: the input
+/// triangles that fail (F5) from the input side (`input_fails` of proofs/lib/vqc.py), empty
+/// without (F5).
+struct FailingItems
+{
+  viskores::cont::ArrayHandle<viskores::UInt8> FailedInput;
+};
+
 /// The clusters that the flags in use flag on a placed labelling, as `flagged_clusters` of
-/// proofs/lib/vqc.py: (F0). Returns
+/// proofs/lib/vqc.py: (F0) and (F5). Returns
 /// false, with no flags, if the discrete closed-ball property fails, which Lemma
-/// "mergeindependent" excludes for a committed set of cluster merges.
+/// "mergeindependent" excludes for a committed set of cluster merges. With `items`, stores the
+/// failing items that the region blame reads.
 inline bool FlaggedClusters(const SurfaceMesh& mesh,
                             const VertexQuadrics& quadrics,
+                            const DistanceMesh& inputDistance,
                             const Clustering& clusters,
                             const MergeParameters& parameters,
-                            viskores::cont::ArrayHandle<viskores::UInt8>& flags)
+                            viskores::cont::ArrayHandle<viskores::UInt8>& flags,
+                            const EnvelopeBases* bases = nullptr,
+                            const EnvelopeVerdicts* known = nullptr,
+                            FailingItems* items = nullptr)
 {
   const viskores::Id k = clusters.NumberOfClusters;
   flags.AllocateAndFill(k, 0);
@@ -1312,6 +2390,38 @@ inline bool FlaggedClusters(const SurfaceMesh& mesh,
   {
     other.AllocateAndFill(k, 0);
     RadiusFlags(Scan(mesh, quadrics.M, clusters), parameters.MaxClusterRadius, other);
+    OrFlags(flags, other);
+  }
+  const viskores::cont::ArrayHandle<viskores::Id3> triangles =
+    OutputTriangles(mesh, clusters.Labels);
+  if (parameters.ErrorBound > 0)
+  {
+    other.AllocateAndFill(k, 0);
+    if (known && known->FailedOutput.GetNumberOfValues() > 0)
+    {
+      // The verdicts of `FlagsFire` on this labelling.
+      FlagFailedTriangles(mesh, clusters.Labels, clusters.Sizes, *known, other);
+      if (items)
+      {
+        items->FailedInput = known->FailedInput;
+      }
+    }
+    else
+    {
+      EnvelopeVerdicts verdicts;
+      MergeEnvelopeFlags(mesh,
+                         inputDistance,
+                         clusters,
+                         triangles,
+                         parameters,
+                         other,
+                         bases,
+                         items ? &verdicts : nullptr);
+      if (items)
+      {
+        items->FailedInput = verdicts.FailedInput;
+      }
+    }
     OrFlags(flags, other);
   }
   return true;
@@ -1341,13 +2451,249 @@ struct MergedFlagged : viskores::worklet::WorkletMapField
   }
 };
 
+/// The cluster that a merge `(i, j)` became, by the label its anchor has after the merge.
+struct MergedLabel : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn pair,
+                                WholeArrayIn anchors,
+                                WholeArrayIn nextLabels,
+                                FieldOut label);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename IdPortal>
+  VISKORES_EXEC viskores::Id operator()(const viskores::Id2& pair,
+                                        const IdPortal& anchors,
+                                        const IdPortal& nextLabels) const
+  {
+    return nextLabels.Get(anchors.Get(pair[0]));
+  }
+};
+
+/// The region that an input triangle failing (F5) from the input side reads, if it flags no
+/// changed cluster: its box grown by `epsilon`, rounded to nearest (`blame_regions` of
+/// proofs/lib/vqc.py).
+struct InputRegion : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                FieldIn failed,
+                                WholeArrayIn labels,
+                                WholeArrayIn sizes,
+                                WholeArrayIn changed,
+                                WholeArrayIn points,
+                                FieldOut keep,
+                                FieldOut lower,
+                                FieldOut upper);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9);
+
+  VISKORES_CONT explicit InputRegion(Real epsilon)
+    : Epsilon(epsilon)
+  {
+  }
+
+  template <typename IdPortal, typename FlagPortal, typename VecPortal>
+  VISKORES_EXEC void operator()(const viskores::Id3& t,
+                                viskores::UInt8 failed,
+                                const IdPortal& labels,
+                                const IdPortal& sizes,
+                                const FlagPortal& changed,
+                                const VecPortal& points,
+                                viskores::UInt8& keep,
+                                Vec3& lower,
+                                Vec3& upper) const
+  {
+    keep = 0;
+    lower = upper = Vec3(0);
+    if (!failed)
+    {
+      return;
+    }
+    for (int a = 0; a < 3; ++a)
+    {
+      const viskores::Id l = labels.Get(t[a]);
+      if (sizes.Get(l) > 1 && changed.Get(l))
+      {
+        return;
+      }
+    }
+    TriangleBounds(points.Get(t[0]), points.Get(t[1]), points.Get(t[2]), lower, upper);
+    for (int a = 0; a < 3; ++a)
+    {
+      lower[a] = lower[a] - this->Epsilon;
+      upper[a] = upper[a] + this->Epsilon;
+    }
+    keep = 1;
+  }
+
+  Real Epsilon;
+};
+
+/// Marks the labels of every output triangle whose box meets a region.
+struct MarkRegionHits : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                WholeArrayIn generators,
+                                ExecObject regions,
+                                WholeArrayIn lower,
+                                WholeArrayIn upper,
+                                AtomicArrayInOut hits);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+
+  template <typename VecPortal, typename Hierarchy, typename AtomicPortal>
+  VISKORES_EXEC void operator()(const viskores::Id3& t,
+                                const VecPortal& generators,
+                                const Hierarchy& regions,
+                                const VecPortal& lower,
+                                const VecPortal& upper,
+                                const AtomicPortal& hits) const
+  {
+    Vec3 lo, hi;
+    TriangleBounds(generators.Get(t[0]), generators.Get(t[1]), generators.Get(t[2]), lo, hi);
+    bool hit = false;
+    const bool done = regions.ForEachOverlap(lo,
+                                             hi,
+                                             [&](viskores::Id r)
+                                             {
+                                               const Vec3 rl = lower.Get(r), rh = upper.Get(r);
+                                               hit = lo[0] <= rh[0] && hi[0] >= rl[0] &&
+                                                 lo[1] <= rh[1] && hi[1] >= rl[1] &&
+                                                 lo[2] <= rh[2] && hi[2] >= rl[2];
+                                               return !hit;
+                                             });
+    if (!done)
+    {
+      this->RaiseError("QuadricClusteringDecimation: hierarchy traversal overflowed.");
+    }
+    if (hit)
+    {
+      for (int a = 0; a < 3; ++a)
+      {
+        hits.Set(t[a], 1);
+      }
+    }
+  }
+};
+
+/// Marks the cluster of a vertex in the batch labelling when its cluster in the base labelling
+/// is marked.
+struct SpreadBaseHits : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn baseLabel,
+                                FieldIn batchLabel,
+                                WholeArrayIn baseHits,
+                                AtomicArrayInOut marks);
+  using ExecutionSignature = void(_1, _2, _3, _4);
+
+  template <typename HitPortal, typename AtomicPortal>
+  VISKORES_EXEC void operator()(viskores::Id baseLabel,
+                                viskores::Id batchLabel,
+                                const HitPortal& baseHits,
+                                const AtomicPortal& marks) const
+  {
+    if (baseHits.Get(baseLabel) != 0)
+    {
+      marks.Set(batchLabel, 1);
+    }
+  }
+};
+
+/// 1 where a mark is set.
+struct NonzeroMark : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn mark, FieldOut flag);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::UInt32 mark) const
+  {
+    return mark != 0 ? 1 : 0;
+  }
+};
+
+} // namespace detail
+
+/// The region blame of a batch `batch` of merges of `base` that failed the full test, with
+/// `changed` its changed clusters and `items` its failing items (`region_culprits` of
+/// proofs/lib/vqc.py): per cluster of `batch`, 1 if an output triangle of `base` at the cluster
+/// of one of its vertices has a box that meets a region read by a failing item that flags no
+/// changed cluster. Such an item passed on `base`, and reads only output within its region: the
+/// regions of the input triangles failing (F5) from the input side, their boxes grown by
+/// `epsilon`.
+inline viskores::cont::ArrayHandle<viskores::UInt8> RegionFlags(
+  const SurfaceMesh& mesh,
+  const MergeParameters& parameters,
+  const Clustering& base,
+  const Clustering& batch,
+  const viskores::cont::ArrayHandle<viskores::UInt8>& changed,
+  const FailingItems& items)
+{
+  using Algorithm = viskores::cont::Algorithm;
+  viskores::cont::Invoker invoke;
+  const viskores::Id k = batch.NumberOfClusters;
+  viskores::cont::ArrayHandle<viskores::UInt8> flags;
+  viskores::cont::ArrayHandle<Vec3> lower, upper;
+  if (items.FailedInput.GetNumberOfValues() > 0)
+  {
+    viskores::cont::ArrayHandle<viskores::UInt8> keep;
+    viskores::cont::ArrayHandle<Vec3> lo, hi;
+    invoke(detail::InputRegion(parameters.ErrorBound),
+           mesh.Triangles,
+           items.FailedInput,
+           batch.Labels,
+           batch.Sizes,
+           changed,
+           mesh.Points,
+           keep,
+           lo,
+           hi);
+    Algorithm::CopyIf(lo, keep, lower);
+    Algorithm::CopyIf(hi, keep, upper);
+  }
+  if (lower.GetNumberOfValues() == 0)
+  {
+    flags.AllocateAndFill(k, 0);
+    return flags;
+  }
+  const viskores::worklet::spatialstructure::BoundingVolumeHierarchy regions(lower, upper);
+  viskores::cont::ArrayHandle<viskores::UInt32> baseHits, marks;
+  baseHits.AllocateAndFill(base.NumberOfClusters, 0);
+  marks.AllocateAndFill(k, 0);
+  invoke(detail::MarkRegionHits{},
+         OutputTriangles(mesh, base.Labels),
+         base.Generators,
+         regions,
+         lower,
+         upper,
+         baseHits);
+  invoke(detail::SpreadBaseHits{}, base.Labels, batch.Labels, baseHits, marks);
+  invoke(detail::NonzeroMark{}, marks, flags);
+  return flags;
+}
+
+namespace detail
+{
+
+/// 1 for a merge that the region blame names and the merged-cluster rule does not, which joins
+/// the culprits.
+struct BlamedOnly : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldInOut culprit, FieldIn region, FieldOut blamed);
+  using ExecutionSignature = void(_1, _2, _3);
+
+  VISKORES_EXEC void operator()(viskores::UInt8& culprit,
+                                viskores::UInt8 region,
+                                viskores::UInt8& blamed) const
+  {
+    blamed = (region && !culprit) ? 1 : 0;
+    culprit = (culprit || region) ? 1 : 0;
+  }
+};
+
 } // namespace detail
 
 /// The merge phase of Algorithm 8: merges adjacent clusters in rounds while `k > k*` and some
 /// merge is admissible. A round commits the greedy maximal set of admissible candidates in
 /// priority order, each conflicting with no other, keeps the `k - k*` of highest priority, and
 /// checks the merged labelling with every flag. If one fires, it defers the merges whose merged
-/// cluster is flagged and chooses again without them, as
+/// cluster is flagged (and those `RegionFlags` names) and chooses again without them, as
 /// deterministic reservations retry the
 /// items that fail (Blelloch, Fineman, Gibbons and Shun, PPoPP 2012); if none or all of them are,
 /// it merges only the candidate of highest priority, or, if that fails too, rejects it and
@@ -1355,6 +2701,7 @@ struct MergedFlagged : viskores::worklet::WorkletMapField
 template <typename RoundObserver>
 void MergePhase(const SurfaceMesh& mesh,
                 const VertexQuadrics& quadrics,
+                const DistanceMesh& inputDistance,
                 const MergeParameters& parameters,
                 Clustering& clusters,
                 MergeDiagnostics& diagnostics,
@@ -1365,6 +2712,36 @@ void MergePhase(const SurfaceMesh& mesh,
   const bool geometric = parameters.GeometricFlags();
   viskores::cont::Timer timer, roundTimer;
   VerdictCache verdicts;
+  // The labellings every full test compares with: the last one committed and the last one
+  // rejected, whose (F5) verdicts are known, so that a full test retests only the triangles a
+  // change can reach.
+  EnvelopeBases envelopeBases;
+  const bool incremental = geometric && parameters.ErrorBound > 0;
+  auto setEnvelopeBase =
+    [&](EnvelopeBase& base, const Clustering& labelling, const EnvelopeVerdicts& verdictsOf)
+  {
+    base.Clusters = labelling;
+    base.Triangles = OutputTriangles(mesh, labelling.Labels);
+    base.Verdicts = verdictsOf;
+  };
+  auto commitEnvelopeBase = [&](const Clustering& committed, const EnvelopeVerdicts& verdictsOf)
+  { setEnvelopeBase(envelopeBases.Committed, committed, verdictsOf); };
+  if (incremental)
+  {
+    EnvelopeVerdicts initial;
+    viskores::cont::ArrayHandle<viskores::UInt8> unused;
+    unused.AllocateAndFill(clusters.NumberOfClusters, 0);
+    MergeEnvelopeFlags(mesh,
+                       inputDistance,
+                       clusters,
+                       OutputTriangles(mesh, clusters.Labels),
+                       parameters,
+                       unused,
+                       nullptr,
+                       &initial);
+    commitEnvelopeBase(clusters, initial);
+  }
+  const EnvelopeBases* bases = incremental ? &envelopeBases : nullptr;
   while (true)
   {
     roundTimer.Start();
@@ -1453,13 +2830,30 @@ void MergePhase(const SurfaceMesh& mesh,
     context.Clusters = &clusters;
     context.Complex = &complex;
     context.VertexMatrices = quadrics.M;
+    context.Input = inputDistance;
     context.MaxRadius = parameters.MaxClusterRadius;
+    context.Epsilon = parameters.ErrorBound;
+    context.Sides = parameters.Sides;
+    if (geometric)
+    {
+      // The tie keys of the single-triangle candidates: the index in K.
+      context.Output = BuildDistanceMesh(clusters.Generators, complex.Triangles);
+      // The three largest absolute coordinates, by value and then label.
+      viskores::cont::ArrayHandle<detail::TopThree> tops;
+      invoke(detail::GeneratorTop{}, clusters.Generators, tops);
+      const detail::TopThree top = Algorithm::Reduce(tops, detail::NoTop(), detail::MergeTops{});
+      for (viskores::IdComponent slot = 0; slot < 3; ++slot)
+      {
+        context.Scale.TopAbs[slot] = top.first[slot];
+        context.Scale.TopLabel[slot] = top.second[slot];
+      }
+    }
 
     viskores::cont::ArrayHandle<viskores::UInt8> memo;
     memo.AllocateAndFill(numCandidates, geometric ? detail::Unknown : detail::Admissible);
     if (geometric)
     {
-      diagnostics.Reused += verdicts.Reuse(clusters, pairs, memo);
+      diagnostics.Reused += verdicts.Reuse(context, clusters, pairs, memo);
     }
     viskores::cont::ArrayHandle<viskores::Id2> committedPairs;
     // The merges deferred as culprits of a batch in this round, never tested alone.
@@ -1500,7 +2894,8 @@ void MergePhase(const SurfaceMesh& mesh,
           viskores::cont::ArrayHandle<Vec3> mergedPositions, lower, upper;
           EvaluateMerges(evaluated, context, admissible, mergedPositions, lower, upper);
           invoke(detail::ScatterAdmissible{}, toEvaluate, admissible, memo);
-          verdicts.Remember(clusters, evaluated, admissible, lower, upper);
+          verdicts.Remember(
+            context, clusters, evaluated, admissible, mergedPositions, lower, upper);
           diagnostics.Evaluated += toEvaluate.GetNumberOfValues();
           timer.Stop();
           diagnostics.SecondsLocalTests += timer.GetElapsedTime();
@@ -1536,10 +2931,15 @@ void MergePhase(const SurfaceMesh& mesh,
           viskores::cont::ArrayHandle<viskores::Id2> single;
           Algorithm::Copy(viskores::cont::make_ArrayHandleView(pairs, rank, 1), single);
           Clustering one = ApplyMerges(mesh, quadrics, clusters, single);
-          if (!FlagsFire(mesh, quadrics, one, parameters))
+          EnvelopeVerdicts oneVerdicts;
+          if (!FlagsFire(mesh, quadrics, inputDistance, one, parameters, bases, &oneVerdicts))
           {
             clusters = one;
             committedPairs = single;
+            if (incremental)
+            {
+              commitEnvelopeBase(clusters, oneVerdicts);
+            }
             break;
           }
         }
@@ -1551,22 +2951,44 @@ void MergePhase(const SurfaceMesh& mesh,
         committedPairs);
       timer.Start();
       Clustering merged = ApplyMerges(mesh, quadrics, clusters, committedPairs);
-      const bool fires = geometric && FlagsFire(mesh, quadrics, merged, parameters);
+      EnvelopeVerdicts mergedVerdicts;
+      const bool fires = geometric &&
+        FlagsFire(mesh, quadrics, inputDistance, merged, parameters, bases, &mergedVerdicts);
       timer.Stop();
       diagnostics.SecondsFullTests += timer.GetElapsedTime();
       timer.Start();
       if (!fires)
       {
         clusters = merged;
+        if (incremental)
+        {
+          commitEnvelopeBase(clusters, mergedVerdicts);
+        }
         break;
       }
+      if (incremental && mergedVerdicts.FailedOutput.GetNumberOfValues() > 0)
+      {
+        setEnvelopeBase(envelopeBases.Rejected, merged, mergedVerdicts);
+      }
       // The set fired a flag. A cluster that no merge made keeps its members and generator, so
-      // the flags fire at a merged cluster: defer the merges whose merged cluster is flagged, and
+      // the flags fire at a merged cluster, unless (F5) from the input side
+      // flags an unmerged one: defer the merges whose merged cluster is flagged, and with the
+      // region blame those whose changed triangles meet the region such an item reads, and
       // choose again without them.
       if (parameters.DeferFlagged && numCommitted > 1)
       {
-        viskores::cont::ArrayHandle<viskores::UInt8> flags, culprit;
-        if (FlaggedClusters(mesh, quadrics, merged, parameters, flags))
+        const bool region = parameters.Blame == MergeBlame::Region;
+        viskores::cont::ArrayHandle<viskores::UInt8> flags, culprit, blamed;
+        FailingItems items;
+        if (FlaggedClusters(mesh,
+                            quadrics,
+                            inputDistance,
+                            merged,
+                            parameters,
+                            flags,
+                            bases,
+                            &mergedVerdicts,
+                            region ? &items : nullptr))
         {
           invoke(detail::MergedFlagged{},
                  committedPairs,
@@ -1574,6 +2996,22 @@ void MergePhase(const SurfaceMesh& mesh,
                  merged.Labels,
                  flags,
                  culprit);
+          if (region)
+          {
+            viskores::cont::ArrayHandle<viskores::Id> mergedLabels;
+            invoke(
+              detail::MergedLabel{}, committedPairs, clusters.Anchors, merged.Labels, mergedLabels);
+            viskores::cont::ArrayHandle<viskores::UInt8> changed, regionCulprit;
+            changed.AllocateAndFill(merged.NumberOfClusters, 0);
+            invoke(MarkIndex{}, mergedLabels, changed);
+            invoke(detail::MergedFlagged{},
+                   committedPairs,
+                   clusters.Anchors,
+                   merged.Labels,
+                   RegionFlags(mesh, parameters, clusters, merged, changed, items),
+                   regionCulprit);
+            invoke(detail::BlamedOnly{}, culprit, regionCulprit, blamed);
+          }
           viskores::cont::ArrayHandle<viskores::Id> culprits;
           Algorithm::CopyIf(viskores::cont::make_ArrayHandleView(committedRanks, 0, numCommitted),
                             culprit,
@@ -1584,6 +3022,10 @@ void MergePhase(const SurfaceMesh& mesh,
             invoke(MarkIndex(detail::Inadmissible), culprits, memo);
             invoke(MarkIndex{}, culprits, deferred);
             diagnostics.Deferred += numCulprits;
+            if (region)
+            {
+              diagnostics.BlameDeferred += Algorithm::Reduce(blamed, viskores::Id(0));
+            }
             timer.Stop();
             diagnostics.SecondsFullTests += timer.GetElapsedTime();
             continue;
@@ -1598,7 +3040,9 @@ void MergePhase(const SurfaceMesh& mesh,
       viskores::cont::ArrayHandle<viskores::Id2> single;
       Algorithm::Copy(viskores::cont::make_ArrayHandleView(pairs, first, 1), single);
       Clustering one = ApplyMerges(mesh, quadrics, clusters, single);
-      const bool oneFires = FlagsFire(mesh, quadrics, one, parameters);
+      EnvelopeVerdicts oneVerdicts;
+      const bool oneFires =
+        FlagsFire(mesh, quadrics, inputDistance, one, parameters, bases, &oneVerdicts);
       timer.Stop();
       diagnostics.SecondsFullTests += timer.GetElapsedTime();
       if (!oneFires)
@@ -1606,6 +3050,10 @@ void MergePhase(const SurfaceMesh& mesh,
         diagnostics.Fallbacks += (numCommitted > 1) ? 1 : 0;
         clusters = one;
         committedPairs = single;
+        if (incremental)
+        {
+          commitEnvelopeBase(clusters, oneVerdicts);
+        }
         break;
       }
       invoke(
