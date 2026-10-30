@@ -33,7 +33,8 @@ void TestParameters()
   VISKORES_TEST_ASSERT(filter.GetMerge(), "The merge phase should run by default.");
   VISKORES_TEST_ASSERT(filter.GetInitialization() == Filter::Initialization::Curvature,
                        "Bad default initialization.");
-  VISKORES_TEST_ASSERT(filter.GetGuarantees() == (Filter::Topology | Filter::TwoSidedError),
+  VISKORES_TEST_ASSERT(filter.GetGuarantees() ==
+                         (Filter::Topology | Filter::NoSelfIntersections | Filter::TwoSidedError),
                        "Bad default guarantees.");
 
   const viskores::cont::DataSet sphere = qcd_test::Icosphere(1).ToDataSet();
@@ -60,6 +61,8 @@ void TestParameters()
                        "A negative weight should be rejected.");
   VISKORES_TEST_ASSERT(rejects([](Filter& f) { f.SetGuarantees(1 << 7); }),
                        "Unknown guarantee bits should be rejected.");
+  VISKORES_TEST_ASSERT(rejects([](Filter& f) { f.SetGuarantees(Filter::NoSelfIntersections); }),
+                       "NoSelfIntersections without Topology should be rejected.");
   VISKORES_TEST_ASSERT(rejects(
                          [](Filter& f)
                          {

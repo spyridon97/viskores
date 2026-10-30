@@ -396,6 +396,24 @@ inline Mesh Genus2PlateWithOpening()
                          });
 }
 
+/// Two icospheres whose centres are half a radius apart: a closed surface whose components
+/// cross each other, so not embedded.
+inline Mesh OverlappingIcospheres(int level)
+{
+  Mesh mesh = Icosphere(level);
+  const Mesh other = Icosphere(level);
+  const viskores::Id offset = static_cast<viskores::Id>(mesh.Points.size());
+  for (const Vec3& p : other.Points)
+  {
+    mesh.Points.push_back(p + Vec3(0.5, 0, 0));
+  }
+  for (const auto& t : other.Triangles)
+  {
+    mesh.Triangles.push_back({ t[0] + offset, t[1] + offset, t[2] + offset });
+  }
+  return mesh;
+}
+
 /// An icosphere with two more components away from it, which no merge can reduce: a small
 /// tetrahedron and a single triangle.
 inline Mesh IcosphereWithSmallComponents(int level)

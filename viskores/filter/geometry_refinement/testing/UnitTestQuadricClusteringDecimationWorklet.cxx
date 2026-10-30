@@ -19,6 +19,7 @@
 
 #include <viskores/filter/geometry_refinement/testing/QuadricClusteringTestMeshes.h>
 #include <viskores/filter/geometry_refinement/worklet/QuadricClusteringDecimation.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/ImproperPairs.h>
 
 #include <viskores/cont/ArrayHandleIndex.h>
 
@@ -331,6 +332,27 @@ Decimation RunChecked(const Mesh& mesh, const Decimation::Parameters& parameters
       "The input is not within epsilon_H of the output.");
   }
 
+  // Invariant 8: with (F4), an exact all-pairs test finds no improper pair of output triangles.
+  if (parameters.Embedding)
+  {
+    viskores::Id improper = 0;
+    for (std::size_t i = 0; i < triangles.size(); ++i)
+    {
+      const Vec3 p[3] = { generators[static_cast<std::size_t>(triangles[i][0])],
+                          generators[static_cast<std::size_t>(triangles[i][1])],
+                          generators[static_cast<std::size_t>(triangles[i][2])] };
+      VISKORES_TEST_ASSERT(!viskores::TriangleIsDegenerate(p[0], p[1], p[2]),
+                           "A degenerate output triangle.");
+      for (std::size_t j = i + 1; j < triangles.size(); ++j)
+      {
+        const Vec3 q[3] = { generators[static_cast<std::size_t>(triangles[j][0])],
+                            generators[static_cast<std::size_t>(triangles[j][1])],
+                            generators[static_cast<std::size_t>(triangles[j][2])] };
+        improper += qc::exact::ImproperPair(p, triangles[i], q, triangles[j]) ? 1 : 0;
+      }
+    }
+    VISKORES_TEST_ASSERT(improper == 0, "The output intersects itself.");
+  }
   return decimation;
 }
 
@@ -343,6 +365,7 @@ Decimation::Parameters Plain(viskores::Id budget = 0,
   p.Quadric.BoundaryWeight = 0;
   p.TargetNumberOfPoints = budget;
   p.MaxClusterRadius = maxRadius;
+  p.Embedding = false;
   p.Merge = false;
   return p;
 }
@@ -372,7 +395,7 @@ double LargestSide(const Mesh& mesh)
 
 struct Expected
 {
-  viskores::Id Clusters, Rounds, Lloyd, Radius, Topology, Envelope = 0;
+  viskores::Id Clusters, Rounds, Lloyd, Radius, Topology, Embedding = 0, Envelope = 0;
 };
 
 void CheckExpected(const Decimation& decimation, const Expected& expected)
@@ -387,12 +410,20 @@ void CheckExpected(const Decimation& decimation, const Expected& expected)
   VISKORES_TEST_ASSERT(d.LloydIterations == expected.Lloyd, "Lloyd phase differs.");
   VISKORES_TEST_ASSERT(d.FlaggedRadius == expected.Radius, "(F0) counts differ.");
   VISKORES_TEST_ASSERT(d.FlaggedTopology == expected.Topology, "(F2)-(F3) counts differ.");
+  VISKORES_TEST_ASSERT(d.FlaggedEmbedding == expected.Embedding, "(F4) counts differ.");
   VISKORES_TEST_ASSERT(d.FlaggedEnvelope == expected.Envelope, "(F5) counts differ.");
+}
+
+Decimation::Parameters WithEmbedding(Decimation::Parameters p)
+{
+  p.Embedding = true;
+  return p;
 }
 
 Decimation::Parameters DefaultPath(const Mesh& mesh, bool augmented)
 {
   Decimation::Parameters p = augmented ? Augmented() : Plain();
+  p.Embedding = true;
   p.ErrorBound = 0.01 * LargestSide(mesh);
   return p;
 }
@@ -401,20 +432,20 @@ void TestEnvelope()
 {
   // The default path of Section 11: (F2) to (F5), epsilon_H 1% of the largest side. The
   // expected numbers come from proofs/lib/vqc.py with the curvature initialisation, the hash
-  // order, and the second condition of its envelope test applied to
+  // order, exact embedding predicates, and the second condition of its envelope test applied to
   // every input triangle instead of the eight with the nearest centroids.
   std::cout << "Envelope: sphere, augmented quadric" << std::endl;
   const Mesh sphere = qcd_test::Icosphere(3);
-  CheckExpected(RunChecked(sphere, DefaultPath(sphere, true)), { 195, 3, 4, 0, 0, 75 });
+  CheckExpected(RunChecked(sphere, DefaultPath(sphere, true)), { 195, 3, 4, 0, 0, 0, 75 });
   std::cout << "Envelope: plate with two holes, plain quadric" << std::endl;
   const Mesh plate = qcd_test::VoxelSolid(qcd_test::PlateWithHoles(2), 0.25);
-  CheckExpected(RunChecked(plate, DefaultPath(plate, false)), { 147, 7, 5, 0, 0, 114 });
+  CheckExpected(RunChecked(plate, DefaultPath(plate, false)), { 147, 7, 5, 0, 0, 0, 114 });
   std::cout << "Envelope: annulus, augmented quadric" << std::endl;
   const Mesh annulus = qcd_test::Annulus();
-  CheckExpected(RunChecked(annulus, DefaultPath(annulus, true)), { 193, 5, 6, 0, 0, 123 });
+  CheckExpected(RunChecked(annulus, DefaultPath(annulus, true)), { 193, 5, 6, 0, 0, 0, 123 });
   std::cout << "Envelope: genus-2 plate with an opening, augmented quadric" << std::endl;
   const Mesh opening = qcd_test::Genus2PlateWithOpening();
-  CheckExpected(RunChecked(opening, DefaultPath(opening, true)), { 66, 6, 5, 0, 4, 31 });
+  CheckExpected(RunChecked(opening, DefaultPath(opening, true)), { 66, 6, 5, 0, 4, 0, 31 });
 }
 
 void TestErrorSides()
@@ -428,6 +459,7 @@ void TestErrorSides()
     Decimation::Parameters p;
     p.Quadric.Alpha = 0.02;
     p.ErrorBound = 0.01 * LargestSide(mesh);
+    p.Embedding = true;
     p.ErrorSides = sides;
     return p;
   };
@@ -484,7 +516,7 @@ void CheckMerged(const Mesh& mesh,
   VISKORES_TEST_ASSERT(decimation.GetMergeDiagnostics().Rounds == mergeRounds,
                        "The merge phase took another number of rounds.");
   const viskores::Id k = decimation.GetNumberOfClusters();
-  const bool geometric = parameters.ErrorBound > 0 ||
+  const bool geometric = parameters.Embedding || parameters.ErrorBound > 0 ||
     parameters.MaxClusterRadius < std::numeric_limits<double>::infinity();
   if (!geometric && k > parameters.TargetNumberOfPoints)
   {
@@ -509,7 +541,7 @@ Decimation::Parameters Merging(Decimation::Parameters p, viskores::Id degreeFloo
 void TestMerge()
 {
   // The expected numbers come from proofs/lib/vqc.py with the curvature initialisation and the
-  // hash order (the envelope rule of TestEnvelope), with
+  // hash order (exact embedding predicates, and the envelope rule of TestEnvelope), with
   // merge_priority=None (the priority the increase of the objective, then the labels) and
   // merge_priority=12 (the degree key), and coarsen=True in error mode.
   const Mesh plate2 = qcd_test::VoxelSolid(qcd_test::PlateWithHoles(2), 1.0);
@@ -518,17 +550,25 @@ void TestMerge()
   const Mesh sphere = qcd_test::Icosphere(3);
   std::cout << "Merge by cost: plate with two holes, budget 2" << std::endl;
   CheckMerged(plate2, Merging(Plain(2), -1), 22, 10, 6);
+  std::cout << "Merge by cost: plate with two holes, budget 2, with (F4)" << std::endl;
+  CheckMerged(plate2, Merging(WithEmbedding(Plain(2)), -1), 22, 12, 6);
   std::cout << "Merge by cost: plate with three holes, budget 2" << std::endl;
   CheckMerged(plate3, Merging(Plain(2), -1), 38, 15, 7);
   std::cout << "Merge by cost: disk, budget 2" << std::endl;
   CheckMerged(qcd_test::Disk(), Merging(Plain(2), -1), 4, 3, 1);
   std::cout << "Merge by cost: annulus, budget 2" << std::endl;
   CheckMerged(qcd_test::Annulus(), Merging(Plain(2), -1), 16, 6, 5);
+  std::cout << "Merge by cost: genus-2 plate with an opening, budget 2, with (F4)" << std::endl;
+  CheckMerged(opening, Merging(WithEmbedding(Plain(2)), -1), 17, 13, 3);
   std::cout << "Merge by cost: sphere, radius cap, error mode" << std::endl;
   CheckMerged(sphere, Merging(Plain(0, 0.08 * LargestSide(sphere)), -1), 207, 179, 3);
 
   std::cout << "Merge with the degree key: plate with two holes, budget 2" << std::endl;
   CheckMerged(plate2, Merging(Plain(2), 12), 22, 11, 6);
+  std::cout << "Merge with the degree key: plate with two holes, budget 2, with (F4)" << std::endl;
+  CheckMerged(plate2, Merging(WithEmbedding(Plain(2)), 12), 22, 13, 5);
+  std::cout << "Merge with the degree key: plate with three holes, budget 2, with (F4)" << std::endl;
+  CheckMerged(plate3, Merging(WithEmbedding(Plain(2)), 12), 47, 17, 9);
   std::cout << "Merge with the degree key: genus-2 plate with an opening, budget 2" << std::endl;
   CheckMerged(opening, Merging(Plain(2), 12), 17, 11, 3);
   std::cout << "Merge with the degree key: annulus, radius cap, error mode" << std::endl;
@@ -544,6 +584,23 @@ void TestMerge()
     RunChecked(qcd_test::IcosphereWithSmallComponents(2), Merging(Plain(6), 12));
   VISKORES_TEST_ASSERT(components.GetNumberOfClusters() == 11,
                        "The merge phase stopped elsewhere than at three irreducible components.");
+}
+
+void TestEmbedding()
+{
+  // The expected numbers come from proofs/lib/vqc.py with the curvature initialisation, the hash
+  // order and its embedding test evaluated by the exact rational predicates of
+  // proofs/lib/exact.py.
+  std::cout << "Embedding: plate with three holes, topology only, augmented quadric" << std::endl;
+  CheckExpected(RunChecked(qcd_test::VoxelSolid(qcd_test::PlateWithHoles(3), 1.0),
+                           WithEmbedding(Augmented())),
+                { 46, 7, 5, 0, 7, 0 });
+  std::cout << "Embedding: genus-2 plate with an opening, topology only, augmented quadric"
+            << std::endl;
+  CheckExpected(RunChecked(qcd_test::Genus2PlateWithOpening(), WithEmbedding(Augmented())),
+                { 31, 2, 5, 0, 2, 0 });
+  std::cout << "Embedding: sphere, budget 2" << std::endl;
+  CheckExpected(RunChecked(qcd_test::Icosphere(3), WithEmbedding(Plain(2))), { 8, 3, 4, 0, 6, 0 });
 }
 
 void TestLoop()
@@ -691,11 +748,35 @@ void TestInvalidInput()
   const viskores::Id3 t = fin.Triangles[0];
   fin.Triangles.push_back({ t[0], t[1], static_cast<viskores::Id>(fin.Points.size()) - 1 });
   VISKORES_TEST_ASSERT(rejects(fin), "An edge in three triangles should be rejected.");
+  // Hypothesis "embedded": with (F4), an input that intersects itself is rejected; without, it
+  // is decimated.
+  const Mesh overlapping = qcd_test::OverlappingIcospheres(2);
+  auto run = [&](bool embedding)
+  {
+    Decimation decimation;
+    Decimation::Parameters p = Plain();
+    p.Embedding = embedding;
+    p.ErrorBound = 0.02;
+    decimation.SetParameters(p);
+    decimation.Run(overlapping.PointArray(), overlapping.TriangleArray());
+  };
+  bool rejected = false;
+  try
+  {
+    run(true);
+  }
+  catch (const viskores::cont::ErrorBadValue&)
+  {
+    rejected = true;
+  }
+  VISKORES_TEST_ASSERT(rejected, "An input that intersects itself should be rejected with (F4).");
+  run(false);
 }
 
 void TestQuadricClusteringDecimationWorklet()
 {
   TestLoop();
+  TestEmbedding();
   TestEnvelope();
   TestErrorSides();
   TestMerge();
