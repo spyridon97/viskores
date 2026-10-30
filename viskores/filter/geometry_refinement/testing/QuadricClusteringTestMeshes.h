@@ -373,6 +373,27 @@ inline Mesh Genus2PlateWithOpening()
                          });
 }
 
+/// An icosphere with two more components away from it, which no merge can reduce: a small
+/// tetrahedron and a single triangle.
+inline Mesh IcosphereWithSmallComponents(int level)
+{
+  Mesh mesh = Icosphere(level);
+  const viskores::Id tetrahedron = static_cast<viskores::Id>(mesh.Points.size());
+  mesh.Points.insert(mesh.Points.end(),
+                     { Vec3(3, 0, 0), Vec3(3.1, 0, 0), Vec3(3, 0.1, 0), Vec3(3, 0, 0.1) });
+  for (const auto& t : { viskores::Id3(0, 2, 1),
+                         viskores::Id3(0, 1, 3),
+                         viskores::Id3(0, 3, 2),
+                         viskores::Id3(1, 2, 3) })
+  {
+    mesh.Triangles.push_back({ t[0] + tetrahedron, t[1] + tetrahedron, t[2] + tetrahedron });
+  }
+  const viskores::Id triangle = static_cast<viskores::Id>(mesh.Points.size());
+  mesh.Points.insert(mesh.Points.end(), { Vec3(0, 3, 0), Vec3(0.1, 3, 0), Vec3(0, 3.1, 0) });
+  mesh.Triangles.push_back({ triangle, triangle + 1, triangle + 2 });
+  return mesh;
+}
+
 /// The number of connected components of every cluster, by union-find over the input edges.
 inline std::vector<int> ComponentsPerLabel(const Mesh& mesh,
                                            const std::vector<viskores::Id>& labels,
@@ -552,6 +573,167 @@ inline std::string CheckSurface(viskores::Id numVertices, const std::vector<visk
     }
   }
   return "";
+}
+
+/// The triangles of `K/ij`: `j` identified with `i`, degenerate triangles dropped, as sorted
+/// triples without repetition.
+inline std::vector<viskores::Id3> Contract(const std::vector<viskores::Id3>& triangles,
+                                           viskores::Id i,
+                                           viskores::Id j)
+{
+  std::set<std::array<viskores::Id, 3>> faces;
+  for (const auto& t : triangles)
+  {
+    std::array<viskores::Id, 3> f = { t[0] == j ? i : t[0], t[1] == j ? i : t[1], t[2] == j ? i : t[2] };
+    std::sort(f.begin(), f.end());
+    if (f[0] != f[1] && f[1] != f[2])
+    {
+      faces.insert(f);
+    }
+  }
+  std::vector<viskores::Id3> result;
+  for (const auto& f : faces)
+  {
+    result.push_back({ f[0], f[1], f[2] });
+  }
+  return result;
+}
+
+/// The type of an unoriented pure 2-complex, after surface_type of the reference: if every edge
+/// lies in one or two triangles, the link of every vertex is one cycle or one path, and the
+/// complex is connected and orientable, its Euler characteristic and number of boundary loops;
+/// otherwise (-1000, -1).
+inline std::pair<viskores::Id, int> SurfaceType(const std::vector<viskores::Id3>& input)
+{
+  const std::pair<viskores::Id, int> invalid(-1000, -1);
+  std::set<std::array<viskores::Id, 3>> unique;
+  for (const auto& t : input)
+  {
+    std::array<viskores::Id, 3> f = { t[0], t[1], t[2] };
+    std::sort(f.begin(), f.end());
+    if (f[0] == f[1] || f[1] == f[2])
+    {
+      return invalid;
+    }
+    unique.insert(f);
+  }
+  if (unique.empty())
+  {
+    return invalid;
+  }
+  std::vector<std::array<viskores::Id, 3>> faces(unique.begin(), unique.end());
+  std::map<std::pair<viskores::Id, viskores::Id>, std::vector<std::size_t>> edgeFaces;
+  std::map<viskores::Id, std::map<viskores::Id, std::vector<viskores::Id>>> links;
+  for (std::size_t f = 0; f < faces.size(); ++f)
+  {
+    const auto& t = faces[f];
+    for (int s = 0; s < 3; ++s)
+    {
+      const viskores::Id x = t[static_cast<std::size_t>(s)];
+      const viskores::Id y = t[static_cast<std::size_t>((s + 1) % 3)];
+      const viskores::Id z = t[static_cast<std::size_t>((s + 2) % 3)];
+      edgeFaces[std::make_pair(std::min(x, y), std::max(x, y))].push_back(f);
+      links[x][y].push_back(z);
+      links[x][z].push_back(y);
+    }
+  }
+  for (const auto& e : edgeFaces)
+  {
+    if (e.second.size() > 2)
+    {
+      return invalid;
+    }
+  }
+  for (const auto& link : links)
+  {
+    std::set<viskores::Id> seen;
+    std::vector<viskores::Id> stack = { link.second.begin()->first };
+    seen.insert(stack[0]);
+    for (const auto& n : link.second)
+    {
+      if (n.second.size() > 2)
+      {
+        return invalid;
+      }
+    }
+    while (!stack.empty())
+    {
+      const viskores::Id u = stack.back();
+      stack.pop_back();
+      for (viskores::Id w : link.second.at(u))
+      {
+        if (seen.insert(w).second)
+        {
+          stack.push_back(w);
+        }
+      }
+    }
+    if (seen.size() != link.second.size())
+    {
+      return invalid;
+    }
+  }
+  // Connected and orientable: propagate an orientation across shared edges.
+  std::vector<int> orientation(faces.size(), 0);
+  orientation[0] = 1;
+  std::vector<std::size_t> stack = { 0 };
+  auto directed = [&](std::size_t f, int o)
+  {
+    const auto& t = faces[f];
+    std::array<std::pair<viskores::Id, viskores::Id>, 3> d;
+    for (int s = 0; s < 3; ++s)
+    {
+      const viskores::Id a = t[static_cast<std::size_t>(s)], b = t[static_cast<std::size_t>((s + 1) % 3)];
+      d[static_cast<std::size_t>(s)] = (o == 1) ? std::make_pair(a, b) : std::make_pair(b, a);
+    }
+    return d;
+  };
+  while (!stack.empty())
+  {
+    const std::size_t f = stack.back();
+    stack.pop_back();
+    for (const auto& uw : directed(f, orientation[f]))
+    {
+      for (std::size_t g : edgeFaces[std::make_pair(std::min(uw.first, uw.second), std::max(uw.first, uw.second))])
+      {
+        if (g == f)
+        {
+          continue;
+        }
+        bool reversed = false;
+        for (const auto& d : directed(g, 1))
+        {
+          reversed = reversed || (d.first == uw.second && d.second == uw.first);
+        }
+        const int o = reversed ? 1 : -1;
+        if (orientation[g] == 0)
+        {
+          orientation[g] = o;
+          stack.push_back(g);
+        }
+        else if (orientation[g] != o)
+        {
+          return invalid;
+        }
+      }
+    }
+  }
+  for (int o : orientation)
+  {
+    if (o == 0)
+    {
+      return invalid;
+    }
+  }
+  std::vector<viskores::Id3> asTriangles;
+  for (const auto& f : faces)
+  {
+    asTriangles.push_back({ f[0], f[1], f[2] });
+  }
+  return std::make_pair(static_cast<viskores::Id>(links.size()) -
+                          static_cast<viskores::Id>(edgeFaces.size()) +
+                          static_cast<viskores::Id>(faces.size()),
+                        BoundaryLoops(asTriangles));
 }
 
 /// Distance from `p` to the triangle `abc`, after Ericson's closest point on a triangle.

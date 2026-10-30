@@ -76,7 +76,8 @@ struct InvariantChecker
   long double PlacedEnergy = 0;
   long double FlaggedCost = 0;
   viskores::Id NumFlagged = 0;
-  int Sweeps = 0, Rounds = 0, PlacementChecks = 0;
+  viskores::Id PreviousClusters = 0;
+  int Sweeps = 0, Rounds = 0, PlacementChecks = 0, MergeRounds = 0;
 
   InvariantChecker(const Mesh& input, viskores::Id eulerM, double quantum)
     : Input(input)
@@ -108,6 +109,10 @@ struct InvariantChecker
       this->M = ToVector(state.Quadrics.M);
     }
     const viskores::Id k = state.Clusters.NumberOfClusters;
+    if (stage != Stage::Merged && stage != Stage::Sweep)
+    {
+      this->PreviousClusters = k;
+    }
     if (stage == Stage::Sweep)
     {
       ++this->Sweeps;
@@ -167,6 +172,23 @@ struct InvariantChecker
                                2 * this->EulerM,
                              "The Euler identity of Lemma Euler fails.");
       }
+    }
+    else if (stage == Stage::Merged)
+    {
+      // Invariant 10: after every round of the merge phase the labelling has the discrete
+      // closed-ball property, and k has decreased by at least one.
+      ++this->MergeRounds;
+      this->CheckConnected(labels, k);
+      viskores::cont::ArrayHandle<viskores::UInt8> flags;
+      flags.AllocateAndFill(k, 0);
+      const qc::TopologyReport report =
+        qc::TopologyFlags(state.Mesh, state.Clusters.Labels, state.Clusters.Sizes, flags);
+      VISKORES_TEST_ASSERT(report.NumberOfD0 + report.NumberOfD1 + report.NumberOfD2 == 0,
+                           "A merge round broke the discrete closed-ball property.");
+      VISKORES_TEST_ASSERT(k <= this->PreviousClusters - 1, "A merge round did not merge.");
+      VISKORES_TEST_ASSERT(k == this->PreviousClusters - state.MergedPairs->GetNumberOfValues(),
+                           "A merge round lost track of its merges.");
+      this->PreviousClusters = k;
     }
     else if (stage == Stage::Split)
     {
@@ -303,6 +325,7 @@ Decimation::Parameters Plain(viskores::Id budget = 0,
   p.Quadric.BoundaryWeight = 0;
   p.TargetNumberOfPoints = budget;
   p.MaxClusterRadius = maxRadius;
+  p.Merge = false;
   return p;
 }
 
@@ -346,6 +369,87 @@ void CheckExpected(const Decimation& decimation, const Expected& expected)
   VISKORES_TEST_ASSERT(d.LloydIterations == expected.Lloyd, "Lloyd phase differs.");
   VISKORES_TEST_ASSERT(d.FlaggedRadius == expected.Radius, "(F0) counts differ.");
   VISKORES_TEST_ASSERT(d.FlaggedTopology == expected.Topology, "(F2)-(F3) counts differ.");
+}
+
+/// Checks the output size and merge rounds of a run of the merge phase against the reference,
+/// and, without geometric flags, that it stopped at `k*` or at an irreducible complex: contracting
+/// any edge of the output gives a complex of another type (Theorem "Output size", (iii), (iv)).
+void CheckMerged(const Mesh& mesh,
+                 const Decimation::Parameters& parameters,
+                 viskores::Id loop,
+                 viskores::Id merged,
+                 viskores::Id mergeRounds)
+{
+  const Decimation decimation = RunChecked(mesh, parameters);
+  VISKORES_TEST_ASSERT(decimation.GetNumberOfClustersAfterLoop() == loop,
+                       "The loop stopped elsewhere than the reference.");
+  VISKORES_TEST_ASSERT(decimation.GetNumberOfClusters() == merged,
+                       "The merge phase stopped elsewhere than the reference: ",
+                       decimation.GetNumberOfClusters(),
+                       " vs ",
+                       merged);
+  VISKORES_TEST_ASSERT(decimation.GetMergeDiagnostics().Rounds == mergeRounds,
+                       "The merge phase took another number of rounds.");
+  const viskores::Id k = decimation.GetNumberOfClusters();
+  const bool geometric = parameters.MaxClusterRadius < std::numeric_limits<double>::infinity();
+  if (!geometric && k > parameters.TargetNumberOfPoints)
+  {
+    const auto triangles = ToVector(decimation.GetOutputTriangles());
+    const auto type = qcd_test::SurfaceType(triangles);
+    for (const auto& e : qcd_test::EdgeCounts(triangles))
+    {
+      VISKORES_TEST_ASSERT(
+        qcd_test::SurfaceType(qcd_test::Contract(triangles, e.first.first, e.first.second)) != type,
+        "The merge phase stopped at a complex with a contractible edge.");
+    }
+  }
+}
+
+Decimation::Parameters Merging(Decimation::Parameters p, viskores::Id degreeFloor)
+{
+  p.Merge = true;
+  p.MergeDegreeFloor = degreeFloor;
+  return p;
+}
+
+void TestMerge()
+{
+  // The expected numbers come from proofs/lib/vqc.py with the curvature initialisation and the
+  // hash order, with
+  // merge_priority=None (the priority the increase of the objective, then the labels) and
+  // merge_priority=12 (the degree key), and coarsen=True in error mode.
+  const Mesh plate2 = qcd_test::VoxelSolid(qcd_test::PlateWithHoles(2), 1.0);
+  const Mesh plate3 = qcd_test::VoxelSolid(qcd_test::PlateWithHoles(3), 1.0);
+  const Mesh opening = qcd_test::Genus2PlateWithOpening();
+  const Mesh sphere = qcd_test::Icosphere(3);
+  std::cout << "Merge by cost: plate with two holes, budget 2" << std::endl;
+  CheckMerged(plate2, Merging(Plain(2), -1), 22, 10, 6);
+  std::cout << "Merge by cost: plate with three holes, budget 2" << std::endl;
+  CheckMerged(plate3, Merging(Plain(2), -1), 38, 15, 7);
+  std::cout << "Merge by cost: disk, budget 2" << std::endl;
+  CheckMerged(qcd_test::Disk(), Merging(Plain(2), -1), 4, 3, 1);
+  std::cout << "Merge by cost: annulus, budget 2" << std::endl;
+  CheckMerged(qcd_test::Annulus(), Merging(Plain(2), -1), 16, 6, 5);
+  std::cout << "Merge by cost: sphere, radius cap, error mode" << std::endl;
+  CheckMerged(sphere, Merging(Plain(0, 0.08 * LargestSide(sphere)), -1), 207, 179, 3);
+
+  std::cout << "Merge with the degree key: plate with two holes, budget 2" << std::endl;
+  CheckMerged(plate2, Merging(Plain(2), 12), 22, 11, 6);
+  std::cout << "Merge with the degree key: genus-2 plate with an opening, budget 2" << std::endl;
+  CheckMerged(opening, Merging(Plain(2), 12), 17, 11, 3);
+  std::cout << "Merge with the degree key: annulus, radius cap, error mode" << std::endl;
+  const Mesh annulus = qcd_test::Annulus();
+  CheckMerged(annulus, Merging(Plain(0, 0.08 * LargestSide(annulus)), 12), 157, 128, 4);
+
+  // A component that is a triangle or a tetrahedron is irreducible while other components still
+  // merge; without geometric flags only the local test guards the merges, so it must leave them
+  // alone (Proposition "A merge is an edge contraction"). The icosphere stops at a tetrahedron.
+  std::cout << "Merge with the degree key: icosphere, tetrahedron and triangle, budget 6"
+            << std::endl;
+  const Decimation components =
+    RunChecked(qcd_test::IcosphereWithSmallComponents(2), Merging(Plain(6), 12));
+  VISKORES_TEST_ASSERT(components.GetNumberOfClusters() == 11,
+                       "The merge phase stopped elsewhere than at three irreducible components.");
 }
 
 void TestLoop()
@@ -498,6 +602,7 @@ void TestInvalidInput()
 void TestQuadricClusteringDecimationWorklet()
 {
   TestLoop();
+  TestMerge();
   TestDeterminism();
   TestInvalidInput();
 }

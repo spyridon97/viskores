@@ -29,6 +29,7 @@ void TestParameters()
   VISKORES_TEST_ASSERT(filter.GetFeatureWeight() == 1 && filter.GetBoundaryWeight() == 1,
                        "Bad default weights.");
   VISKORES_TEST_ASSERT(filter.GetMaxSweeps() == 0, "Bad default sweep cap.");
+  VISKORES_TEST_ASSERT(filter.GetMerge(), "The merge phase should run by default.");
   VISKORES_TEST_ASSERT(filter.GetInitialization() == Filter::Initialization::Curvature,
                        "Bad default initialization.");
   VISKORES_TEST_ASSERT(filter.GetGuarantees() == Filter::Topology, "Bad default guarantees.");
