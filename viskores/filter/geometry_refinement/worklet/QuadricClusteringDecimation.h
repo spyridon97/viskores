@@ -19,6 +19,7 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SegmentMerges.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SurfaceMesh.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/ThickeningFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/VertexQuadrics.h>
 
@@ -292,7 +293,7 @@ public:
     /// The target vertex count `k*` of budget mode, or 0.
     viskores::Id TargetNumberOfPoints = 0;
     /// The bound `epsilon_H` on the Hausdorff distance between input and output of error mode,
-    /// enforced by the envelope flag (F5), or 0.
+    /// enforced by the envelope flag (F5), or by (F7) with the fast thickening, or 0.
     Real ErrorBound = 0;
     /// A cap on the cluster radius, flag (F0).
     Real MaxClusterRadius = std::numeric_limits<Real>::infinity();
@@ -308,6 +309,43 @@ public:
     /// The halves of the envelope flag (F5) with an error bound. The geometric-only mode needs
     /// both.
     quadric_clustering::EnvelopeSides ErrorSides = quadric_clustering::EnvelopeSides::Both;
+    /// Isotopy, an option: the flag (F7) of Theorem I, the output isotopic to the input through a
+    /// certified thickening of it (proofs/lib/thick.py). Needs a closed surface,
+    /// the topological flags, (F4) and an error bound. With `Creases`, the thickening is that of
+    /// the input before the cut, and (F7) reads the glued output (Corollary "creasesiso").
+    ///
+    /// - `Standard`: a wide thickening, offsets from three times the error bound, not capped,
+    ///   and (F5) as `ErrorSides` says, so the output is within the error bound by (F5).
+    /// - `Fast`: offsets from just below the error bound and capped by it, and (F5) off: (F7)
+    ///   alone certifies the error bound (Proposition "thickhausdorff"). Faster, but it costs
+    ///   output size on boxy parts.
+    ///
+    /// If no certified thickening is found, the run takes the default path, with (F5) as
+    /// `ErrorSides` says, and `Diagnostics::ThickeningCertified` is false.
+    ///
+    /// Measured cost: free on smooth and boxy inputs (identical outputs on 16 of 18 synthetic
+    /// inputs and the roller), about twice the output size on CAD parts with thin features
+    /// (gears 515-524 vertices against 255-260, Link31 162 against 120): the certificate needs
+    /// the output inside a thickening, which thin features make thin. A better thickening is an
+    /// open problem.
+    enum class ThickeningMode
+    {
+      Off,
+      Standard,
+      Fast
+    };
+    ThickeningMode Thickening = ThickeningMode::Off;
+    /// Experimental: the initial offsets of the thickening as a multiple of the error bound,
+    /// in place of those of the mode, or 0 for those.
+    Real ThickeningOffset = 0;
+    /// With the thickening, halve only the offset on the side of a failure while building it,
+    /// not both.
+    bool ThickeningAsymmetric = true;
+    /// With the thickening, the directions of its offsets (Proposition "thicklocal"): by
+    /// default the area-weighted normal where it makes a positive angle margin with every
+    /// triangle at the vertex, and the max-min direction elsewhere.
+    quadric_clustering::ThickeningDirections ThickeningDirections =
+      quadric_clustering::ThickeningDirections::Hybrid;
     /// The cap `T` on the propose/commit sweeps of each assignment step, or 0 for none.
     viskores::Id MaxSweeps = 0;
     /// The initial clusters. Seeds are followed by a Lloyd phase. An input cut into surfaces and
@@ -343,7 +381,7 @@ public:
     /// piece is orientable. Otherwise only the singular edges (and the creases) are cut and
     /// nothing is reoriented, so a piece may not be orientable (Corollary "nonorientable"); a
     /// surface that is not orientable, such as a Moebius band, takes the cut with no edge cut
-    /// and no frozen copy.
+    /// and no frozen copy. The thickening needs a consistently oriented input either way.
     bool Seams = true;
     /// For an input cut into surfaces: decimate its singular curves too, by merging consecutive
     /// segments of them in the merge phase (Proposition "Decimating the singular curves");
@@ -412,12 +450,17 @@ public:
     viskores::Id LloydIterations = 0;
     viskores::Id Sweeps = 0;
     /// Clusters flagged by each test over the whole loop, each counted once per round by the
-    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F4), (F5).
+    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F4), (F5), (F7).
     viskores::Id FlaggedRadius = 0;
     viskores::Id FlaggedBudget = 0;
     viskores::Id FlaggedTopology = 0;
     viskores::Id FlaggedEmbedding = 0;
     viskores::Id FlaggedEnvelope = 0;
+    viskores::Id FlaggedThickening = 0;
+    /// With the thickening: whether a certified one was found, so that (F7) ran and the output
+    /// is isotopic to the input, and the rounds of halving of its offsets.
+    bool ThickeningCertified = false;
+    viskores::Id ThickeningHalvings = 0;
     /// Clusters found adjacent to two copies of a frozen vertex of a cut input, over the loop;
     /// they are flagged with (F2) and (F3).
     viskores::Id GlueViolations = 0;
@@ -441,6 +484,7 @@ public:
       double Topology = 0;
       double Embedding = 0;
       double Envelope = 0;
+      double Thickening = 0;
       double InsertSplit = 0;
       double Merge = 0;
       double Output = 0;
@@ -515,7 +559,46 @@ public:
       throw viskores::cont::ErrorBadValue("QuadricClusteringDecimation: the geometric-only mode "
                                           "checks both sides of the error bound.");
     }
-    const qc::EnvelopeSides sides = this->Params.ErrorSides;
+    const bool thickeningRequested = this->Params.Thickening != Parameters::ThickeningMode::Off;
+    if (thickeningRequested &&
+        (geometric || !this->Params.Topology || !this->Params.Embedding ||
+         !(this->Params.ErrorBound > 0) || !problem.empty() || this->Mesh.HasBoundary))
+    {
+      throw viskores::cont::ErrorBadValue(
+        "QuadricClusteringDecimation: the thickening flag needs a closed surface, the "
+        "topological and embedding flags and an error bound.");
+    }
+    if (thickeningRequested && this->Mesh.Unoriented)
+    {
+      throw viskores::cont::ErrorBadValue(
+        "QuadricClusteringDecimation: the thickening flag needs a consistently oriented input; "
+        "no result covers a piece that is not orientable.");
+    }
+    // With (F7), the certified thickening of the input, before a cut along its creases, which
+    // keeps its triangles in order (Corollary "creasesiso"); without one, the default path. The
+    // fast setting turns (F5) off, which (F7) then replaces.
+    qc::Thickening thick;
+    qc::EnvelopeSides sides = this->Params.ErrorSides;
+    if (thickeningRequested)
+    {
+      const Real bound = this->Params.ErrorBound;
+      const bool asymmetric = this->Params.ThickeningAsymmetric;
+      const bool fast = this->Params.Thickening == Parameters::ThickeningMode::Fast;
+      Real delta0 = fast ? bound * (1 - std::ldexp(Real(1), -20)) : 3 * bound;
+      if (this->Params.ThickeningOffset > 0)
+      {
+        delta0 = this->Params.ThickeningOffset * bound;
+      }
+      thick = qc::BuildThickening(
+        this->Mesh, delta0, bound, fast, asymmetric, this->Params.ThickeningDirections);
+      this->Diag.ThickeningCertified = thick.Valid;
+      this->Diag.ThickeningHalvings = thick.Halvings;
+      if (thick.Valid && fast)
+      {
+        sides = qc::EnvelopeSides::None;
+      }
+    }
+    const bool thickening = thick.Valid;
     // The creases, cut as the singular edges are: the given cut set, or the sharp edges of the
     // feature angle.
     viskores::cont::ArrayHandle<viskores::Id2> creases;
@@ -812,6 +895,23 @@ public:
         timer.Stop();
         seconds.Envelope += timer.GetElapsedTime();
       }
+      // (F7), last, likewise.
+      if (thickening && qc::CountFlags(flags) == 0)
+      {
+        timer.Start();
+        viskores::cont::ArrayHandle<viskores::UInt8> thickeningFlags;
+        thickeningFlags.AllocateAndFill(k, 0);
+        qc::ThickeningFlags(mesh,
+                            thick,
+                            clusters.Labels,
+                            clusters.Generators,
+                            clusters.Sizes,
+                            thickeningFlags,
+                            this->Glue(clusters));
+        this->Diag.FlaggedThickening += qc::OrFlags(flags, thickeningFlags);
+        timer.Stop();
+        seconds.Thickening += timer.GetElapsedTime();
+      }
 
       State state{ mesh, this->Quadrics, clusters };
       state.Scan = &scan;
@@ -845,6 +945,7 @@ public:
       qc::MergeParameters merge;
       merge.Budget = budget;
       merge.MaxClusterRadius = maxRadius;
+      merge.CertifiedThickening = thickening ? &thick : nullptr;
       merge.Embedding = embedding;
       merge.ErrorBound = errorBound;
       merge.Sides = sides;

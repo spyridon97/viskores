@@ -518,6 +518,254 @@ struct GroupTriangleImproper : viskores::worklet::WorkletMapField
   }
 };
 
+/// The corners of the glued output triangles, one vertex per corner.
+struct GluedCorners : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle, FieldOut corners);
+  using ExecutionSignature = void(_1, _2);
+
+  template <typename CornerVec>
+  VISKORES_EXEC void operator()(const viskores::Id3& t, CornerVec& corners) const
+  {
+    for (int a = 0; a < 3; ++a)
+    {
+      corners[a] = t[a];
+    }
+  }
+};
+
+/// (F7) on a candidate's labelling, given that no 3-label triangle fails on the labelling of
+/// the round, as `ArcThickVQC.iso_pass`: a 3-label triangle at neither glue group keeps its
+/// output triangle, and fails only through its component or a probe. The component of the
+/// merged group keeps its first vertex unless that is the removed group, and that first vertex
+/// moves only if it is the merged group. A probe's crossings change by those of the output
+/// triangles at the two groups and at the merged group; a failing probe fails a triangle that
+/// meets it, which exists if it has a crossing, or one with a vertex of its triangle's labels.
+/// Sides are tested by `IncidentThickeningFires`.
+struct CandidateThickening : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn candidate,
+                                ExecObject region,
+                                ExecObject round,
+                                WholeArrayIn outputTriangles,
+                                WholeArrayIn gluedTriangles,
+                                WholeArrayIn fanOffsets,
+                                WholeArrayIn fans,
+                                WholeArrayIn groupOffsets,
+                                WholeArrayIn groupTriangles,
+                                WholeArrayIn inputTriangles,
+                                WholeArrayIn appear,
+                                WholeArrayInOut fires);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12);
+
+  template <typename Region,
+            typename Round,
+            typename Id3Portal,
+            typename IdPortal,
+            typename FirePortal>
+  VISKORES_EXEC void operator()(viskores::Id c,
+                                const Region& region,
+                                const Round& round,
+                                const Id3Portal& outputTriangles,
+                                const Id3Portal& gluedTriangles,
+                                const IdPortal& fanOffsets,
+                                const IdPortal& fans,
+                                const IdPortal& groupOffsets,
+                                const Id3Portal& groupTriangles,
+                                const Id3Portal& inputTriangles,
+                                const IdPortal& appear,
+                                FirePortal& fires) const
+  {
+    // The glue group that stays (the target) and the one that joins it.
+    const viskores::Id2 groups = region.GroupGlue.Get(c);
+    const viskores::Id kept = groups[0], removed = groups[1];
+    const viskores::Id newBegin = groupOffsets.Get(c), newEnd = groupOffsets.Get(c + 1);
+    const bool hasNew = newEnd > newBegin;
+    bool complete = true, fits = true;
+    bool fire = false;
+
+    // The component: its first vertex without the removed group.
+    viskores::Id first = -1;
+    bool firstInside = true;
+    for (int which = 0; which < 2; ++which)
+    {
+      const viskores::Id root = round.Root.Get(which == 0 ? kept : removed);
+      if (root < 0)
+      {
+        continue;
+      }
+      viskores::Id f = root;
+      bool inside = round.InsideFirst.Get(root) != 0;
+      if (f == removed)
+      {
+        f = round.Second.Get(root);
+        inside = round.InsideSecond.Get(root) != 0;
+      }
+      if (f >= 0 && (first < 0 || f < first))
+      {
+        first = f;
+        firstInside = inside;
+      }
+    }
+    if (first >= 0 && hasNew)
+    {
+      const bool inside = (first == kept)
+        ? round.Thick.Inside(region.Generator(c, kept), complete, fits)
+        : firstInside;
+      fire = !inside;
+    }
+
+    // The output triangles of the round at the two groups, each once: from its smallest label
+    // in them.
+    auto forEachRemoved = [&](auto&& visit)
+    {
+      for (viskores::Id r = region.LabelOffsets.Get(c); r < region.LabelOffsets.Get(c + 1); ++r)
+      {
+        const viskores::Id x = region.LabelRecords.Get(r)[1];
+        for (viskores::Id k = fanOffsets.Get(x); k < fanOffsets.Get(x + 1); ++k)
+        {
+          const viskores::Id row = fans.Get(k);
+          const viskores::Id3 tri = outputTriangles.Get(row);
+          bool firstHere = true;
+          for (int a = 0; a < 3; ++a)
+          {
+            if (tri[a] < x && region.Affected(c, tri[a]))
+            {
+              firstHere = false;
+            }
+          }
+          if (firstHere)
+          {
+            visit(row, tri);
+          }
+        }
+      }
+    };
+    // The glued vertex of a label of the candidate's labelling, -1 for the merged group.
+    auto gluedNew = [&](viskores::Id label)
+    { return region.Affected(c, label) ? viskores::Id(-1) : region.Glue.Get(label); };
+
+    const viskores::Id numProbes = round.ProbeCrossings.GetNumberOfValues();
+    for (viskores::Id q = 0; q < numProbes && !fire; ++q)
+    {
+      viskores::Id crossings = round.ProbeCrossings.Get(q);
+      viskores::Id nongeneric = round.ProbeNongeneric.Get(q);
+      forEachRemoved(
+        [&](viskores::Id, const viskores::Id3& tri)
+        {
+          const Vec3 p[3] = { region.Generators.Get(tri[0]),
+                              region.Generators.Get(tri[1]),
+                              region.Generators.Get(tri[2]) };
+          const thickening_detail::SegmentHit hit = round.Thick.ProbeHit(q, p, fits);
+          if (hit.Hit)
+          {
+            --crossings;
+            nongeneric -= hit.Generic ? 0 : 1;
+          }
+        });
+      for (viskores::Id g = newBegin; g < newEnd; ++g)
+      {
+        const viskores::Id3 tri = groupTriangles.Get(g);
+        const Vec3 p[3] = { region.Generator(c, tri[0]),
+                            region.Generator(c, tri[1]),
+                            region.Generator(c, tri[2]) };
+        const thickening_detail::SegmentHit hit = round.Thick.ProbeHit(q, p, fits);
+        if (hit.Hit)
+        {
+          ++crossings;
+          nongeneric += hit.Generic ? 0 : 1;
+        }
+      }
+      if (nongeneric == 0 && crossings % 2 == 1)
+      {
+        continue;
+      }
+      if (crossings > 0)
+      {
+        fire = true;
+        break;
+      }
+      // A 3-label triangle with a vertex at a label of the probe's triangle.
+      const viskores::Id3 f = inputTriangles.Get(round.Thick.ProbeTriangles.Get(q));
+      for (int a = 0; a < 3 && !fire; ++a)
+      {
+        const viskores::Id y = region.Labels.Get(f[a]);
+        const viskores::Id x = gluedNew(y);
+        if (x < 0)
+        {
+          fire = hasNew;
+          continue;
+        }
+        viskores::Id count = appear.Get(x);
+        forEachRemoved(
+          [&](viskores::Id row, const viskores::Id3&)
+          {
+            const viskores::Id3 gt = gluedTriangles.Get(row);
+            count -= (gt[0] == x || gt[1] == x || gt[2] == x) ? 1 : 0;
+          });
+        for (viskores::Id g = newBegin; g < newEnd; ++g)
+        {
+          const viskores::Id3 tri = groupTriangles.Get(g);
+          count +=
+            (gluedNew(tri[0]) == x || gluedNew(tri[1]) == x || gluedNew(tri[2]) == x) ? 1 : 0;
+        }
+        fire = count > 0;
+      }
+    }
+    if (!complete || !fits)
+    {
+      this->RaiseError("QuadricClusteringDecimation: exact evaluation out of range.");
+    }
+    if (fire)
+    {
+      Fire(fires, c);
+    }
+  }
+};
+
+/// (F7) on the input triangles at the two glue groups of a candidate: whether one is a 3-label
+/// triangle of its labelling whose output triangle meets a side of the thickening; these are the
+/// only triangles whose output triangles change.
+struct IncidentThickeningFires : viskores::worklet::WorkletMapField
+{
+  using ControlSignature =
+    void(FieldIn item, ExecObject mesh, ExecObject region, ExecObject round, WholeArrayInOut fires);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5);
+
+  template <typename Mesh, typename Region, typename Round, typename FirePortal>
+  VISKORES_EXEC void operator()(const viskores::Id2& item,
+                                const Mesh& mesh,
+                                const Region& region,
+                                const Round& round,
+                                FirePortal& fires) const
+  {
+    const viskores::Id c = item[0];
+    const viskores::Id3 tri = mesh.Triangles.Get(item[1]);
+    viskores::Id l[3];
+    for (int a = 0; a < 3; ++a)
+    {
+      l[a] = region.VertexLabel(c, tri[a]);
+    }
+    if (!AllDistinct(l[0], l[1], l[2]))
+    {
+      return;
+    }
+    const Vec3 p[3] = { region.Generator(c, l[0]),
+                        region.Generator(c, l[1]),
+                        region.Generator(c, l[2]) };
+    bool complete = true, fits = true;
+    const bool meets = round.Thick.MeetsSides(p, complete, fits);
+    if (!complete || !fits)
+    {
+      this->RaiseError("QuadricClusteringDecimation: exact evaluation out of range.");
+    }
+    if (meets)
+    {
+      Fire(fires, c);
+    }
+  }
+};
+
 //---------------------------------------------------------------------------------------------
 // (F5)
 
@@ -1101,8 +1349,8 @@ struct FiredFlag : viskores::worklet::WorkletMapField
 /// discrete closed-ball property on the clusters it changes and the pairs and triples at them,
 /// (d') at its merged group, (F0) on its moved generators, (F4) on its output triangles at the
 /// merged group, which are never inherited, (F5) on the triangles whose tests it can change, or
-/// on every triangle if it changes a scale of the test, and (Fc) on the output polyline of its
-/// arc.
+/// on every triangle if it changes a scale of the test, (Fc) on the output polyline of its arc,
+/// and (F7) on its glued output.
 inline viskores::cont::ArrayHandle<viskores::UInt8> CandidateFlags(
   const SurfaceMesh& mesh,
   const DistanceMesh& inputDistance,
@@ -1307,18 +1555,19 @@ inline viskores::cont::ArrayHandle<viskores::UInt8> CandidateFlags(
   viskores::cont::ArrayHandle<viskores::Id3> sourceKeys;
   invoke(detail::IndexKey{}, outputSources, sourceKeys);
 
-  // The glued output triangles of the round, for (F4).
+  // The glued output triangles of the round, for (F4) and (F7).
   const bool improperTest =
     parameters.Embedding && parameters.Topological && groupTriangles.GetNumberOfValues() > 0;
+  const bool thickeningTest = parameters.CertifiedThickening && parameters.Topological;
   viskores::cont::ArrayHandle<viskores::Id3> glued;
-  if (improperTest)
+  if (improperTest || thickeningTest)
   {
     glued = GlueTriangles(outputTriangles, glue);
   }
-  // The output triangles of the round at every label, for (ii) of (F5).
+  // The output triangles of the round at every label, for (F7) and (ii) of (F5).
   const viskores::UInt8 sides = static_cast<viskores::UInt8>(parameters.Sides);
   viskores::cont::ArrayHandle<viskores::Id> fanOffsets, fans;
-  if (envelopeTest && (sides & 2) != 0)
+  if (thickeningTest || (envelopeTest && (sides & 2) != 0))
   {
     viskores::cont::ArrayHandle<viskores::Id2> cornerRecords;
     invoke(detail::CornerRecords{},
@@ -1344,6 +1593,48 @@ inline viskores::cont::ArrayHandle<viskores::UInt8> CandidateFlags(
            hierarchy,
            region,
            fires);
+  }
+
+  // (F7), on the glued output of every candidate's labelling.
+  if (thickeningTest)
+  {
+    const ThickeningRound round = PrepareThickeningRound(
+      *parameters.CertifiedThickening, clusters.Generators, glued, clusters.NumberOfClusters);
+    const ThickeningRoundObject roundObject(*parameters.CertifiedThickening, round);
+    // The glued output triangles at every vertex of K.
+    viskores::cont::ArrayHandle<viskores::Id> appear;
+    appear.AllocateAndFill(clusters.NumberOfClusters, 0);
+    if (glued.GetNumberOfValues() > 0)
+    {
+      viskores::cont::ArrayHandle<viskores::Id> corners, keys, counts;
+      corners.Allocate(3 * glued.GetNumberOfValues());
+      invoke(sf::GluedCorners{}, glued, viskores::cont::make_ArrayHandleGroupVec<3>(corners));
+      Algorithm::Sort(corners);
+      Algorithm::ReduceByKey(
+        corners,
+        viskores::cont::make_ArrayHandleConstant(viskores::Id(1), corners.GetNumberOfValues()),
+        keys,
+        counts,
+        viskores::Add());
+      invoke(ScatterValue{}, keys, counts, appear);
+    }
+    invoke(sf::CandidateThickening{},
+           viskores::cont::ArrayHandleIndex(n),
+           region,
+           roundObject,
+           outputTriangles,
+           glued,
+           fanOffsets,
+           fans,
+           groupOffsets,
+           groupTriangles,
+           mesh.Triangles,
+           appear,
+           fires);
+    if (incident.GetNumberOfValues() > 0)
+    {
+      invoke(sf::IncidentThickeningFires{}, incident, meshObject, region, roundObject, fires);
+    }
   }
 
   // (F5)

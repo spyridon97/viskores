@@ -67,6 +67,8 @@ enum class EnvelopeMode
 /// input, (ii) every input triangle within epsilon of the output.
 enum class EnvelopeSides : viskores::UInt8
 {
+  /// Neither: (F5) is off; with the fast thickening, (F7) certifies the error bound.
+  None = 0,
   OutputToInput = 1,
   InputToOutput = 2,
   Both = 3

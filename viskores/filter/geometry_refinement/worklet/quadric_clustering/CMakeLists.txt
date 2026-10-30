@@ -25,6 +25,7 @@ set(headers
   SegmentMerges.h
   SingularCurves.h
   SurfaceMesh.h
+  ThickeningFlags.h
   TopologyFlags.h
   VertexQuadrics.h
   )

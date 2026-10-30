@@ -15,6 +15,7 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/GlueItems.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SingularCurves.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/ThickeningFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/VertexQuadrics.h>
 
@@ -68,7 +69,7 @@ struct MergeParameters
 {
   bool GeometricFlags() const
   {
-    return this->Embedding || this->ErrorBound > 0 ||
+    return this->Embedding || this->ErrorBound > 0 || this->CertifiedThickening != nullptr ||
       this->MaxClusterRadius < std::numeric_limits<Real>::infinity();
   }
 
@@ -79,6 +80,8 @@ struct MergeParameters
   Real ErrorBound = 0;
   /// The halves of the envelope flag (F5) in use.
   EnvelopeSides Sides = EnvelopeSides::Both;
+  /// The certified thickening of the flag (F7), or null without it.
+  const Thickening* CertifiedThickening = nullptr;
   /// Whether candidates must keep the discrete closed-ball property; off in the geometric-only
   /// mode, where every pair of adjacent clusters is a candidate and the output is the set of
   /// simplices.
@@ -388,10 +391,174 @@ struct MergeContextPortals
     return false;
   }
 
+  /// (F7) for a merge `(i, j)` with the merged generator at `merged`, on the 3-label input
+  /// triangles with a vertex in the merged cluster, as `ThickVQC.iso_pass` of
+  /// proofs/lib/thick.py on the labelling with the merge: the output triangle misses the sides,
+  /// the component of the merged cluster has its first generator inside T, and no probe that
+  /// fails on that labelling meets the triangle or has the label of a vertex of its triangle.
+  VISKORES_EXEC bool ThickeningAdmissible(viskores::Id i,
+                                          viskores::Id j,
+                                          const Vec3& merged,
+                                          bool& complete) const
+  {
+    const ThickeningRoundPortals& round = this->RoundThickening;
+    bool fits = true;
+    // The vertex of the glued output of a label; j is never glued, and i only when it is frozen.
+    auto glued = [&](viskores::Id label) { return this->HasGlue ? this->Glue.Get(label) : label; };
+    const viskores::Id gi = glued(i);
+    // The component, without j: its first vertex and whether its generator is inside T.
+    bool inside = true;
+    const viskores::Id root = round.Root.Get(gi);
+    if (root >= 0)
+    {
+      viskores::Id first = root;
+      bool firstInside = round.InsideFirst.Get(root) != 0;
+      if (first == j)
+      {
+        first = round.Second.Get(root);
+        firstInside = round.InsideSecond.Get(root) != 0;
+      }
+      inside = (first == gi) ? round.Thick.Inside(merged, complete, fits) : firstInside;
+    }
+    auto atI = [&](const viskores::Id3& tri) { return tri[0] == i || tri[1] == i || tri[2] == i; };
+    // Whether probe p fails on the labelling with the merge: its crossings with the output
+    // triangles at i or j are replaced by those with the triangles at the merged vertex, once
+    // each.
+    auto probeFails = [&](viskores::Id p)
+    {
+      viskores::Id crossings = round.ProbeCrossings.Get(p);
+      viskores::Id nongeneric = round.ProbeNongeneric.Get(p);
+      auto count = [&](const Vec3* q, viskores::Id sign)
+      {
+        const thickening_detail::SegmentHit hit = round.Thick.ProbeHit(p, q, fits);
+        if (hit.Hit)
+        {
+          crossings += sign;
+          nongeneric += hit.Generic ? 0 : sign;
+        }
+      };
+      for (int which = 0; which < 2; ++which)
+      {
+        const viskores::Id c = (which == 0) ? i : j;
+        for (viskores::Id f = this->FanOffsets.Get(c); f < this->FanOffsets.Get(c + 1); ++f)
+        {
+          const viskores::Id3 tri = this->OutputTriangles.Get(this->Fans.Get(f));
+          if (which == 1 && atI(tri))
+          {
+            continue;
+          }
+          const Vec3 q[3] = { this->Generators.Get(tri[0]),
+                              this->Generators.Get(tri[1]),
+                              this->Generators.Get(tri[2]) };
+          count(q, -1);
+        }
+      }
+      // The triangles at the merged vertex, a triangle of j dropped when i has one on the same
+      // labels.
+      this->ForEachNewTriangle(
+        i,
+        j,
+        merged,
+        [&](const Vec3* q, const viskores::Id3& labels, viskores::Id t)
+        {
+          if (!atI(this->OutputTriangles.Get(t)))
+          {
+            for (viskores::Id f = this->FanOffsets.Get(i); f < this->FanOffsets.Get(i + 1); ++f)
+            {
+              const viskores::Id3 other = this->OutputTriangles.Get(this->Fans.Get(f));
+              int same = 0;
+              for (int a = 0; a < 3; ++a)
+              {
+                same +=
+                  (other[a] == labels[0] || other[a] == labels[1] || other[a] == labels[2]) ? 1 : 0;
+              }
+              if (same == 3)
+              {
+                return true;
+              }
+            }
+          }
+          count(q, 1);
+          return true;
+        });
+      return nongeneric > 0 || crossings % 2 == 0;
+    };
+    const viskores::Id numProbes = round.ProbeCrossings.GetNumberOfValues();
+    // The verdicts of the first probes: 0 unknown, 1 passing, 2 failing.
+    viskores::UInt8 verdicts[64];
+    for (int p = 0; p < 64; ++p)
+    {
+      verdicts[p] = 0;
+    }
+    auto fails = [&](viskores::Id p)
+    {
+      if (p >= 64)
+      {
+        return probeFails(p);
+      }
+      if (verdicts[p] == 0)
+      {
+        verdicts[p] = probeFails(p) ? 2 : 1;
+      }
+      return verdicts[p] == 2;
+    };
+    bool bad = false;
+    for (int which = 0; which < 2 && !bad; ++which)
+    {
+      const viskores::Id c = (which == 0) ? i : j;
+      for (viskores::Id k = this->MemberOffsets.Get(c); !bad && k < this->MemberOffsets.Get(c + 1);
+           ++k)
+      {
+        const viskores::Id v = this->Members.Get(k);
+        for (viskores::Id r = this->CornerOffsets.Get(v);
+             !bad && r < this->CornerOffsets.Get(v + 1);
+             ++r)
+        {
+          const viskores::Id t = this->Corners.Get(r) % this->NumberOfInputTriangles;
+          const viskores::Id3 tri = this->InputTriangles.Get(t);
+          viskores::Id labels[3];
+          for (int a = 0; a < 3; ++a)
+          {
+            labels[a] = this->Labels.Get(tri[a]);
+            labels[a] = (labels[a] == j) ? i : labels[a];
+          }
+          if (!AllDistinct(labels[0], labels[1], labels[2]))
+          {
+            continue;
+          }
+          Vec3 p[3];
+          for (int a = 0; a < 3; ++a)
+          {
+            p[a] = (labels[a] == i) ? merged : this->Generators.Get(labels[a]);
+          }
+          bad = !inside || round.Thick.MeetsSides(p, complete, fits);
+          for (viskores::Id q = 0; q < numProbes && !bad; ++q)
+          {
+            if (!fails(q))
+            {
+              continue;
+            }
+            const viskores::Id3 f = this->InputTriangles.Get(round.Thick.ProbeTriangles.Get(q));
+            for (int a = 0; a < 3 && !bad; ++a)
+            {
+              viskores::Id pl = this->Labels.Get(f[a]);
+              pl = glued((pl == j) ? i : pl);
+              bad = pl == glued(labels[0]) || pl == glued(labels[1]) || pl == glued(labels[2]);
+            }
+            bad = bad || round.Thick.ProbeHit(q, p, fits).Hit;
+          }
+        }
+      }
+    }
+    complete = complete && fits;
+    return !bad;
+  }
+
   /// The local test of a merge of Section 11.5 but for the envelope: (F0) on the merged
-  /// cluster and (F4) on the pairs with a triangle at the merged vertex. Sets `merged` to the
-  /// position of the merged generator; a sheet cluster joining a frozen cluster leaves its
-  /// generator in place. (d') of such a merge is tested by `SheetMergeGlueTest`.
+  /// cluster, (F4) on the pairs with a triangle at the merged vertex, and (F7) on the 3-label
+  /// input triangles with a vertex in the merged cluster. Sets `merged` to the position of the
+  /// merged generator; a sheet cluster joining a frozen cluster leaves its generator in place.
+  /// (d') of such a merge is tested by `SheetMergeGlueTest`.
   VISKORES_EXEC bool Admissible(viskores::Id i, viskores::Id j, Vec3& merged, bool& complete) const;
 
   /// Visits the input triangles the envelope part of the local test reads, as `visit(t, tri,
@@ -455,6 +622,9 @@ struct MergeContextPortals
   bool Embedding;
   /// The halves of (F5) in use, as the bits of the tests of `ForEachEnvelopeItem`.
   viskores::UInt8 SideTests;
+  /// With (F7): the thickening and what the round's labelling reads of it.
+  bool HasThickening;
+  ThickeningRoundPortals RoundThickening;
   /// The largest absolute coordinate of the generators with two clusters replaced.
   MergedScale Scale;
 };
@@ -591,6 +761,12 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
     {
       return false;
     }
+  }
+  // (F7) on the 3-label triangles with a vertex in the merged cluster, on the labelling with
+  // the merge (`ThickVQC.iso_pass`).
+  if (this->HasThickening && !this->ThickeningAdmissible(i, j, merged, complete))
+  {
+    return false;
   }
   return true;
 }
@@ -900,6 +1076,13 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
     portals.Epsilon = this->Epsilon;
     portals.Embedding = this->Embedding;
     portals.SideTests = static_cast<viskores::UInt8>(this->Sides);
+    portals.HasThickening = this->CertifiedThickening != nullptr;
+    if (this->CertifiedThickening)
+    {
+      portals.RoundThickening =
+        ThickeningRoundObject(*this->CertifiedThickening, *this->RoundThickening)
+          .PrepareForExecution(device, token);
+    }
     portals.Scale = this->Scale;
     return portals;
   }
@@ -921,6 +1104,8 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
   Real Epsilon;
   bool Embedding;
   EnvelopeSides Sides = EnvelopeSides::Both;
+  const Thickening* CertifiedThickening = nullptr;
+  const ThickeningRound* RoundThickening = nullptr;
   MergedScale Scale;
 };
 
@@ -3262,7 +3447,7 @@ inline bool NewImproper(const SurfaceMesh& mesh,
 }
 
 /// Whether any flag in use fires on a placed labelling, evaluated in full: the discrete
-/// closed-ball property, the glue condition, (Fc), (F0), (F4) and (F5). With `bases`,
+/// closed-ball property, the glue condition, (Fc), (F0), (F4), (F5) and (F7). With `bases`,
 /// (F5) tests only the triangles whose verdicts can differ from a base's
 /// (`MergeEnvelopeFlags`); with `verdicts`, its verdicts are stored there, for a caller that
 /// commits the labelling or keeps it as a base.
@@ -3401,19 +3586,37 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
       return true;
     }
   }
+  if (parameters.CertifiedThickening)
+  {
+    flags.AllocateAndFill(k, 0);
+    ThickeningFlags(mesh,
+                    *parameters.CertifiedThickening,
+                    clusters.Labels,
+                    clusters.Generators,
+                    clusters.Sizes,
+                    flags,
+                    OutputGlue(parameters, clusters));
+    if (CountFlags(flags) > 0)
+    {
+      return true;
+    }
+  }
   return false;
 }
 
 /// The failing items of the full test on a labelling that the region blame reads: the input
 /// triangles that fail (F5) from the input side (`input_fails` of proofs/lib/vqc.py), empty
-/// without (F5).
+/// without (F5), and the round of (F7), whose probes may fail, with the glue it read.
 struct FailingItems
 {
   viskores::cont::ArrayHandle<viskores::UInt8> FailedInput;
+  bool HasThickeningRound = false;
+  ThickeningRound Round;
+  viskores::cont::ArrayHandle<viskores::Id> Glue;
 };
 
 /// The clusters that the flags in use flag on a placed labelling, as `flagged_clusters` of
-/// proofs/lib/vqc.py: (F0), the glue condition, (Fc), (F4) and (F5). Returns
+/// proofs/lib/vqc.py: (F0), the glue condition, (Fc), (F4), (F5) and (F7). Returns
 /// false, with no flags, if the discrete closed-ball property fails, which Lemma
 /// "mergeindependent" excludes for a committed set of cluster merges; with `blameTopology`, for
 /// a batch of segment merges, which can break it, flags every cluster a violation names, of any
@@ -3532,6 +3735,25 @@ inline bool FlaggedClusters(const SurfaceMesh& mesh,
     }
     OrFlags(flags, other);
   }
+  if (parameters.CertifiedThickening)
+  {
+    other.AllocateAndFill(k, 0);
+    const viskores::cont::ArrayHandle<viskores::Id> glue = OutputGlue(parameters, clusters);
+    ThickeningFlags(mesh,
+                    *parameters.CertifiedThickening,
+                    clusters.Labels,
+                    clusters.Generators,
+                    clusters.Sizes,
+                    other,
+                    glue,
+                    items ? &items->Round : nullptr);
+    if (items)
+    {
+      items->HasThickeningRound = true;
+      items->Glue = GlueOrIdentity(glue, k);
+    }
+    OrFlags(flags, other);
+  }
   return true;
 }
 
@@ -3635,6 +3857,127 @@ struct InputRegion : viskores::worklet::WorkletMapField
   Real Epsilon;
 };
 
+/// 1 for a probe that fails (K2): a crossing is not generic, or their number is even.
+struct ProbeFails : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn crossings, FieldIn nongeneric, FieldOut fails);
+  using ExecutionSignature = _3(_1, _2);
+
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::Id crossings, viskores::Id nongeneric) const
+  {
+    return (nongeneric == 0 && crossings % 2 == 1) ? 0 : 1;
+  }
+};
+
+/// Marks every failing probe that fails a 3-label input triangle with a changed cluster of at
+/// least two vertices: the probe meets its output triangle, or has the label of a vertex of the
+/// probe's triangle, read through `glue` (`probe_fails` of `ThickVQC.iso_pass` of
+/// proofs/lib/thick.py).
+struct ProbeFlagsChanged : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                WholeArrayIn inputTriangles,
+                                WholeArrayIn labels,
+                                WholeArrayIn glue,
+                                WholeArrayIn generators,
+                                WholeArrayIn sizes,
+                                WholeArrayIn changed,
+                                WholeArrayIn fails,
+                                ExecObject thickening,
+                                AtomicArrayInOut flagsChanged);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10);
+
+  template <typename Id3Portal,
+            typename IdPortal,
+            typename VecPortal,
+            typename FlagPortal,
+            typename Thick,
+            typename AtomicPortal>
+  VISKORES_EXEC void operator()(const viskores::Id3& triangle,
+                                const Id3Portal& inputTriangles,
+                                const IdPortal& labels,
+                                const IdPortal& glue,
+                                const VecPortal& generators,
+                                const IdPortal& sizes,
+                                const FlagPortal& changed,
+                                const FlagPortal& fails,
+                                const Thick& thickening,
+                                const AtomicPortal& flagsChanged) const
+  {
+    const viskores::Id l[3] = { labels.Get(triangle[0]),
+                                labels.Get(triangle[1]),
+                                labels.Get(triangle[2]) };
+    if (!AllDistinct(l[0], l[1], l[2]))
+    {
+      return;
+    }
+    bool touches = false;
+    for (int a = 0; a < 3; ++a)
+    {
+      touches = touches || (sizes.Get(l[a]) > 1 && changed.Get(l[a]));
+    }
+    if (!touches)
+    {
+      return;
+    }
+    const Vec3 p[3] = { generators.Get(l[0]), generators.Get(l[1]), generators.Get(l[2]) };
+    bool fits = true;
+    for (viskores::Id i = 0; i < fails.GetNumberOfValues(); ++i)
+    {
+      if (!fails.Get(i) || flagsChanged.Get(i) != 0)
+      {
+        continue;
+      }
+      const viskores::Id3 f = inputTriangles.Get(thickening.ProbeTriangles.Get(i));
+      bool marked = false;
+      for (int a = 0; a < 3 && !marked; ++a)
+      {
+        const viskores::Id pl = glue.Get(labels.Get(f[a]));
+        marked = pl == glue.Get(l[0]) || pl == glue.Get(l[1]) || pl == glue.Get(l[2]);
+      }
+      marked = marked || thickening.ProbeHit(i, p, fits).Hit;
+      if (marked)
+      {
+        flagsChanged.Set(i, 1);
+      }
+    }
+    if (!fits)
+    {
+      this->RaiseError("QuadricClusteringDecimation: exact evaluation out of range.");
+    }
+  }
+};
+
+/// The region a failing probe that flags no changed cluster reads: the box of its segment.
+struct ProbeRegion : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn probe,
+                                FieldIn fails,
+                                FieldIn flagsChanged,
+                                ExecObject thickening,
+                                FieldOut keep,
+                                FieldOut lower,
+                                FieldOut upper);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7);
+
+  template <typename Thick>
+  VISKORES_EXEC void operator()(viskores::Id i,
+                                viskores::UInt8 fails,
+                                viskores::UInt32 flagsChanged,
+                                const Thick& thickening,
+                                viskores::UInt8& keep,
+                                Vec3& lower,
+                                Vec3& upper) const
+  {
+    keep = (fails && flagsChanged == 0) ? 1 : 0;
+    lower = upper = Vec3(0);
+    if (keep)
+    {
+      thickening.ProbeBox(i, lower, upper);
+    }
+  }
+};
+
 /// Marks the labels of every output triangle whose box meets a region.
 struct MarkRegionHits : viskores::worklet::WorkletMapField
 {
@@ -3724,7 +4067,8 @@ struct NonzeroMark : viskores::worklet::WorkletMapField
 /// of one of its vertices has a box that meets a region read by a failing item that flags no
 /// changed cluster. Such an item passed on `base`, and reads only output within its region: the
 /// regions of the input triangles failing (F5) from the input side, their boxes grown by
-/// `epsilon`.
+/// `epsilon`, and the boxes of the failing probes of (F7). A new triangle that meets a probe is at
+/// a changed cluster, which the probe then flags, so the triangles of `batch` are not read.
 inline viskores::cont::ArrayHandle<viskores::UInt8> RegionFlags(
   const SurfaceMesh& mesh,
   const MergeParameters& parameters,
@@ -3754,6 +4098,46 @@ inline viskores::cont::ArrayHandle<viskores::UInt8> RegionFlags(
            hi);
     Algorithm::CopyIf(lo, keep, lower);
     Algorithm::CopyIf(hi, keep, upper);
+  }
+  const viskores::Id numProbes = items.Round.ProbeCrossings.GetNumberOfValues();
+  if (items.HasThickeningRound && numProbes > 0)
+  {
+    const ThickeningObject thickening(*parameters.CertifiedThickening);
+    viskores::cont::ArrayHandle<viskores::UInt8> fails;
+    invoke(detail::ProbeFails{}, items.Round.ProbeCrossings, items.Round.ProbeNongeneric, fails);
+    if (Algorithm::Reduce(fails, viskores::Id(0)) > 0)
+    {
+      viskores::cont::ArrayHandle<viskores::UInt32> flagsChanged;
+      flagsChanged.AllocateAndFill(numProbes, 0);
+      invoke(detail::ProbeFlagsChanged{},
+             mesh.Triangles,
+             mesh.Triangles,
+             batch.Labels,
+             items.Glue,
+             batch.Generators,
+             batch.Sizes,
+             changed,
+             fails,
+             thickening,
+             flagsChanged);
+      viskores::cont::ArrayHandle<viskores::UInt8> keep;
+      viskores::cont::ArrayHandle<Vec3> lo, hi, probeLower, probeUpper;
+      invoke(detail::ProbeRegion{},
+             viskores::cont::ArrayHandleIndex(numProbes),
+             fails,
+             flagsChanged,
+             thickening,
+             keep,
+             lo,
+             hi);
+      Algorithm::CopyIf(lo, keep, probeLower);
+      Algorithm::CopyIf(hi, keep, probeUpper);
+      viskores::cont::ArrayHandle<Vec3> allLower, allUpper;
+      Algorithm::Copy(viskores::cont::make_ArrayHandleConcatenate(lower, probeLower), allLower);
+      Algorithm::Copy(viskores::cont::make_ArrayHandleConcatenate(upper, probeUpper), allUpper);
+      lower = allLower;
+      upper = allUpper;
+    }
   }
   if (lower.GetNumberOfValues() == 0)
   {
@@ -4007,6 +4391,18 @@ void MergePhase(const SurfaceMesh& mesh,
     context.Epsilon = parameters.ErrorBound;
     context.Embedding = parameters.Embedding && parameters.Topological;
     context.Glue = OutputGlue(parameters, clusters);
+    // (F7) reads the whole labelling: the components of the glued output and the crossings of
+    // the probes.
+    ThickeningRound thickeningRound;
+    if (parameters.CertifiedThickening)
+    {
+      thickeningRound = PrepareThickeningRound(*parameters.CertifiedThickening,
+                                               clusters.Generators,
+                                               GlueTriangles(complex.Triangles, context.Glue),
+                                               k);
+      context.CertifiedThickening = parameters.CertifiedThickening;
+      context.RoundThickening = &thickeningRound;
+    }
     context.Sides = parameters.Sides;
     context.GeometricOnly = !parameters.Topological;
     if (parameters.FaceMerges && frozenLabels.GetNumberOfValues() > 0)
@@ -4042,7 +4438,8 @@ void MergePhase(const SurfaceMesh& mesh,
 
     viskores::cont::ArrayHandle<viskores::UInt8> memo;
     memo.AllocateAndFill(numCandidates, geometric ? detail::Unknown : detail::Admissible);
-    if (geometric)
+    // A verdict of (F7) depends on the whole labelling, so none is reused.
+    if (geometric && !parameters.CertifiedThickening)
     {
       diagnostics.Reused += verdicts.Reuse(context, clusters, pairs, memo);
     }
@@ -4182,7 +4579,7 @@ void MergePhase(const SurfaceMesh& mesh,
         setEnvelopeBase(envelopeBases.Rejected, merged, mergedVerdicts);
       }
       // The set fired a flag. A cluster that no merge made keeps its members and generator, so
-      // the flags fire at a merged cluster, unless (F5) from the input side
+      // the flags fire at a merged cluster, unless (F5) from the input side or a probe of (F7)
       // flags an unmerged one: defer the merges whose merged cluster is flagged, and with the
       // region blame those whose changed triangles meet the region such an item reads, and
       // choose again without them.

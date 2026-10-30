@@ -22,6 +22,7 @@
 #include <viskores/worklet/ScatterCounting.h>
 #include <viskores/worklet/WorkletMapField.h>
 
+#include <limits>
 
 VISKORES_QUADRIC_CLUSTERING_STRICT_FP_BEGIN
 
@@ -194,6 +195,15 @@ struct ComponentMax
     return Vec3(viskores::Max(a[0], b[0]), viskores::Max(a[1], b[1]), viskores::Max(a[2], b[2]));
   }
 };
+
+/// The largest side of the bounding box of `points`.
+inline Real LargestSide(const viskores::cont::ArrayHandle<Vec3>& points)
+{
+  const Vec3 infinity(std::numeric_limits<Real>::infinity());
+  const Vec3 lo = viskores::cont::Algorithm::Reduce(points, infinity, ComponentMin{});
+  const Vec3 hi = viskores::cont::Algorithm::Reduce(points, Vec3(-infinity[0]), ComponentMax{});
+  return viskores::Max(viskores::Max(hi[0] - lo[0], hi[1] - lo[1]), hi[2] - lo[2]);
+}
 
 /// The largest absolute coordinate of a point.
 struct PointMaxAbs : viskores::worklet::WorkletMapField
