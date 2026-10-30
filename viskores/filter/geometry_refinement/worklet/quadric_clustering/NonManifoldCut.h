@@ -28,7 +28,7 @@ namespace quadric_clustering
 /// A triangle complex cut into surfaces (Theorem "Inputs that are not surfaces" of the paper,
 /// after Gueziec et al., "Cutting and stitching"): every vertex is split into one copy per fan of
 /// triangles connected across edges not in the cut set `X`: the singular edges (in three or more
-/// triangles), and with `seams` a seam that makes every piece orientable.
+/// triangles), the edges `extra`, and with `seams` a seam that makes every piece orientable.
 struct CutComplex
 {
   /// The triangles on the copies, reoriented with `seams` so that every piece is consistently
@@ -81,22 +81,26 @@ struct FirstOfEdge : viskores::worklet::WorkletMapField
   }
 };
 
-/// For every edge: its triangles when it has exactly two, whether it is in `X` (singular), and
-/// whether the orientation crosses it.
+/// For every edge: its triangles when it has exactly two, whether it is in `X` (singular, or in
+/// `extra`), and whether the orientation crosses it.
 struct EdgeIncidence : viskores::worklet::WorkletMapField
 {
-  using ControlSignature = void(FieldIn start,
+  using ControlSignature = void(FieldIn edge,
+                                FieldIn start,
                                 WholeArrayIn starts,
                                 WholeArrayIn records,
+                                WholeArrayIn extra,
                                 FieldOut triangles,
                                 FieldOut inX,
                                 FieldOut usable);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, WorkIndex);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, WorkIndex);
 
-  template <typename IdPortal, typename RecordPortal>
-  VISKORES_EXEC void operator()(viskores::Id start,
+  template <typename IdPortal, typename RecordPortal, typename EdgePortal>
+  VISKORES_EXEC void operator()(const viskores::Id2& edge,
+                                viskores::Id start,
                                 const IdPortal& starts,
                                 const RecordPortal& records,
+                                const EdgePortal& extra,
                                 viskores::Id2& triangles,
                                 viskores::UInt8& inX,
                                 viskores::UInt8& usable,
@@ -107,7 +111,7 @@ struct EdgeIncidence : viskores::worklet::WorkletMapField
     const viskores::Id count = end - start;
     triangles = (count == 2) ? viskores::Id2(records.Get(start)[2], records.Get(start + 1)[2])
                              : viskores::Id2(-1);
-    inX = (count >= 3) ? 1 : 0;
+    inX = (count >= 3 || ContainsSorted(extra, edge)) ? 1 : 0;
     usable = (count == 2 && !inX) ? 1 : 0;
   }
 };
@@ -423,11 +427,14 @@ struct IsFrozenCopy : viskores::worklet::WorkletMapField
 /// from the smallest triangle of every component, across edges in exactly two triangles that
 /// are not in `X`, and an edge whose two triangles cannot be made to agree joins the seam. The
 /// search runs a level at a time, and a triangle takes its sign from the first triangle of the
-/// level, in queue order, that reaches it, as a queue would. Copies are numbered by vertex, then
-/// by the smallest triangle of their fan. Without `seams`, only the singular edges are cut and
+/// level, in queue order, that reaches it, as a queue would. The edges `extra`, such as creases,
+/// are cut as the singular edges are. Copies are numbered by vertex, then by the smallest
+/// triangle of their fan. Without `seams`, only the singular edges and `extra` are cut and
 /// nothing is reoriented, so a piece may not be orientable (Corollary "Cuts that are not orientable").
 inline CutComplex CutAlongSingularEdges(const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
                                         viskores::Id numVertices,
+                                        const viskores::cont::ArrayHandle<viskores::Id2>& extra =
+                                          viskores::cont::ArrayHandle<viskores::Id2>{},
                                         bool seams = true)
 {
   using Algorithm = viskores::cont::Algorithm;
@@ -446,9 +453,13 @@ inline CutComplex CutAlongSingularEdges(const viskores::cont::ArrayHandle<viskor
   Algorithm::CopyIf(recordEdges, first, edges);
   viskores::cont::ArrayHandle<viskores::Id> starts;
   Algorithm::CopyIf(viskores::cont::ArrayHandleIndex(3 * m), first, starts);
+  viskores::cont::ArrayHandle<viskores::Id2> extraSorted;
+  Algorithm::Copy(extra, extraSorted);
+  Algorithm::Sort(extraSorted);
   viskores::cont::ArrayHandle<viskores::Id2> edgeTriangles;
   viskores::cont::ArrayHandle<viskores::UInt8> inX, usable;
-  invoke(cd::EdgeIncidence{}, starts, starts, records, edgeTriangles, inX, usable);
+  invoke(
+    cd::EdgeIncidence{}, edges, starts, starts, records, extraSorted, edgeTriangles, inX, usable);
   viskores::cont::ArrayHandle<viskores::UInt8> finalInX;
   viskores::cont::ArrayHandle<viskores::Id3> oriented;
   if (!seams)

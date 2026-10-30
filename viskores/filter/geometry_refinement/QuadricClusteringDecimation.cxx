@@ -88,14 +88,19 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
     reject("the target number of points must not be negative.");
   }
   const viskores::UInt32 guarantees = this->Guarantees;
-  const viskores::UInt32 all = Topology | TwoSidedError | NoSelfIntersections | SingularCurves;
+  const viskores::UInt32 all =
+    Topology | TwoSidedError | NoSelfIntersections | SingularCurves | Creases;
   if ((guarantees & ~all) != 0)
   {
     reject("unknown guarantee bits.");
   }
-  if (!(guarantees & Topology) && (guarantees & (NoSelfIntersections | SingularCurves)))
+  if (!(guarantees & Topology) && (guarantees & (NoSelfIntersections | SingularCurves | Creases)))
   {
-    reject("the NoSelfIntersections and SingularCurves guarantees require Topology.");
+    reject("the NoSelfIntersections, SingularCurves and Creases guarantees require Topology.");
+  }
+  if (guarantees & Creases)
+  {
+    reject("the Creases guarantee is not implemented yet.");
   }
   if (this->ErrorBound > 0 && !(guarantees & TwoSidedError))
   {

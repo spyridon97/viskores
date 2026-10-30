@@ -398,6 +398,10 @@ struct MovedPoint : viskores::worklet::WorkletMapField
                                 const IdPortal& copyOffsets,
                                 const Region& region) const
   {
+    if (moved < 0)
+    {
+      return Vec3(0);
+    }
     const viskores::Id label = region.Labels.Get(copyOffsets.Get(arcVertices.Get(moved)));
     return region.Generator(c, region.NewLabel(c, label));
   }

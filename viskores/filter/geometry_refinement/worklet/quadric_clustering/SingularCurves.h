@@ -33,6 +33,84 @@ namespace worklet
 namespace quadric_clustering
 {
 
+namespace curves_detail
+{
+
+/// Whether an edge in exactly two triangles has unit normals with a dot product, times the sign
+/// of the edge, below `CosAngle`.
+struct IsCrease : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn edgeTriangles,
+                                FieldIn count,
+                                FieldIn sign,
+                                WholeArrayIn triangles,
+                                WholeArrayIn points,
+                                FieldOut crease);
+  using ExecutionSignature = _6(_1, _2, _3, _4, _5);
+
+  VISKORES_CONT explicit IsCrease(Real cosAngle)
+    : CosAngle(cosAngle)
+  {
+  }
+
+  template <typename TrianglePortal, typename PointPortal>
+  VISKORES_EXEC Vec3 Normal(viskores::Id t,
+                            const TrianglePortal& triangles,
+                            const PointPortal& points) const
+  {
+    const viskores::Id3 tri = triangles.Get(t);
+    const Vec3 a = points.Get(tri[0]);
+    const Vec3 x = Cross(Sub(points.Get(tri[1]), a), Sub(points.Get(tri[2]), a));
+    const Real twice = 2 * (Norm(x) / 2);
+    return Vec3(x[0] / twice, x[1] / twice, x[2] / twice);
+  }
+
+  template <typename TrianglePortal, typename PointPortal>
+  VISKORES_EXEC viskores::UInt8 operator()(const viskores::Id2& edgeTriangles,
+                                           viskores::IdComponent count,
+                                           viskores::Int8 sign,
+                                           const TrianglePortal& triangles,
+                                           const PointPortal& points) const
+  {
+    if (count != 2)
+    {
+      return 0;
+    }
+    return (Real(sign) *
+              Dot(this->Normal(edgeTriangles[0], triangles, points),
+                  this->Normal(edgeTriangles[1], triangles, points)) <
+            this->CosAngle)
+      ? 1
+      : 0;
+  }
+
+  Real CosAngle;
+};
+
+} // namespace curves_detail
+
+/// The creases of a mesh: its edges in exactly two triangles whose unit normals have a dot
+/// product, times the sign of the edge, below `cosAngle`, as sorted vertex pairs in increasing order. The normals are
+/// `x / (2 a)` with `x` the cross product of the edges at the first corner and `a = |x| / 2`, as
+/// `Mesh.nf` of proofs/lib/vqc.py, so the test is exact against the reference.
+inline viskores::cont::ArrayHandle<viskores::Id2> CreaseEdges(const SurfaceMesh& mesh,
+                                                              Real cosAngle)
+{
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::UInt8> isCrease;
+  invoke(curves_detail::IsCrease(cosAngle),
+         mesh.EdgeTriangles,
+         mesh.EdgeTriangleCounts,
+         mesh.EdgeSigns,
+         mesh.Triangles,
+         mesh.Points,
+         isCrease);
+  viskores::cont::ArrayHandle<viskores::Id2> creases;
+  viskores::cont::Algorithm::CopyIf(mesh.Edges, isCrease, creases);
+  viskores::cont::Algorithm::Sort(creases);
+  return creases;
+}
+
 /// The singular curves of an input cut into surfaces (Proposition "Decimating the singular
 /// curves"), on the device. A frozen input vertex is regular if it lies on exactly two edges of
 /// the cut `X` and every copy of it lies on one copy of each; the others are junctions. An arc
@@ -40,7 +118,7 @@ namespace quadric_clustering
 /// or a cycle of regular vertices. The interior vertices of every arc are grouped into segments,
 /// runs of consecutive vertices, initially one per vertex; in every sheet the copies of a
 /// segment form one cluster, a piece, and the pieces of a segment are one vertex of the glued
-/// output.
+/// output. With junction merges, the end segments of an open arc may join its junctions.
 struct SingularCurves
 {
   viskores::Id NumberOfArcs = 0;
@@ -56,8 +134,10 @@ struct SingularCurves
   /// Per arc: the position of the head of its first segment. A closed arc whose last segment
   /// absorbed its first starts later.
   viskores::cont::ArrayHandle<viskores::Id> FirstHead;
-  /// Per input vertex: the first vertex of its segment, its junction for a junction, or -1 for a
-  /// vertex that is not frozen.
+  /// Per arc: how many of its vertices joined the junction at each end.
+  viskores::cont::ArrayHandle<viskores::Id2> Absorbed;
+  /// Per input vertex: the first vertex of its segment, its junction for a junction or a vertex
+  /// that joined one, or -1 for a vertex that is not frozen.
   viskores::cont::ArrayHandle<viskores::Id> Segment;
   /// Per input vertex: whether it is a regular arc vertex.
   viskores::cont::ArrayHandle<viskores::UInt8> Regular;
@@ -579,6 +659,7 @@ inline SingularCurves FindSingularCurves(const viskores::cont::ArrayHandle<visko
   curves.SegmentHead.AllocateAndFill(total, 1);
   Algorithm::Copy(viskores::cont::make_ArrayHandleView(curves.ArcOffsets, 0, curves.NumberOfArcs),
                   curves.FirstHead);
+  curves.Absorbed.AllocateAndFill(curves.NumberOfArcs, viskores::Id2(0, 0));
   return curves;
 }
 
@@ -609,7 +690,8 @@ inline viskores::Id NumberOfJunctions(const SingularCurves& curves)
 }
 
 /// The smallest frozen member of every label, or -1 for a label without one, as
-/// `frozen_first` of proofs/lib/arcs.py.
+/// `frozen_first` of proofs/lib/arcs.py. A cluster of a sheet merged into a piece or a junction
+/// copy keeps the frozen label, and its anchor may then not be frozen.
 inline viskores::cont::ArrayHandle<viskores::Id> FrozenFirst(
   const viskores::cont::ArrayHandle<viskores::UInt8>& frozenVertices,
   const Clustering& clustering)
@@ -626,6 +708,95 @@ inline viskores::cont::ArrayHandle<viskores::Id> FrozenFirst(
   first.AllocateAndFill(clustering.NumberOfClusters, -1);
   invoke(ScatterValue{}, uniqueLabels, smallest, first);
   return first;
+}
+
+namespace curves_detail
+{
+
+/// A piece holding sheet vertices, placed from its frozen members alone: its generator and
+/// quadric replace those of `Place`. Every other label keeps them.
+struct ScatterPiece : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn label,
+                                FieldIn generator,
+                                FieldIn q,
+                                FieldIn frozenSize,
+                                WholeArrayIn sizes,
+                                WholeArrayInOut generators,
+                                WholeArrayInOut quadrics);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7);
+
+  template <typename IdPortal, typename VecPortal, typename MatPortal>
+  VISKORES_EXEC void operator()(viskores::Id label,
+                                const Vec3& generator,
+                                const Mat3& q,
+                                viskores::Id frozenSize,
+                                const IdPortal& sizes,
+                                VecPortal& generators,
+                                MatPortal& quadrics) const
+  {
+    if (sizes.Get(label) > frozenSize)
+    {
+      generators.Set(label, generator);
+      quadrics.Set(label, q);
+    }
+  }
+};
+
+} // namespace curves_detail
+
+/// The generators and quadrics of the labels with every piece placed as if no sheet vertex had
+/// joined it (`piece_place="frozen"` of proofs/lib/arcs.py): a label holding frozen and other
+/// vertices gets those of `Place` over its frozen members alone, every other label keeps
+/// `generators` and `quadrics`, those of `Place`.
+inline void FrozenPiecePlacement(const SurfaceMesh& mesh,
+                                 const viskores::cont::ArrayHandle<Mat3>& vertexMatrices,
+                                 const viskores::cont::ArrayHandle<viskores::UInt8>& frozenVertices,
+                                 const viskores::cont::ArrayHandle<viskores::Id>& labels,
+                                 const viskores::cont::ArrayHandle<viskores::Id>& sizes,
+                                 const viskores::cont::ArrayHandle<Vec3>& generators,
+                                 const viskores::cont::ArrayHandle<Mat3>& quadrics,
+                                 viskores::cont::ArrayHandle<Vec3>& pieceGenerators,
+                                 viskores::cont::ArrayHandle<Mat3>& pieceQuadrics)
+{
+  using Algorithm = viskores::cont::Algorithm;
+  viskores::cont::Invoker invoke;
+  Algorithm::Copy(generators, pieceGenerators);
+  Algorithm::Copy(quadrics, pieceQuadrics);
+  viskores::cont::ArrayHandle<viskores::Id> frozenVertexIds, frozenLabels;
+  Algorithm::CopyIf(viskores::cont::ArrayHandleIndex(frozenVertices.GetNumberOfValues()),
+                    frozenVertices,
+                    frozenVertexIds);
+  if (frozenVertexIds.GetNumberOfValues() == 0)
+  {
+    return;
+  }
+  invoke(GatherValue{}, frozenVertexIds, labels, frozenLabels);
+  viskores::worklet::Keys<viskores::Id> pieces;
+  pieces.BuildArrays(frozenLabels, viskores::worklet::KeysSortType::Stable);
+  viskores::cont::ArrayHandle<viskores::Id> anchors, frozenSizes;
+  viskores::cont::ArrayHandle<Mat3> q;
+  viskores::cont::ArrayHandle<Vec3> b, generator;
+  viskores::cont::ArrayHandle<Real> s;
+  invoke(detail::Place{},
+         pieces,
+         frozenVertexIds,
+         mesh.Points,
+         vertexMatrices,
+         anchors,
+         q,
+         b,
+         s,
+         generator,
+         frozenSizes);
+  invoke(curves_detail::ScatterPiece{},
+         pieces.GetUniqueKeys(),
+         generator,
+         q,
+         frozenSizes,
+         sizes,
+         pieceGenerators,
+         pieceQuadrics);
 }
 
 /// The first copy of every input vertex, for an input cut into surfaces whose copies are sorted
@@ -652,10 +823,11 @@ enum : viskores::IdComponent
   AtMinimiser = 3
 };
 
-/// For a glue group, its labels in increasing order, as `place` of proofs/lib/arcs.py:
+/// For a glue group, its labels in increasing order, as `place` of proofs/lib/arcs.py with the
+/// pieces placed as if no sheet vertex had joined them (`pieceGenerators`, `pieceQuadrics`):
 /// `KeepGenerators` keeps the generator of a label with no frozen member, `AtJunction` places a
 /// junction at itself, `AtMinimiser` places the group at the minimiser of the sum of the costs of
-/// its labels, `generators` for a single label.
+/// its labels, `pieceGenerators` for a single label.
 struct GroupPlacement : viskores::worklet::WorkletReduceByKey
 {
   using ControlSignature = void(KeysIn group,
@@ -666,8 +838,8 @@ struct GroupPlacement : viskores::worklet::WorkletReduceByKey
                                 WholeArrayIn regular,
                                 WholeArrayIn copyOffsets,
                                 WholeArrayIn points,
-                                WholeArrayIn quadrics,
-                                WholeArrayIn generators,
+                                WholeArrayIn pieceQuadrics,
+                                WholeArrayIn pieceGenerators,
                                 ReducedValuesOut kind,
                                 ReducedValuesOut generator);
   using ExecutionSignature = void(_2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12);
@@ -684,15 +856,15 @@ struct GroupPlacement : viskores::worklet::WorkletReduceByKey
                                 const FlagPortal& regular,
                                 const IdPortal& copyOffsets,
                                 const VecPortal& points,
-                                const MatPortal& quadrics,
-                                const VecPortal& generators,
+                                const MatPortal& pieceQuadrics,
+                                const VecPortal& pieceGenerators,
                                 viskores::IdComponent& kind,
                                 Vec3& generator) const
   {
     const viskores::IdComponent count = labels.GetNumberOfComponents();
     const viskores::Id first = frozenFirst.Get(labels[0]);
     kind = KeepGenerators;
-    generator = generators.Get(labels[0]);
+    generator = pieceGenerators.Get(labels[0]);
     if (first < 0)
     {
       return;
@@ -710,13 +882,13 @@ struct GroupPlacement : viskores::worklet::WorkletReduceByKey
     {
       return;
     }
-    const Vec3 o = generators.Get(labels[0]);
+    const Vec3 o = pieceGenerators.Get(labels[0]);
     TreeSum<Mat3> qs;
     TreeSum<Vec3> bs;
     for (viskores::IdComponent i = 0; i < count; ++i)
     {
-      qs.Push(quadrics.Get(labels[i]));
-      bs.Push(MatVec(quadrics.Get(labels[i]), Sub(generators.Get(labels[i]), o)));
+      qs.Push(pieceQuadrics.Get(labels[i]));
+      bs.Push(MatVec(pieceQuadrics.Get(labels[i]), Sub(pieceGenerators.Get(labels[i]), o)));
     }
     generator = Add(o, SolveSPD(qs.Result(), bs.Result()));
   }
@@ -751,11 +923,14 @@ struct GroupGenerator : viskores::worklet::WorkletMapField
 
 /// The generators of the vertices of `K` on the curves, as `place` of proofs/lib/arcs.py
 /// (Proposition "Decimating the singular curves", (e)). The labels that `glue` joins share one
-/// generator: at the input position of the junction, for the copies of a junction; and otherwise
-/// the minimiser of the sum of their costs, `c = o + (sum Q_l)^-1 sum Q_l (c_l - o)` with `o` the
-/// generator of the smallest label, summed in increasing label order. The copies of one vertex,
-/// at its position, stay there.
+/// generator: at the input position of the junction, for the copies of a junction and the
+/// segments merged into it; and otherwise the minimiser of the sum of their costs,
+/// `c = o + (sum Q_l)^-1 sum Q_l (c_l - o)` with `o` the generator of the smallest label, summed
+/// in increasing label order, with every piece placed as if no sheet vertex had joined it
+/// (`FrozenPiecePlacement`), so that a sheet vertex joining a piece moves no generator. The
+/// copies of one vertex, at its position, stay there.
 inline void PlaceCurveGenerators(const SurfaceMesh& mesh,
+                                 const viskores::cont::ArrayHandle<Mat3>& vertexMatrices,
                                  const SingularCurves& curves,
                                  const viskores::cont::ArrayHandle<viskores::UInt8>& frozenVertices,
                                  const viskores::cont::ArrayHandle<viskores::Id>& original,
@@ -768,6 +943,17 @@ inline void PlaceCurveGenerators(const SurfaceMesh& mesh,
   const viskores::Id numInput = curves.Segment.GetNumberOfValues();
   const viskores::cont::ArrayHandle<viskores::Id> frozenFirst =
     FrozenFirst(frozenVertices, clustering);
+  viskores::cont::ArrayHandle<Vec3> pieceGenerators;
+  viskores::cont::ArrayHandle<Mat3> pieceQuadrics;
+  FrozenPiecePlacement(mesh,
+                       vertexMatrices,
+                       frozenVertices,
+                       clustering.Labels,
+                       clustering.Sizes,
+                       clustering.Generators,
+                       clustering.Q,
+                       pieceGenerators,
+                       pieceQuadrics);
   const auto copyOffsets = FirstCopies(original, numInput);
 
   // Per group, in increasing label order.
@@ -784,8 +970,8 @@ inline void PlaceCurveGenerators(const SurfaceMesh& mesh,
          curves.Regular,
          copyOffsets,
          mesh.Points,
-         clustering.Q,
-         clustering.Generators,
+         pieceQuadrics,
+         pieceGenerators,
          kinds,
          groupGenerators);
   invoke(cd::GroupGenerator{},

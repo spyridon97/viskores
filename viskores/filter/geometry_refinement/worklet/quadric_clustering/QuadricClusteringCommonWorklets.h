@@ -38,6 +38,18 @@ VISKORES_EXEC_CONT inline viskores::Id2 SortedEdge(viskores::Id a, viskores::Id 
   return viskores::Id2(viskores::Min(a, b), viskores::Max(a, b));
 }
 
+/// An edge as `SortedEdge`.
+struct SortedEdgeOf : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn edge, FieldOut sorted);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_EXEC viskores::Id2 operator()(const viskores::Id2& e) const
+  {
+    return SortedEdge(e[0], e[1]);
+  }
+};
+
 namespace detail
 {
 

@@ -340,7 +340,7 @@ public:
     /// cluster (the default).
     quadric_clustering::MergeBlame MergeBlame = quadric_clustering::MergeBlame::Region;
     /// For an input that is not a consistently oriented surface: cut a seam too, so that every
-    /// piece is orientable. Otherwise only the singular edges are cut and
+    /// piece is orientable. Otherwise only the singular edges (and the creases) are cut and
     /// nothing is reoriented, so a piece may not be orientable (Corollary "nonorientable"); a
     /// surface that is not orientable, such as a Moebius band, takes the cut with no edge cut
     /// and no frozen copy.
@@ -349,10 +349,24 @@ public:
     /// segments of them in the merge phase (Proposition "Decimating the singular curves");
     /// otherwise they keep their input resolution (Theorem "Inputs that are not surfaces").
     bool DecimateSingularCurves = true;
+    /// Experimental: cut the creases too, the edges in two triangles whose normals are farther
+    /// apart than the feature angle, so that every crease curve
+    /// comes out as a path of output edges through its ends, decimated as the singular curves
+    /// are. Error mode only.
+    bool Creases = false;
+    /// With `Creases`: the cut set `X`, as pairs of input vertices, in place of the creases
+    /// found by the feature angle; empty for those.
+    viskores::cont::ArrayHandle<viskores::Id2> CutEdges;
     /// With the curves decimated: the tolerance `eps_c` of the curve test (Fc) of Proposition
     /// "curvetol", a length, or 0 for none. Every output curve then stays within `eps_c` of its
     /// input curve, and every input curve within `eps_c` of its output curve.
     Real CurveTolerance = 0;
+    /// Experimental, with the curves decimated: the end segment of an open curve may merge into
+    /// the junction at that end.
+    bool JunctionMerges = false;
+    /// Experimental, with the curves decimated: a cluster of a sheet may merge into an adjacent
+    /// piece of a segment or copy of a junction.
+    bool FaceMerges = false;
   };
 
   /// The points of the run at which an observer is called.
@@ -407,7 +421,8 @@ public:
     /// Clusters found adjacent to two copies of a frozen vertex of a cut input, over the loop;
     /// they are flagged with (F2) and (F3).
     viskores::Id GlueViolations = 0;
-    /// With the curves decimated, the arcs and the junctions.
+    /// With creases: the crease edges; with the curves decimated, the arcs and the junctions.
+    viskores::Id CreaseEdges = 0;
     viskores::Id Arcs = 0;
     viskores::Id Junctions = 0;
     /// Output triangles given to (F4), and pieces examined by the envelope tests, over the run:
@@ -501,20 +516,41 @@ public:
                                           "checks both sides of the error bound.");
     }
     const qc::EnvelopeSides sides = this->Params.ErrorSides;
-    // Without seams, a surface that is not consistently oriented is cut too, along nothing, as
-    // the reference cuts it.
+    // The creases, cut as the singular edges are: the given cut set, or the sharp edges of the
+    // feature angle.
+    viskores::cont::ArrayHandle<viskores::Id2> creases;
+    if (this->Params.Creases && !geometric)
+    {
+      if (this->Params.CutEdges.GetNumberOfValues() > 0)
+      {
+        viskores::cont::Invoker invoke;
+        invoke(qc::SortedEdgeOf{}, this->Params.CutEdges, creases);
+        Algorithm::Sort(creases);
+        Algorithm::Unique(creases);
+      }
+      else
+      {
+        const qc::QuadricParameters& q = this->Params.Quadric;
+        const Real cosAngle = qc::FeatureAngleCosine(q.FeatureAngle);
+        creases = qc::CreaseEdges(this->Mesh, cosAngle);
+      }
+      this->Diag.CreaseEdges = creases.GetNumberOfValues();
+    }
+    // Without seams, a surface that is not consistently oriented is cut too, along nothing but
+    // its creases, as the reference cuts it.
     const bool unoriented = !this->Params.Seams && this->Mesh.Unoriented;
-    if (!geometric && (!problem.empty() || unoriented))
+    if (!geometric && (!problem.empty() || creases.GetNumberOfValues() > 0 || unoriented))
     {
       if (budget > 0)
       {
         throw viskores::cont::ErrorBadValue(
           "QuadricClusteringDecimation: budget mode needs a surface without cut, and the input " +
           (!problem.empty() ? "is not one: " + problem
-                            : std::string("is not consistently oriented")) +
+             : unoriented   ? std::string("is not consistently oriented")
+                            : std::string("has creases")) +
           ".");
       }
-      this->CutInput(points, triangles);
+      this->CutInput(points, triangles, creases);
       if (this->HasCurves)
       {
         this->Diag.Arcs = this->Curves.NumberOfArcs;
@@ -619,6 +655,7 @@ public:
       if (this->HasCurves)
       {
         qc::PlaceCurveGenerators(mesh,
+                                 this->Quadrics.M,
                                  this->Curves,
                                  this->FrozenCopies,
                                  this->CopyOriginals,
@@ -820,6 +857,8 @@ public:
       merge.Order = this->Params.MergeOrder;
       merge.DeferFlagged = this->Params.DeferFlaggedMerges;
       merge.Blame = this->Params.MergeBlame;
+      merge.FaceMerges = this->HasCurves && this->Params.FaceMerges;
+      merge.JunctionMerges = this->HasCurves && this->Params.JunctionMerges;
       merge.CurveTolerance = this->HasCurves ? this->Params.CurveTolerance : 0;
       auto merged =
         [&](const qc::Clustering&, const viskores::cont::ArrayHandle<viskores::Id2>& pairs)
@@ -957,12 +996,14 @@ private:
   /// Cuts the input along its singular edges and, with `Seams`, a seam into surfaces, and builds
   /// the mesh of the copies, with the frozen copies and the first copy of every input point.
   VISKORES_CONT void CutInput(const viskores::cont::ArrayHandle<Vec3>& points,
-                              const viskores::cont::ArrayHandle<viskores::Id3>& triangles)
+                              const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
+                              const viskores::cont::ArrayHandle<viskores::Id2>& creases)
   {
     namespace qc = quadric_clustering;
     using Algorithm = viskores::cont::Algorithm;
     const viskores::Id numPoints = points.GetNumberOfValues();
-    const qc::CutComplex cut = qc::CutAlongSingularEdges(triangles, numPoints, this->Params.Seams);
+    const qc::CutComplex cut =
+      qc::CutAlongSingularEdges(triangles, numPoints, creases, this->Params.Seams);
     // The copies of a vertex are numbered consecutively; the first is canonical.
     viskores::cont::ArrayHandle<Vec3> copyPoints;
     Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(cut.Original, points), copyPoints);

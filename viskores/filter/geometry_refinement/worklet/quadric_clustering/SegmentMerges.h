@@ -52,7 +52,7 @@ struct SegmentList
 namespace segment_detail
 {
 
-/// The head of a segment as `(arc, order, position)`, where
+/// The head of a segment, alive (not merged into a junction), as `(arc, order, position)`, where
 /// the order runs along an open arc and around a closed arc from its first head; `(-1, ...)`
 /// otherwise.
 struct HeadRecord : viskores::worklet::WorkletMapField
@@ -63,8 +63,9 @@ struct HeadRecord : viskores::worklet::WorkletMapField
                                 WholeArrayIn arcOffsets,
                                 WholeArrayIn arcEnds,
                                 WholeArrayIn firstHead,
+                                WholeArrayIn absorbed,
                                 FieldOut record);
-  using ExecutionSignature = _7(_1, _2, _3, _4, _5, _6);
+  using ExecutionSignature = _8(_1, _2, _3, _4, _5, _6, _7);
 
   template <typename IdPortal, typename PairPortal>
   VISKORES_EXEC viskores::Id3 operator()(viskores::Id p,
@@ -72,10 +73,12 @@ struct HeadRecord : viskores::worklet::WorkletMapField
                                          viskores::UInt8 isHead,
                                          const IdPortal& arcOffsets,
                                          const PairPortal& arcEnds,
-                                         const IdPortal& firstHead) const
+                                         const IdPortal& firstHead,
+                                         const PairPortal& absorbed) const
   {
     const viskores::Id start = arcOffsets.Get(a), end = arcOffsets.Get(a + 1);
-    if (!isHead)
+    const viskores::Id2 absorbedCounts = absorbed.Get(a);
+    if (!isHead || p < start + absorbedCounts[0] || p >= end - absorbedCounts[1])
     {
       return viskores::Id3(-1);
     }
@@ -99,7 +102,7 @@ struct HeadOfRecord : viskores::worklet::WorkletMapField
 };
 
 /// The extent of a segment: from its head to the next head, around a closed arc, or to the end
-/// of an open arc.
+/// of the alive part of an open arc.
 struct SegmentExtent : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn arc,
@@ -108,11 +111,12 @@ struct SegmentExtent : viskores::worklet::WorkletMapField
                                 WholeArrayIn segmentOffsets,
                                 WholeArrayIn arcOffsets,
                                 WholeArrayIn arcEnds,
+                                WholeArrayIn absorbed,
                                 WholeArrayIn arcVertices,
                                 FieldOut first,
                                 FieldOut last,
                                 FieldOut length);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, WorkIndex);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, WorkIndex);
 
   template <typename IdPortal, typename PairPortal>
   VISKORES_EXEC void operator()(viskores::Id a,
@@ -121,6 +125,7 @@ struct SegmentExtent : viskores::worklet::WorkletMapField
                                 const IdPortal& segmentOffsets,
                                 const IdPortal& arcOffsets,
                                 const PairPortal& arcEnds,
+                                const PairPortal& absorbed,
                                 const IdPortal& arcVertices,
                                 viskores::Id& first,
                                 viskores::Id& last,
@@ -141,7 +146,7 @@ struct SegmentExtent : viskores::worklet::WorkletMapField
     }
     else
     {
-      const viskores::Id next = (s < ls) ? heads.Get(s + 1) : end;
+      const viskores::Id next = (s < ls) ? heads.Get(s + 1) : end - absorbed.Get(a)[1];
       length = next - head;
       last = arcVertices.Get(next - 1);
     }
@@ -150,21 +155,24 @@ struct SegmentExtent : viskores::worklet::WorkletMapField
 
 } // namespace segment_detail
 
-/// The candidate merges of a round. A segment merge (position `si`) joins segment `si` of the arc
-/// and the next. In every sheet, the piece of the source joins the cluster of the copy of the
-/// target that a copy of the edge `(target, source)` of `X` meets.
+/// The candidate merges of a round. A segment merge (`SegmentMergeKind`, position `si`) joins
+/// segment `si` of the arc and the next; a junction merge (`JunctionMergeKind`, position `end`)
+/// joins the end segment at `end` to its junction. In every sheet, the piece of the source joins
+/// the cluster of the copy of the target that a copy of the edge `(target, source)` of `X` meets.
 struct CandidateList
 {
   viskores::cont::ArrayHandle<viskores::Id> Arc;
+  viskores::cont::ArrayHandle<viskores::IdComponent> Kind;
   viskores::cont::ArrayHandle<viskores::Id> Position;
   viskores::cont::ArrayHandle<viskores::Id2> Edge;
-  /// The segment whose vertices change segment, and the segment (its first vertex) they join.
+  /// The segment whose vertices change segment, and the segment (its first vertex) or junction
+  /// they join.
   viskores::cont::ArrayHandle<viskores::Id> Moved;
   viskores::cont::ArrayHandle<viskores::Id> MovedTo;
-  /// The two segments (first vertices) whose glue groups merge.
+  /// The two segments (first vertices) or junction whose glue groups merge.
   viskores::cont::ArrayHandle<viskores::Id2> Groups;
   /// The keys the candidate touches and those it takes, for the greedy commit: segments by
-  /// index; -1 where none.
+  /// index, junctions after them; -1 where none.
   viskores::cont::ArrayHandle<viskores::Vec<viskores::Id, 5>> Touch;
   viskores::cont::ArrayHandle<viskores::Id2> Take;
 };
@@ -172,7 +180,16 @@ struct CandidateList
 namespace segment_detail
 {
 
-/// The number of candidates of an arc: one segment merge per pair of consecutive segments.
+/// The number of junction merges of an arc: two when allowed.
+VISKORES_EXEC inline viskores::Id JunctionCandidates(bool junctionMerges,
+                                                     viskores::Id ns,
+                                                     const viskores::Id2& ends)
+{
+  return (junctionMerges && ends[0] >= 0 && ns >= 1 && !(ns == 1 && ends[0] == ends[1])) ? 2 : 0;
+}
+
+/// The number of candidates of an arc: its junction merges, and one segment merge per pair of
+/// consecutive segments.
 struct CandidateCount : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn arc,
@@ -181,6 +198,11 @@ struct CandidateCount : viskores::worklet::WorkletMapField
                                 FieldOut count);
   using ExecutionSignature = _4(_1, _2, _3);
 
+  VISKORES_CONT explicit CandidateCount(bool junctionMerges)
+    : JunctionMerges(junctionMerges)
+  {
+  }
+
   template <typename IdPortal, typename PairPortal>
   VISKORES_EXEC viskores::Id operator()(viskores::Id a,
                                         const IdPortal& segmentOffsets,
@@ -188,20 +210,40 @@ struct CandidateCount : viskores::worklet::WorkletMapField
   {
     const viskores::Id ns = segmentOffsets.Get(a + 1) - segmentOffsets.Get(a);
     const viskores::Id2 ends = arcEnds.Get(a);
-    return (ns >= 2) ? ((ends[0] >= 0) ? ns - 1 : ns) : 0;
+    const viskores::Id segment = (ns >= 2) ? ((ends[0] >= 0) ? ns - 1 : ns) : 0;
+    return JunctionCandidates(this->JunctionMerges, ns, ends) + segment;
   }
+
+  bool JunctionMerges;
 };
 
-/// Candidate `c`: its arc and position, the edge of `X` it merges across, the segment it
+} // namespace segment_detail
+
+/// The kinds of candidate merges; the kind orders the candidates after their arc.
+enum : viskores::IdComponent
+{
+  SegmentMergeKind = 0,
+  JunctionMergeKind = 1
+};
+
+namespace segment_detail
+{
+
+/// Candidate `c`: its arc, kind and position, the edge of `X` it merges across, the segment it
 /// moves, the groups it merges, and its keys.
 struct CandidateFields : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn candidate,
                                 WholeArrayIn candidateOffsets,
                                 WholeArrayIn segmentOffsets,
+                                WholeArrayIn arcOffsets,
+                                WholeArrayIn arcEnds,
+                                WholeArrayIn absorbed,
+                                WholeArrayIn arcVertices,
                                 WholeArrayIn first,
                                 WholeArrayIn last,
                                 FieldOut arc,
+                                FieldOut kind,
                                 FieldOut position,
                                 FieldOut edge,
                                 FieldOut moved,
@@ -209,15 +251,27 @@ struct CandidateFields : viskores::worklet::WorkletMapField
                                 FieldOut groups,
                                 FieldOut touch,
                                 FieldOut take);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13);
+  using ExecutionSignature =
+    void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18);
 
-  template <typename IdPortal>
+  VISKORES_CONT CandidateFields(bool junctionMerges, viskores::Id numSegments)
+    : JunctionMerges(junctionMerges)
+    , NumberOfSegments(numSegments)
+  {
+  }
+
+  template <typename IdPortal, typename PairPortal>
   VISKORES_EXEC void operator()(viskores::Id c,
                                 const IdPortal& candidateOffsets,
                                 const IdPortal& segmentOffsets,
+                                const IdPortal& arcOffsets,
+                                const PairPortal& arcEnds,
+                                const PairPortal& absorbed,
+                                const IdPortal& arcVertices,
                                 const IdPortal& first,
                                 const IdPortal& last,
                                 viskores::Id& arc,
+                                viskores::IdComponent& kind,
                                 viskores::Id& position,
                                 viskores::Id2& edge,
                                 viskores::Id& moved,
@@ -230,11 +284,47 @@ struct CandidateFields : viskores::worklet::WorkletMapField
     // or before c.
     const viskores::Id a = OwnerOf(candidateOffsets, c);
     arc = a;
+    const viskores::Id i = c - candidateOffsets.Get(a);
     const viskores::Id fs = segmentOffsets.Get(a);
     const viskores::Id ns = segmentOffsets.Get(a + 1) - fs;
+    const viskores::Id2 ends = arcEnds.Get(a);
+    const viskores::Id junctions = JunctionCandidates(this->JunctionMerges, ns, ends);
     touch = viskores::Vec<viskores::Id, 5>(-1);
+    if (i < junctions)
+    {
+      // The end segment joins its junction across the edge of X from its outer vertex to the
+      // junction, or to the vertex absorbed last at that end.
+      kind = JunctionMergeKind;
+      position = i;
+      const viskores::IdComponent end = static_cast<viskores::IdComponent>(i);
+      const viskores::Id index = (end == 0) ? 0 : ns - 1;
+      const viskores::Id s = fs + index;
+      const viskores::Id u = (end == 0) ? first.Get(s) : last.Get(s);
+      const viskores::Id2 absorbedCounts = absorbed.Get(a);
+      const viskores::Id j = ends[end];
+      viskores::Id t = j;
+      if (end == 0 && absorbedCounts[0] > 0)
+      {
+        t = arcVertices.Get(arcOffsets.Get(a) + absorbedCounts[0] - 1);
+      }
+      else if (end == 1 && absorbedCounts[1] > 0)
+      {
+        t = arcVertices.Get(arcOffsets.Get(a + 1) - absorbedCounts[1]);
+      }
+      edge = viskores::Id2(t, u);
+      moved = s;
+      movedTo = j;
+      groups = viskores::Id2(j, first.Get(s));
+      touch[0] = s;
+      const viskores::Id neighbor = index + ((end == 0) ? 1 : -1);
+      touch[1] = (neighbor >= 0 && neighbor < ns) ? fs + neighbor : viskores::Id(-1);
+      touch[2] = this->NumberOfSegments + j;
+      take = viskores::Id2(s, this->NumberOfSegments + j);
+      return;
+    }
     // Segments si and si + 1 (around a closed arc): the piece of the second joins the first.
-    const viskores::Id si = c - candidateOffsets.Get(a);
+    kind = SegmentMergeKind;
+    const viskores::Id si = i - junctions;
     position = si;
     const viskores::Id s1 = fs + si, s2 = fs + (si + 1) % ns;
     edge = viskores::Id2(last.Get(s1), first.Get(s2));
@@ -248,6 +338,9 @@ struct CandidateFields : viskores::worklet::WorkletMapField
     touch[3] = fs + (si + 2) % ns;
     take = viskores::Id2(s1, s2);
   }
+
+  bool JunctionMerges;
+  viskores::Id NumberOfSegments;
 };
 
 /// The range of the copies of the edge of `X` of a candidate.
@@ -479,18 +572,61 @@ struct RawGenerator : viskores::worklet::WorkletMapField
   }
 };
 
+/// A changed cluster as if no sheet vertex had joined it: placed from its frozen members alone
+/// if it holds other vertices too, by `Place` otherwise.
+struct MergedPiece : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn key,
+                                FieldIn generator,
+                                FieldIn q,
+                                FieldIn size,
+                                WholeArrayIn frozenKeys,
+                                WholeArrayIn frozenGenerators,
+                                WholeArrayIn frozenQ,
+                                WholeArrayIn frozenSizes,
+                                FieldOut cp,
+                                FieldOut qp);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10);
+
+  template <typename KeyPortal, typename VecPortal, typename MatPortal, typename IdPortal>
+  VISKORES_EXEC void operator()(const viskores::Id2& key,
+                                const Vec3& generator,
+                                const Mat3& q,
+                                viskores::Id size,
+                                const KeyPortal& frozenKeys,
+                                const VecPortal& frozenGenerators,
+                                const MatPortal& frozenQ,
+                                const IdPortal& frozenSizes,
+                                Vec3& cp,
+                                Mat3& qp) const
+  {
+    const viskores::Id i = FindSorted(frozenKeys, key);
+    if (i >= 0 && size > frozenSizes.Get(i))
+    {
+      cp = frozenGenerators.Get(i);
+      qp = frozenQ.Get(i);
+    }
+    else
+    {
+      cp = generator;
+      qp = q;
+    }
+  }
+};
+
 /// The values of an affected label of a candidate on the candidate's labelling: from its merged
-/// cluster if the candidate changes it, its own otherwise; its first frozen member and its size.
+/// cluster if the candidate changes it, its own otherwise, with the pieces placed as if no sheet
+/// vertex had joined them (`cp`, `qp`); its first frozen member and its size.
 struct LabelValues : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn record,
                                 WholeArrayIn mergedKeys,
-                                WholeArrayIn mergedGenerators,
-                                WholeArrayIn mergedQ,
+                                WholeArrayIn mergedCp,
+                                WholeArrayIn mergedQp,
                                 WholeArrayIn mergedSizes,
                                 WholeArrayIn mergedFrozenFirst,
-                                WholeArrayIn generators,
-                                WholeArrayIn quadrics,
+                                WholeArrayIn cp,
+                                WholeArrayIn qp,
                                 WholeArrayIn sizes,
                                 WholeArrayIn frozenFirst,
                                 FieldOut generator,
@@ -502,12 +638,12 @@ struct LabelValues : viskores::worklet::WorkletMapField
   template <typename KeyPortal, typename VecPortal, typename MatPortal, typename IdPortal>
   VISKORES_EXEC void operator()(const viskores::Id3& r,
                                 const KeyPortal& mergedKeys,
-                                const VecPortal& mergedGenerators,
-                                const MatPortal& mergedQ,
+                                const VecPortal& mergedCp,
+                                const MatPortal& mergedQp,
                                 const IdPortal& mergedSizes,
                                 const IdPortal& mergedFrozenFirst,
-                                const VecPortal& generators,
-                                const MatPortal& quadrics,
+                                const VecPortal& cp,
+                                const MatPortal& qp,
                                 const IdPortal& sizes,
                                 const IdPortal& frozenFirst,
                                 Vec3& generator,
@@ -519,15 +655,15 @@ struct LabelValues : viskores::worklet::WorkletMapField
     const viskores::Id i = FindSorted(mergedKeys, viskores::Id2(r[0], label));
     if (i >= 0)
     {
-      generator = mergedGenerators.Get(i);
-      matrix = mergedQ.Get(i);
+      generator = mergedCp.Get(i);
+      matrix = mergedQp.Get(i);
       size = mergedSizes.Get(i);
       firstFrozen = mergedFrozenFirst.Get(i);
     }
     else
     {
-      generator = generators.Get(label);
-      matrix = quadrics.Get(label);
+      generator = cp.Get(label);
+      matrix = qp.Get(label);
       size = sizes.Get(label);
       firstFrozen = frozenFirst.Get(label);
     }
@@ -781,19 +917,22 @@ struct TreeResult : viskores::worklet::WorkletMapField
 
 /// What candidate `c` changes in the output polyline of its arc: the head of the segment whose
 /// point it removes, and that of the segment whose point moves, or -1. A segment merge removes
-/// the point of the second segment and moves that of the first.
+/// the point of the second segment and moves that of the first; a junction merge removes the
+/// point of the end segment.
 struct CurveChange : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn arc,
+                                FieldIn kind,
                                 FieldIn position,
                                 WholeArrayIn segmentOffsets,
                                 WholeArrayIn heads,
                                 FieldOut removed,
                                 FieldOut moved);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7);
 
   template <typename IdPortal>
   VISKORES_EXEC void operator()(viskores::Id a,
+                                viskores::IdComponent kind,
                                 viskores::Id position,
                                 const IdPortal& segmentOffsets,
                                 const IdPortal& heads,
@@ -802,23 +941,33 @@ struct CurveChange : viskores::worklet::WorkletMapField
   {
     const viskores::Id fs = segmentOffsets.Get(a);
     const viskores::Id ns = segmentOffsets.Get(a + 1) - fs;
+    if (kind == JunctionMergeKind)
+    {
+      removed = heads.Get(position == 0 ? fs : fs + ns - 1);
+      moved = -1;
+      return;
+    }
     removed = heads.Get(fs + (position + 1) % ns);
     moved = heads.Get(fs + position);
   }
 };
 
-/// The order of the passing candidates: increase, arc and position.
+/// The order of the passing candidates: increase, arc, kind and position.
 struct CandidateKey : viskores::worklet::WorkletMapField
 {
-  using ControlSignature = void(FieldIn increase, FieldIn arc, FieldIn position, FieldOut key);
-  using ExecutionSignature = _4(_1, _2, _3, WorkIndex);
+  using ControlSignature =
+    void(FieldIn increase, FieldIn arc, FieldIn kind, FieldIn position, FieldOut key);
+  using ExecutionSignature = _5(_1, _2, _3, _4, WorkIndex);
 
-  VISKORES_EXEC viskores::Pair<Real, viskores::Id3> operator()(Real increase,
-                                                               viskores::Id arc,
-                                                               viskores::Id position,
-                                                               viskores::Id c) const
+  VISKORES_EXEC viskores::Pair<Real, viskores::Vec<viskores::Id, 4>> operator()(
+    Real increase,
+    viskores::Id arc,
+    viskores::IdComponent kind,
+    viskores::Id position,
+    viskores::Id c) const
   {
-    return viskores::Pair<Real, viskores::Id3>(increase, viskores::Id3(arc, position, c));
+    return viskores::Pair<Real, viskores::Vec<viskores::Id, 4>>(
+      increase, viskores::Vec<viskores::Id, 4>(arc, kind, position, c));
   }
 };
 
@@ -827,9 +976,10 @@ struct KeyCandidate : viskores::worklet::WorkletMapField
   using ControlSignature = void(FieldIn key, FieldOut candidate);
   using ExecutionSignature = _2(_1);
 
-  VISKORES_EXEC viskores::Id operator()(const viskores::Pair<Real, viskores::Id3>& key) const
+  VISKORES_EXEC viskores::Id operator()(
+    const viskores::Pair<Real, viskores::Vec<viskores::Id, 4>>& key) const
   {
-    return key.second[2];
+    return key.second[3];
   }
 };
 
@@ -965,29 +1115,53 @@ struct SelectedRelabel : viskores::worklet::WorkletMapField
 };
 
 /// A selected segment merge removes the head of the merged segment; a closed arc whose first
-/// segment merged into its last starts at its next head.
+/// segment merged into its last starts at its next head. A selected junction merge adds the
+/// length of its segment at its end.
 struct ApplySegmentChange : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn candidate,
                                 WholeArrayIn arcs,
+                                WholeArrayIn kinds,
+                                WholeArrayIn positions,
                                 WholeArrayIn moved,
                                 WholeArrayIn heads,
+                                WholeArrayIn lengths,
                                 WholeArrayIn segmentOffsets,
                                 WholeArrayInOut segmentHead,
-                                WholeArrayInOut firstHead);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7);
+                                WholeArrayInOut firstHead,
+                                WholeArrayInOut absorbedFront,
+                                WholeArrayInOut absorbedBack);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12);
 
-  template <typename IdPortal, typename HeadFlagPortal, typename OutPortal>
+  template <typename IdPortal, typename KindPortal, typename HeadFlagPortal, typename OutPortal>
   VISKORES_EXEC void operator()(viskores::Id c,
                                 const IdPortal& arcs,
+                                const KindPortal& kinds,
+                                const IdPortal& positions,
                                 const IdPortal& moved,
                                 const IdPortal& heads,
+                                const IdPortal& lengths,
                                 const IdPortal& segmentOffsets,
                                 HeadFlagPortal& segmentHead,
-                                OutPortal& firstHead) const
+                                OutPortal& firstHead,
+                                OutPortal& absorbedFront,
+                                OutPortal& absorbedBack) const
   {
     const viskores::Id a = arcs.Get(c);
     const viskores::Id s = moved.Get(c);
+    if (kinds.Get(c) == JunctionMergeKind)
+    {
+      // At most one junction merge per end of an arc.
+      if (positions.Get(c) == 0)
+      {
+        absorbedFront.Set(a, lengths.Get(s));
+      }
+      else
+      {
+        absorbedBack.Set(a, lengths.Get(s));
+      }
+      return;
+    }
     segmentHead.Set(heads.Get(s), 0);
     const viskores::Id fs = segmentOffsets.Get(a);
     if (s == fs)
@@ -998,7 +1172,22 @@ struct ApplySegmentChange : viskores::worklet::WorkletMapField
   }
 };
 
-/// The vertices of a moved segment join their new segment.
+/// The absorbed counts of an arc, increased by those of its selected junction merges.
+struct AddAbsorbed : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn front, FieldIn back, FieldInOut absorbed);
+  using ExecutionSignature = void(_1, _2, _3);
+
+  VISKORES_EXEC void operator()(viskores::Id front,
+                                viskores::Id back,
+                                viskores::Id2& absorbed) const
+  {
+    absorbed[0] += front;
+    absorbed[1] += back;
+  }
+};
+
+/// The vertices of a moved segment join their new segment or junction.
 struct MoveSegmentVertex : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn item,
@@ -1036,12 +1225,17 @@ struct MoveSegmentVertex : viskores::worklet::WorkletMapField
   }
 };
 
-/// The key vertex of a candidate: the first vertex of the segment that stays, whose copies are
-/// in the merged pieces.
-template <typename IdPortal>
-VISKORES_EXEC inline viskores::Id KeyVertex(viskores::Id c, const IdPortal& movedTo)
+/// The key vertex of a candidate: for a segment merge, the first vertex of the segment that
+/// stays, whose copies are in the merged pieces; for a junction merge, the first vertex of the
+/// absorbed segment.
+template <typename KindPortal, typename IdPortal>
+VISKORES_EXEC inline viskores::Id KeyVertex(viskores::Id c,
+                                            const KindPortal& kinds,
+                                            const IdPortal& moved,
+                                            const IdPortal& movedTo,
+                                            const IdPortal& segmentFirst)
 {
-  return movedTo.Get(c);
+  return (kinds.Get(c) == JunctionMergeKind) ? segmentFirst.Get(moved.Get(c)) : movedTo.Get(c);
 }
 
 /// Whether a candidate of a batch that failed the full test is a culprit: a frozen copy of its
@@ -1049,23 +1243,29 @@ VISKORES_EXEC inline viskores::Id KeyVertex(viskores::Id c, const IdPortal& move
 struct SegmentCulprit : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn candidate,
+                                WholeArrayIn kinds,
+                                WholeArrayIn moved,
                                 WholeArrayIn movedTo,
+                                WholeArrayIn segmentFirst,
                                 WholeArrayIn copyOffsets,
                                 WholeArrayIn frozen,
                                 WholeArrayIn labels,
                                 WholeArrayIn flags,
                                 FieldOut culprit);
-  using ExecutionSignature = _7(_1, _2, _3, _4, _5, _6);
+  using ExecutionSignature = _10(_1, _2, _3, _4, _5, _6, _7, _8, _9);
 
-  template <typename IdPortal, typename FlagPortal>
+  template <typename KindPortal, typename IdPortal, typename FlagPortal>
   VISKORES_EXEC viskores::UInt8 operator()(viskores::Id c,
+                                           const KindPortal& kinds,
+                                           const IdPortal& moved,
                                            const IdPortal& movedTo,
+                                           const IdPortal& segmentFirst,
                                            const IdPortal& copyOffsets,
                                            const FlagPortal& frozen,
                                            const IdPortal& labels,
                                            const FlagPortal& flags) const
   {
-    const viskores::Id key = KeyVertex(c, movedTo);
+    const viskores::Id key = KeyVertex(c, kinds, moved, movedTo, segmentFirst);
     const viskores::Id end = (key + 1 < copyOffsets.GetNumberOfValues())
       ? copyOffsets.Get(key + 1)
       : labels.GetNumberOfValues();
@@ -1085,22 +1285,28 @@ struct SegmentCulprit : viskores::worklet::WorkletMapField
 struct MarkKeyClusters : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn candidate,
+                                WholeArrayIn kinds,
+                                WholeArrayIn moved,
                                 WholeArrayIn movedTo,
+                                WholeArrayIn segmentFirst,
                                 WholeArrayIn copyOffsets,
                                 WholeArrayIn frozen,
                                 WholeArrayIn labels,
                                 AtomicArrayInOut changed);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9);
 
-  template <typename IdPortal, typename FlagPortal, typename AtomicPortal>
+  template <typename KindPortal, typename IdPortal, typename FlagPortal, typename AtomicPortal>
   VISKORES_EXEC void operator()(viskores::Id c,
+                                const KindPortal& kinds,
+                                const IdPortal& moved,
                                 const IdPortal& movedTo,
+                                const IdPortal& segmentFirst,
                                 const IdPortal& copyOffsets,
                                 const FlagPortal& frozen,
                                 const IdPortal& labels,
                                 const AtomicPortal& changed) const
   {
-    const viskores::Id key = KeyVertex(c, movedTo);
+    const viskores::Id key = KeyVertex(c, kinds, moved, movedTo, segmentFirst);
     const viskores::Id end = (key + 1 < copyOffsets.GetNumberOfValues())
       ? copyOffsets.Get(key + 1)
       : labels.GetNumberOfValues();
@@ -1129,7 +1335,8 @@ struct MarkedFlag : viskores::worklet::WorkletMapField
 } // namespace segment_detail
 
 /// The merges of consecutive segments of the singular curves, (f) of Proposition "Decimating
-/// the singular curves", as `ArcVQC` of proofs/lib/arcs.py.
+/// the singular curves", and with junction merges of end segments into their junctions, as
+/// `ArcVQC` of proofs/lib/arcs.py.
 class SegmentMerger
 {
 public:
@@ -1188,8 +1395,8 @@ public:
 
 private:
   /// One round, as `arc_merge_round`: every candidate that keeps every flag quiet is ranked by
-  /// the increase of the objective, then by arc and position; the greedy set of those that
-  /// share no segment and are not consecutive is applied and checked, and if a flag
+  /// the increase of the objective, then by arc, kind and position; the greedy set of those that
+  /// share no segment or junction and are not consecutive is applied and checked, and if a flag
   /// fires, chosen again without the deferred candidates. Returns whether the labelling changed.
   bool Round(Clustering& clusters, MergeDiagnostics& diagnostics)
   {
@@ -1211,8 +1418,9 @@ private:
     diagnostics.SegmentCandidates += numCandidates;
 
     // The passing candidates, ranked.
-    viskores::cont::ArrayHandle<viskores::Pair<Real, viskores::Id3>> keys, passing;
-    invoke(sd::CandidateKey{}, increases, candidates.Arc, candidates.Position, keys);
+    viskores::cont::ArrayHandle<viskores::Pair<Real, viskores::Vec<viskores::Id, 4>>> keys, passing;
+    invoke(
+      sd::CandidateKey{}, increases, candidates.Arc, candidates.Kind, candidates.Position, keys);
     Algorithm::CopyIf(keys, fires, passing, IsZero{});
     if (passing.GetNumberOfValues() == 0)
     {
@@ -1320,6 +1528,7 @@ private:
            curves.ArcOffsets,
            curves.ArcEnds,
            curves.FirstHead,
+           curves.Absorbed,
            records);
     viskores::cont::ArrayHandle<viskores::UInt8> valid;
     invoke(IsValidRecord{}, records, valid);
@@ -1335,6 +1544,7 @@ private:
            list.Offsets,
            curves.ArcOffsets,
            curves.ArcEnds,
+           curves.Absorbed,
            curves.ArcVertices,
            list.First,
            list.Last,
@@ -1349,8 +1559,9 @@ private:
     namespace sd = segment_detail;
     viskores::cont::Invoker invoke;
     const SingularCurves& curves = this->Curves;
+    const bool junctionMerges = this->Parameters.JunctionMerges;
     viskores::cont::ArrayHandle<viskores::Id> counts, offsets;
-    invoke(sd::CandidateCount{},
+    invoke(sd::CandidateCount(junctionMerges),
            viskores::cont::ArrayHandleIndex(curves.NumberOfArcs),
            segments.Offsets,
            curves.ArcEnds,
@@ -1358,13 +1569,18 @@ private:
     Algorithm::ScanExtended(counts, offsets);
     const viskores::Id total = viskores::cont::ArrayGetValue(curves.NumberOfArcs, offsets);
     CandidateList candidates;
-    invoke(sd::CandidateFields{},
+    invoke(sd::CandidateFields(junctionMerges, segments.Head.GetNumberOfValues()),
            viskores::cont::ArrayHandleIndex(total),
            offsets,
            segments.Offsets,
+           curves.ArcOffsets,
+           curves.ArcEnds,
+           curves.Absorbed,
+           curves.ArcVertices,
            segments.First,
            segments.Last,
            candidates.Arc,
+           candidates.Kind,
            candidates.Position,
            candidates.Edge,
            candidates.Moved,
@@ -1422,6 +1638,7 @@ private:
       curve.Arc = candidates.Arc;
       invoke(segment_detail::CurveChange{},
              candidates.Arc,
+             candidates.Kind,
              candidates.Position,
              segments.Offsets,
              segments.Head,
@@ -1544,18 +1761,70 @@ private:
            rawGenerators);
     const viskores::cont::ArrayHandle<viskores::Id> frozenFirst =
       FrozenFirst(this->Parameters.FrozenVertices, clusters);
+    // The pieces as if no sheet vertex had joined them: of the round, and the changed clusters.
+    viskores::cont::ArrayHandle<Vec3> cp, mergedCp;
+    viskores::cont::ArrayHandle<Mat3> qp, mergedQp;
+    FrozenPiecePlacement(this->Mesh,
+                         this->Quadrics.M,
+                         this->Parameters.FrozenVertices,
+                         clusters.Labels,
+                         clusters.Sizes,
+                         rawGenerators,
+                         clusters.Q,
+                         cp,
+                         qp);
+    {
+      viskores::cont::ArrayHandle<viskores::UInt8> isFrozen;
+      viskores::cont::ArrayHandle<viskores::Id3> frozenMembers;
+      invoke(GatherComponent<2>{}, members, this->Parameters.FrozenVertices, isFrozen);
+      Algorithm::CopyIf(members, isFrozen, frozenMembers);
+      viskores::cont::ArrayHandle<viskores::Id2> frozenKeys, uniqueFrozenKeys;
+      viskores::cont::ArrayHandle<viskores::Id> frozenMemberVertices, frozenAnchors, frozenSizes;
+      viskores::cont::ArrayHandle<Mat3> frozenQ;
+      viskores::cont::ArrayHandle<Vec3> frozenB, frozenGenerators;
+      viskores::cont::ArrayHandle<Real> frozenS;
+      if (frozenMembers.GetNumberOfValues() > 0)
+      {
+        invoke(sd::MemberKey{}, frozenMembers, frozenKeys, frozenMemberVertices);
+        viskores::worklet::Keys<viskores::Id2> pieces;
+        pieces.BuildArrays(frozenKeys, viskores::worklet::KeysSortType::Stable);
+        invoke(detail::Place{},
+               pieces,
+               frozenMemberVertices,
+               this->Mesh.Points,
+               this->Quadrics.M,
+               frozenAnchors,
+               frozenQ,
+               frozenB,
+               frozenS,
+               frozenGenerators,
+               frozenSizes);
+        uniqueFrozenKeys = pieces.GetUniqueKeys();
+      }
+      invoke(sd::MergedPiece{},
+             merged.GetUniqueKeys(),
+             mergedGenerators,
+             mergedQ,
+             mergedSizes,
+             uniqueFrozenKeys,
+             frozenGenerators,
+             frozenQ,
+             frozenSizes,
+             mergedCp,
+             mergedQp);
+    }
     viskores::cont::ArrayHandle<Vec3> labelGenerators;
     viskores::cont::ArrayHandle<Mat3> labelQ;
     viskores::cont::ArrayHandle<viskores::Id> labelFrozenFirst, labelSizes;
     invoke(sd::LabelValues{},
            labelRecords,
            merged.GetUniqueKeys(),
-           mergedGenerators,
-           mergedQ,
+           mergedCp,
+           mergedQp,
            mergedSizes,
            mergedFrozenFirst,
-           rawGenerators,
-           clusters.Q,
+           cp,
+           qp,
            clusters.Sizes,
            frozenFirst,
            labelGenerators,
@@ -1723,9 +1992,11 @@ private:
     // The state to restore.
     viskores::cont::ArrayHandle<viskores::Id> savedSegment, savedFirstHead;
     viskores::cont::ArrayHandle<viskores::UInt8> savedHead;
+    viskores::cont::ArrayHandle<viskores::Id2> savedAbsorbed;
     Algorithm::Copy(curves.Segment, savedSegment);
     Algorithm::Copy(curves.FirstHead, savedFirstHead);
     Algorithm::Copy(curves.SegmentHead, savedHead);
+    Algorithm::Copy(curves.Absorbed, savedAbsorbed);
 
     // The relabels of the selected candidates, as merges (to, from).
     viskores::cont::ArrayHandle<viskores::UInt8> isSelected, keep;
@@ -1735,15 +2006,24 @@ private:
     invoke(sd::SelectedRelabel{}, relabels, isSelected, keep, allPairs);
     Algorithm::CopyIf(allPairs, keep, pairs);
 
-    // Merge the segments.
+    // Merge the segments, and absorb the end segments of junction merges.
+    viskores::cont::ArrayHandle<viskores::Id> front, back;
+    front.AllocateAndFill(curves.NumberOfArcs, 0);
+    back.AllocateAndFill(curves.NumberOfArcs, 0);
     invoke(sd::ApplySegmentChange{},
            selected,
            candidates.Arc,
+           candidates.Kind,
+           candidates.Position,
            candidates.Moved,
            segments.Head,
+           segments.Length,
            segments.Offsets,
            curves.SegmentHead,
-           curves.FirstHead);
+           curves.FirstHead,
+           front,
+           back);
+    invoke(sd::AddAbsorbed{}, front, back, curves.Absorbed);
     viskores::cont::ArrayHandle<viskores::Id> lengths, itemOffsets;
     invoke(GatherTwice{}, selected, candidates.Moved, segments.Length, lengths);
     const viskores::Id numItems = Algorithm::ScanExclusive(lengths, itemOffsets);
@@ -1786,7 +2066,10 @@ private:
         {
           invoke(sd::SegmentCulprit{},
                  selected,
+                 candidates.Kind,
+                 candidates.Moved,
                  candidates.MovedTo,
+                 segments.First,
                  this->CopyOffsets,
                  this->Parameters.FrozenVertices,
                  merged.Labels,
@@ -1799,7 +2082,10 @@ private:
             marks.AllocateAndFill(merged.NumberOfClusters, 0);
             invoke(sd::MarkKeyClusters{},
                    selected,
+                   candidates.Kind,
+                   candidates.Moved,
                    candidates.MovedTo,
+                   segments.First,
                    this->CopyOffsets,
                    this->Parameters.FrozenVertices,
                    merged.Labels,
@@ -1808,7 +2094,10 @@ private:
             invoke(sd::MarkedFlag{}, marks, changed);
             invoke(sd::SegmentCulprit{},
                    selected,
+                   candidates.Kind,
+                   candidates.Moved,
                    candidates.MovedTo,
+                   segments.First,
                    this->CopyOffsets,
                    this->Parameters.FrozenVertices,
                    merged.Labels,
@@ -1825,6 +2114,7 @@ private:
       curves.Segment = savedSegment;
       curves.FirstHead = savedFirstHead;
       curves.SegmentHead = savedHead;
+      curves.Absorbed = savedAbsorbed;
       return false;
     }
     clusters = merged;

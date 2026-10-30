@@ -105,7 +105,10 @@ public:
     /// a plate, the curve is decimated too, with every junction of curves kept in place.
     /// Without it, those curves keep their input resolution. Requires `Topology`; it matters
     /// only for inputs that are not surfaces.
-    SingularCurves = 1 << 4
+    SingularCurves = 1 << 4,
+    /// Every sharp edge curve comes out as a chain of output edges through its corners. Requires
+    /// `Topology`. Not implemented yet.
+    Creases = 1 << 5
   };
 
   /// @brief The guarantees of the output, as a combination of `Guarantee` bits.

@@ -12,6 +12,7 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/CurveFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EmbeddingFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EnvelopeFlags.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/GlueItems.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SingularCurves.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
@@ -89,6 +90,13 @@ struct MergeParameters
   viskores::Id DegreeFloor = 12;
   /// The key after the degree.
   MergeOrder Order = MergeOrder::Cost;
+  /// Experimental: a cluster of a sheet may merge into an adjacent piece of a segment or copy of a
+  /// junction on the boundary of the cut, which keeps its label and its generator. Such merges
+  /// take the local test with that generator fixed, and (d') at the glued vertex.
+  bool FaceMerges = false;
+  /// Experimental: the end segment of an open arc may merge into the junction at that end, whose
+  /// generator stays at the junction.
+  bool JunctionMerges = false;
   /// When the committed set fails the full test: defer the merges whose merged cluster is
   /// flagged and test the others again, or, if false, merge only the candidate of highest
   /// priority.
@@ -171,6 +179,58 @@ struct MergeContextPortals
     Id3Portal,
     viskores::worklet::spatialstructure::BoundingVolumeHierarchy::ExecObjectType>;
 
+  /// Calls `visit(P, labels, t)` for every triangle of `K/ij` at the glued vertex of a frozen
+  /// cluster `i` that the sheet cluster `j` joins, with `j` at the generator `merged` of `i`,
+  /// which does not move: the triangles at a label of the glue group of `i` or at `j`,
+  /// relabelled, each once, but not those at both `i` and `j`, which degenerate.
+  template <typename Visit>
+  VISKORES_EXEC bool ForEachSheetMergeTriangle(viskores::Id i,
+                                               viskores::Id j,
+                                               const Vec3& merged,
+                                               Visit&& visit) const
+  {
+    const viskores::Id group = this->Glue.Get(i);
+    const viskores::Id g =
+      LowerBound(this->GroupKeys, 0, this->GroupKeys.GetNumberOfValues(), group);
+    const viskores::Id begin = this->GroupOffsets.Get(g), end = this->GroupOffsets.Get(g + 1);
+    // The group's labels in increasing order, then j; a triangle is visited from the first.
+    for (viskores::Id r = begin; r <= end; ++r)
+    {
+      const viskores::Id c = (r < end) ? this->GroupLabels.Get(r) : j;
+      for (viskores::Id f = this->FanOffsets.Get(c); f < this->FanOffsets.Get(c + 1); ++f)
+      {
+        const viskores::Id t = this->Fans.Get(f);
+        viskores::Id3 labels = this->OutputTriangles.Get(t);
+        bool earlier = false, hasI = false, hasJ = false;
+        for (int k = 0; k < 3; ++k)
+        {
+          const bool inGroup = this->Glue.Get(labels[k]) == group;
+          earlier = earlier || (inGroup && (c == j || labels[k] < c));
+          hasI = hasI || labels[k] == i;
+          hasJ = hasJ || labels[k] == j;
+        }
+        if (earlier || (hasI && hasJ))
+        {
+          continue;
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+          labels[k] = (labels[k] == j) ? i : labels[k];
+        }
+        Vec3 p[3];
+        for (int k = 0; k < 3; ++k)
+        {
+          p[k] = (labels[k] == i) ? merged : this->Generators.Get(labels[k]);
+        }
+        if (!visit(p, labels, t))
+        {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
   VISKORES_EXEC viskores::Id3 Glued(const viskores::Id3& t) const
   {
     if (!this->HasGlue)
@@ -178,6 +238,88 @@ struct MergeContextPortals
       return t;
     }
     return viskores::Id3(this->Glue.Get(t[0]), this->Glue.Get(t[1]), this->Glue.Get(t[2]));
+  }
+
+  /// (F4) for a sheet cluster `j` joining a frozen cluster `i`, as `merge_ok(fixed=True)` of
+  /// proofs/lib/vqc.py: every triangle at the glued vertex of `i` must be nondegenerate and
+  /// meet no other nondegenerate triangle improperly.
+  VISKORES_EXEC bool SheetMergeEmbedded(viskores::Id i,
+                                        viskores::Id j,
+                                        const Vec3& merged,
+                                        bool& complete) const
+  {
+    const viskores::Id group = this->Glue.Get(i);
+    bool bad = false;
+    this->ForEachSheetMergeTriangle(
+      i,
+      j,
+      merged,
+      [&](const Vec3* p, const viskores::Id3& labels, viskores::Id t)
+      {
+        if (viskores::TriangleIsDegenerate(p[0], p[1], p[2]))
+        {
+          bad = true;
+          return false;
+        }
+        // Against the other triangles at the glued vertex, each pair once.
+        bool after = false;
+        this->ForEachSheetMergeTriangle(
+          i,
+          j,
+          merged,
+          [&](const Vec3* q, const viskores::Id3& otherLabels, viskores::Id u)
+          {
+            if (u == t)
+            {
+              after = true;
+              return true;
+            }
+            if (after && !viskores::TriangleIsDegenerate(q[0], q[1], q[2]) &&
+                exact::ImproperPair(p, this->Glued(labels), q, this->Glued(otherLabels)))
+            {
+              bad = true;
+              return false;
+            }
+            return true;
+          });
+        if (bad)
+        {
+          return false;
+        }
+        // Against the triangles of K away from the glued vertex and from j, which stay.
+        Vec3 lo, hi;
+        TriangleBounds(p[0], p[1], p[2], lo, hi);
+        const bool done = this->Output.Hierarchy.ForEachOverlap(
+          lo,
+          hi,
+          [&](viskores::Id u)
+          {
+            const viskores::Id3 other = this->OutputTriangles.Get(u);
+            for (int k = 0; k < 3; ++k)
+            {
+              if (other[k] == j || this->Glue.Get(other[k]) == group)
+              {
+                return true;
+              }
+            }
+            if (this->OutputDegenerate.Get(u))
+            {
+              return true;
+            }
+            const Vec3 q[3] = { this->Generators.Get(other[0]),
+                                this->Generators.Get(other[1]),
+                                this->Generators.Get(other[2]) };
+            if (exact::ImproperPair(p, this->Glued(labels), q, this->Glued(other)))
+            {
+              bad = true;
+              return false;
+            }
+            return true;
+          });
+        complete = complete && done;
+        return !bad;
+      });
+    return !bad;
   }
 
   /// Calls `visit(P, labels, t)` for every triangle of `K/ij` at the merged vertex `i`, realised
@@ -248,7 +390,8 @@ struct MergeContextPortals
 
   /// The local test of a merge of Section 11.5 but for the envelope: (F0) on the merged
   /// cluster and (F4) on the pairs with a triangle at the merged vertex. Sets `merged` to the
-  /// position of the merged generator.
+  /// position of the merged generator; a sheet cluster joining a frozen cluster leaves its
+  /// generator in place. (d') of such a merge is tested by `SheetMergeGlueTest`.
   VISKORES_EXEC bool Admissible(viskores::Id i, viskores::Id j, Vec3& merged, bool& complete) const;
 
   /// Visits the input triangles the envelope part of the local test reads, as `visit(t, tri,
@@ -299,6 +442,13 @@ struct MergeContextPortals
   Distance Output;
   IdPortal Glue;
   bool HasGlue;
+  /// With sheet merges: the frozen clusters, which a cluster of a sheet joins without moving
+  /// their generator, and the labels of every glue group, sorted by glue id.
+  FlagPortal FrozenLabels;
+  bool HasFrozen;
+  IdPortal GroupKeys;
+  IdPortal GroupOffsets;
+  IdPortal GroupLabels;
   bool GeometricOnly;
   Real MaxRadius;
   Real Epsilon;
@@ -314,26 +464,34 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
                                                           Vec3& merged,
                                                           bool& complete) const
 {
+  const bool fixed = this->HasFrozen && this->FrozenLabels.Get(i) != 0;
   Vec3 o, bm;
   Mat3 qm;
-  // The generator step (b) gives the merged cluster, by the same sums: tree sums over its
-  // members in increasing order, from the smallest (Theorem "budget" (v)).
-  viskores::Id a = this->MemberOffsets.Get(i), aEnd = this->MemberOffsets.Get(i + 1);
-  viskores::Id c = this->MemberOffsets.Get(j), cEnd = this->MemberOffsets.Get(j + 1);
-  o = this->Points.Get(viskores::Min(this->Anchors.Get(i), this->Anchors.Get(j)));
-  TreeSum<Mat3> qSum;
-  TreeSum<Vec3> bSum;
-  while (a < aEnd || c < cEnd)
+  if (fixed)
   {
-    const bool fromI = c >= cEnd || (a < aEnd && this->Members.Get(a) < this->Members.Get(c));
-    const viskores::Id v = fromI ? this->Members.Get(a++) : this->Members.Get(c++);
-    const Mat3 mv = this->VertexMatrices.Get(v);
-    qSum.Push(mv);
-    bSum.Push(MatVec(mv, Sub(this->Points.Get(v), o)));
+    merged = this->Generators.Get(i);
   }
-  qm = qSum.Result();
-  bm = bSum.Result();
-  merged = Add(o, SolveSPD(qm, bm));
+  else
+  {
+    // The generator step (b) gives the merged cluster, by the same sums: tree sums over its
+    // members in increasing order, from the smallest (Theorem "budget" (v)).
+    viskores::Id a = this->MemberOffsets.Get(i), aEnd = this->MemberOffsets.Get(i + 1);
+    viskores::Id c = this->MemberOffsets.Get(j), cEnd = this->MemberOffsets.Get(j + 1);
+    o = this->Points.Get(viskores::Min(this->Anchors.Get(i), this->Anchors.Get(j)));
+    TreeSum<Mat3> qSum;
+    TreeSum<Vec3> bSum;
+    while (a < aEnd || c < cEnd)
+    {
+      const bool fromI = c >= cEnd || (a < aEnd && this->Members.Get(a) < this->Members.Get(c));
+      const viskores::Id v = fromI ? this->Members.Get(a++) : this->Members.Get(c++);
+      const Mat3 mv = this->VertexMatrices.Get(v);
+      qSum.Push(mv);
+      bSum.Push(MatVec(mv, Sub(this->Points.Get(v), o)));
+    }
+    qm = qSum.Result();
+    bm = bSum.Result();
+    merged = Add(o, SolveSPD(qm, bm));
+  }
   auto forEachMember = [&](auto&& visit)
   {
     for (int which = 0; which < 2; ++which)
@@ -360,8 +518,12 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
   {
     return true;
   }
+  if (this->Embedding && fixed && !this->SheetMergeEmbedded(i, j, merged, complete))
+  {
+    return false;
+  }
   // (F4): the new triangles must be nondegenerate and meet no other triangle improperly.
-  if (this->Embedding)
+  if (this->Embedding && !fixed)
   {
     bool bad = false;
     this->ForEachNewTriangle(
@@ -726,6 +888,11 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
     portals.OutputDegenerate = this->OutputDegenerate.PrepareForInput(device, token);
     portals.Glue = this->Glue.PrepareForInput(device, token);
     portals.HasGlue = this->Glue.GetNumberOfValues() > 0;
+    portals.FrozenLabels = this->FrozenLabels.PrepareForInput(device, token);
+    portals.HasFrozen = this->FrozenLabels.GetNumberOfValues() > 0;
+    portals.GroupKeys = this->GroupKeys.PrepareForInput(device, token);
+    portals.GroupOffsets = this->GroupOffsets.PrepareForInput(device, token);
+    portals.GroupLabels = this->GroupLabels.PrepareForInput(device, token);
     portals.GeometricOnly = this->GeometricOnly;
     portals.Input = DistanceMeshObject(this->Input).PrepareForExecution(device, token);
     portals.Output = DistanceMeshObject(this->Output).PrepareForExecution(device, token);
@@ -743,6 +910,10 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
   viskores::cont::ArrayHandle<Mat3> VertexMatrices;
   viskores::cont::ArrayHandle<viskores::UInt8> OutputDegenerate;
   viskores::cont::ArrayHandle<viskores::Id> Glue;
+  viskores::cont::ArrayHandle<viskores::UInt8> FrozenLabels;
+  viskores::cont::ArrayHandle<viskores::Id> GroupKeys;
+  viskores::cont::ArrayHandle<viskores::Id> GroupOffsets;
+  viskores::cont::ArrayHandle<viskores::Id> GroupLabels;
   bool GeometricOnly = false;
   DistanceMesh Input;
   DistanceMesh Output;
@@ -1619,6 +1790,28 @@ struct InReducibleComponent : viskores::worklet::WorkletMapField
   }
 };
 
+/// Marks the label of a frozen vertex on the boundary of the cut; every write is a 1.
+struct MarkFrozenBoundary : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn frozen,
+                                FieldIn boundary,
+                                FieldIn label,
+                                WholeArrayOut labels);
+  using ExecutionSignature = void(_1, _2, _3, _4);
+
+  template <typename FlagsPortal>
+  VISKORES_EXEC void operator()(viskores::UInt8 frozen,
+                                viskores::UInt8 boundary,
+                                viskores::Id label,
+                                FlagsPortal& labels) const
+  {
+    if (frozen && boundary)
+    {
+      labels.Set(label, 1);
+    }
+  }
+};
+
 } // namespace detail
 
 /// The priority of a candidate merge `(i, j)`, smaller first: `max(D_0, deg i + deg j)`, the
@@ -1684,6 +1877,7 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
                                 WholeArrayIn degreeOffsets,
                                 WholeArrayIn faces,
                                 WholeArrayIn frozenLabels,
+                                WholeArrayIn frozenBoundary,
                                 WholeArrayIn contactOffsets,
                                 WholeArrayIn contacts,
                                 WholeArrayIn anchors,
@@ -1694,14 +1888,16 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
                                 FieldOut isCandidate,
                                 FieldOut record);
   using ExecutionSignature =
-    void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17);
+    void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18);
 
   VISKORES_CONT MergeCandidate(bool topological,
                                bool hasFrozen,
+                               bool faceMerges,
                                viskores::Id degreeFloor,
                                MergeOrder order)
     : Topological(topological)
     , HasFrozen(hasFrozen)
+    , FaceMerges(faceMerges)
     , DegreeFloor(degreeFloor)
     , Order(order)
   {
@@ -1721,6 +1917,7 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
                                 const IdPortal& degreeOffsets,
                                 const Id3Portal& faces,
                                 const FlagPortal& frozenLabels,
+                                const FlagPortal& frozenBoundary,
                                 const IdPortal& contactOffsets,
                                 const Id3Portal& contacts,
                                 const IdPortal& anchors,
@@ -1734,13 +1931,18 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
     const viskores::Id i = edge[0], j = edge[1];
     isCandidate = 0;
     record = MergePriority(0, { 0, { 0, edge } });
+    bool frozenJ = false;
     if (this->HasFrozen)
     {
+      // With face merges, a cluster of a sheet may join a frozen one, which keeps its label,
+      // if a frozen copy in it is on the boundary of the cut: a copy of a junction inside it (a
+      // pinch, or an edge of X that does not separate its sheet) never grows.
       const bool fi = frozenLabels.Get(i) != 0, fj = frozenLabels.Get(j) != 0;
-      if (fi || fj)
+      if ((fi || fj) && !(this->FaceMerges && fi != fj && frozenBoundary.Get(fi ? i : j)))
       {
         return;
       }
+      frozenJ = fj;
       // The glue condition: the merged cluster touches at most one copy of every frozen input
       // vertex. The contacts of each cluster are sorted by input vertex, then copy.
       viskores::Id a = contactOffsets.Get(i), aEnd = contactOffsets.Get(i + 1);
@@ -1820,6 +2022,8 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
     {
       record.second.first = viskores::Max(d, Real(0));
     }
+    // The pair merges its second cluster into its first, which a frozen cluster must be.
+    record.second.second.second = frozenJ ? viskores::Id2(j, i) : edge;
     if (this->DegreeFloor >= 0)
     {
       const viskores::Id degrees = (degreeOffsets.Get(i + 1) - degreeOffsets.Get(i)) +
@@ -1831,6 +2035,7 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
 
   bool Topological;
   bool HasFrozen;
+  bool FaceMerges;
   viskores::Id DegreeFloor;
   MergeOrder Order;
 };
@@ -1937,6 +2142,25 @@ struct MergeTops
       }
     }
     return merged;
+  }
+};
+
+/// Tests again the merges into a frozen cluster, the first of their pair, whose verdicts are not
+/// kept between rounds.
+struct RetestSheetMerge : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn pair, WholeArrayIn frozenLabels, FieldInOut memo);
+  using ExecutionSignature = void(_1, _2, _3);
+
+  template <typename FlagPortal>
+  VISKORES_EXEC void operator()(const viskores::Id2& pair,
+                                const FlagPortal& frozenLabels,
+                                viskores::UInt8& memo) const
+  {
+    if (frozenLabels.Get(pair[0]))
+    {
+      memo = Unknown;
+    }
   }
 };
 
@@ -2444,6 +2668,106 @@ inline void EvaluateMerges(const viskores::cont::ArrayHandle<viskores::Id2>& pai
 namespace detail
 {
 
+/// Whether an evaluated merge is a sheet merge that passed its local test.
+struct IsPassingSheetMerge : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn pair,
+                                FieldIn admissible,
+                                WholeArrayIn frozenLabels,
+                                FieldOut fixed);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename FlagPortal>
+  VISKORES_EXEC viskores::UInt8 operator()(const viskores::Id2& pair,
+                                           viskores::UInt8 admissible,
+                                           const FlagPortal& frozenLabels) const
+  {
+    return (admissible && frozenLabels.Get(pair[0])) ? 1 : 0;
+  }
+};
+
+/// The glue group of the frozen cluster of a sheet merge `(i, j)`, as an index of the groups,
+/// and the number of labels of its region: those of the group, and `j`.
+struct SheetRegionCount : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn pair,
+                                WholeArrayIn glue,
+                                WholeArrayIn groupKeys,
+                                WholeArrayIn groupOffsets,
+                                FieldOut group,
+                                FieldOut count);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+
+  template <typename IdPortal>
+  VISKORES_EXEC void operator()(const viskores::Id2& pair,
+                                const IdPortal& glue,
+                                const IdPortal& groupKeys,
+                                const IdPortal& groupOffsets,
+                                viskores::Id& group,
+                                viskores::Id& count) const
+  {
+    const viskores::Id key = glue.Get(pair[0]);
+    viskores::Id lo = LowerBound(groupKeys, 0, groupKeys.GetNumberOfValues(), key);
+    group = lo;
+    count = groupOffsets.Get(lo + 1) - groupOffsets.Get(lo) + 1;
+  }
+};
+
+/// A label of the region of a sheet merge: `(candidate, label, new label)`, the labels of the
+/// group staying, `j` joining `i`.
+struct SheetRegionLabel : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn item,
+                                WholeArrayIn itemOffsets,
+                                WholeArrayIn pairs,
+                                WholeArrayIn groups,
+                                WholeArrayIn groupOffsets,
+                                WholeArrayIn groupLabels,
+                                FieldOut record);
+  using ExecutionSignature = _7(_1, _2, _3, _4, _5, _6);
+
+  template <typename IdPortal, typename PairPortal>
+  VISKORES_EXEC viskores::Id3 operator()(viskores::Id item,
+                                         const IdPortal& itemOffsets,
+                                         const PairPortal& pairs,
+                                         const IdPortal& groups,
+                                         const IdPortal& groupOffsets,
+                                         const IdPortal& groupLabels) const
+  {
+    const viskores::Id c = OwnerOf(itemOffsets, item);
+    const viskores::Id k = item - itemOffsets.Get(c);
+    const viskores::Id g = groups.Get(c);
+    const viskores::Id size = groupOffsets.Get(g + 1) - groupOffsets.Get(g);
+    if (k < size)
+    {
+      const viskores::Id label = groupLabels.Get(groupOffsets.Get(g) + k);
+      return viskores::Id3(c, label, label);
+    }
+    return viskores::Id3(c, pairs.Get(c)[1], pairs.Get(c)[0]);
+  }
+};
+
+/// The relabel of a sheet merge, `(candidate, j, i)`, and its glue group, twice.
+struct SheetRelabel : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn pair,
+                                WholeArrayIn glue,
+                                FieldOut relabel,
+                                FieldOut groupGlue);
+  using ExecutionSignature = void(_1, _2, _3, _4, WorkIndex);
+
+  template <typename IdPortal>
+  VISKORES_EXEC void operator()(const viskores::Id2& pair,
+                                const IdPortal& glue,
+                                viskores::Id3& relabel,
+                                viskores::Id2& groupGlue,
+                                viskores::Id c) const
+  {
+    relabel = viskores::Id3(c, pair[1], pair[0]);
+    groupGlue = viskores::Id2(glue.Get(pair[0]), glue.Get(pair[0]));
+  }
+};
+
 /// A vertex of a label of a region: `(candidate, vertex, label, new label)`.
 struct RegionVertex : viskores::worklet::WorkletMapField
 {
@@ -2468,6 +2792,116 @@ struct RegionVertex : viskores::worklet::WorkletMapField
     return viskores::Vec<viskores::Id, 4>(record[0], v, record[1], record[2]);
   }
 };
+
+/// Clears the verdict of a sheet merge that violates (d').
+struct ClearViolating : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn index, FieldIn fires, WholeArrayInOut admissible);
+  using ExecutionSignature = void(_1, _2, _3);
+
+  template <typename FlagPortal>
+  VISKORES_EXEC void operator()(viskores::Id index,
+                                viskores::UInt8 fires,
+                                FlagPortal& admissible) const
+  {
+    if (fires)
+    {
+      admissible.Set(index, 0);
+    }
+  }
+};
+
+} // namespace detail
+
+/// (d') for the sheet merges among `evaluated` that passed their local test, as
+/// `merge_ok(fixed=True)` of proofs/lib/vqc.py, tested at the glued vertex of the frozen
+/// cluster in every sheet (`GroupGlueFires`); clears `admissible` for those that violate it.
+inline void SheetMergeGlueTest(const SurfaceMesh& mesh,
+                               const MergeParameters& parameters,
+                               const Clustering& clusters,
+                               const MergeContextObject& context,
+                               const viskores::cont::ArrayHandle<viskores::Id2>& evaluated,
+                               viskores::cont::ArrayHandle<viskores::UInt8>& admissible)
+{
+  using Algorithm = viskores::cont::Algorithm;
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::UInt8> isFixed;
+  invoke(detail::IsPassingSheetMerge{}, evaluated, admissible, context.FrozenLabels, isFixed);
+  viskores::cont::ArrayHandle<viskores::Id> indices;
+  Algorithm::CopyIf(
+    viskores::cont::ArrayHandleIndex(evaluated.GetNumberOfValues()), isFixed, indices);
+  const viskores::Id n = indices.GetNumberOfValues();
+  if (n == 0)
+  {
+    return;
+  }
+  viskores::cont::ArrayHandle<viskores::Id2> pairs;
+  Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(indices, evaluated), pairs);
+  CandidateRegions regions;
+  regions.NumberOfCandidates = n;
+  viskores::cont::ArrayHandle<viskores::Id> groups, counts, itemOffsets;
+  invoke(detail::SheetRegionCount{},
+         pairs,
+         context.Glue,
+         context.GroupKeys,
+         context.GroupOffsets,
+         groups,
+         counts);
+  const viskores::Id numItems = Algorithm::ScanExclusive(counts, itemOffsets);
+  invoke(detail::SheetRegionLabel{},
+         viskores::cont::ArrayHandleIndex(numItems),
+         itemOffsets,
+         pairs,
+         groups,
+         context.GroupOffsets,
+         context.GroupLabels,
+         regions.Labels);
+  Algorithm::Sort(regions.Labels);
+  regions.LabelOffsets = RecordOffsets(regions.Labels, n);
+  regions.LabelGenerators.AllocateAndFill(numItems, Vec3(0));
+  regions.LabelSizes.AllocateAndFill(numItems, 0);
+  invoke(detail::SheetRelabel{}, pairs, context.Glue, regions.Relabels, regions.GroupGlue);
+  regions.RelabelOffsets = RecordOffsets(regions.Relabels, n);
+  viskores::cont::ArrayHandle<viskores::Id> vertexCounts, vertexOffsets;
+  invoke(GatherComponent<1>{}, regions.Labels, clusters.Sizes, vertexCounts);
+  const viskores::Id numVertices = Algorithm::ScanExclusive(vertexCounts, vertexOffsets);
+  invoke(detail::RegionVertex{},
+         viskores::cont::ArrayHandleIndex(numVertices),
+         vertexOffsets,
+         regions.Labels,
+         clusters.Keys.GetOffsets(),
+         clusters.Keys.GetSortedValuesMap(),
+         regions.Vertices);
+  Algorithm::Sort(regions.Vertices);
+
+  viskores::cont::ArrayHandle<viskores::Id2> incident;
+  viskores::cont::ArrayHandle<viskores::Id> groupCandidates, groupOffsets, groupSources;
+  viskores::cont::ArrayHandle<viskores::Id3> groupTriangles;
+  GroupTriangles(mesh,
+                 clusters,
+                 context.Glue,
+                 regions,
+                 incident,
+                 groupCandidates,
+                 groupTriangles,
+                 groupOffsets,
+                 groupSources);
+  viskores::cont::ArrayHandle<viskores::UInt8> fires;
+  fires.AllocateAndFill(n, 0);
+  GroupGlueFires(mesh,
+                 parameters.Original,
+                 *parameters.Curves,
+                 clusters,
+                 context.Glue,
+                 regions,
+                 groupCandidates,
+                 groupTriangles,
+                 fires);
+  invoke(detail::ClearViolating{}, indices, fires, admissible);
+}
+
+namespace detail
+{
 
 struct ScatterAdmissible : viskores::worklet::WorkletMapField
 {
@@ -2567,6 +3001,7 @@ inline void PlaceGlued(const SurfaceMesh& mesh,
   if (parameters.Curves)
   {
     PlaceCurveGenerators(mesh,
+                         quadrics.M,
                          *parameters.Curves,
                          parameters.FrozenVertices,
                          parameters.Original,
@@ -3499,9 +3934,21 @@ void MergePhase(const SurfaceMesh& mesh,
         BothDirections{}, candidateEdges, viskores::cont::make_ArrayHandleGroupVec<2>(adjacency));
       BuildAdjacency(adjacency, k, conflictOffsets, conflictNeighbors);
     }
-    // No merge involves a frozen cluster, and none joins two copies of one frozen vertex.
+    // No merge involves a frozen cluster but a sheet merge, and none joins two copies of one
+    // frozen vertex.
     const viskores::cont::ArrayHandle<viskores::UInt8> frozenLabels =
       FrozenLabels(parameters.FrozenVertices, clusters);
+    // The frozen clusters a cluster of a sheet may join.
+    viskores::cont::ArrayHandle<viskores::UInt8> frozenBoundary;
+    if (parameters.FaceMerges && frozenLabels.GetNumberOfValues() > 0)
+    {
+      frozenBoundary.AllocateAndFill(k, 0);
+      invoke(detail::MarkFrozenBoundary{},
+             parameters.FrozenVertices,
+             mesh.IsBoundaryVertex,
+             clusters.Labels,
+             frozenBoundary);
+    }
     viskores::cont::ArrayHandle<viskores::Id> contactOffsets;
     viskores::cont::ArrayHandle<viskores::Id3> contacts;
     if (parameters.FrozenVertices.GetNumberOfValues() > 0)
@@ -3517,6 +3964,7 @@ void MergePhase(const SurfaceMesh& mesh,
     viskores::cont::ArrayHandle<MergePriority> records, candidates;
     invoke(detail::MergeCandidate(parameters.Topological,
                                   frozenLabels.GetNumberOfValues() > 0,
+                                  parameters.FaceMerges,
                                   parameters.DegreeFloor,
                                   parameters.Order),
            candidateEdges,
@@ -3527,6 +3975,7 @@ void MergePhase(const SurfaceMesh& mesh,
            conflictOffsets,
            complex.Faces,
            frozenLabels,
+           frozenBoundary,
            contactOffsets,
            contacts,
            clusters.Anchors,
@@ -3560,6 +4009,15 @@ void MergePhase(const SurfaceMesh& mesh,
     context.Glue = OutputGlue(parameters, clusters);
     context.Sides = parameters.Sides;
     context.GeometricOnly = !parameters.Topological;
+    if (parameters.FaceMerges && frozenLabels.GetNumberOfValues() > 0)
+    {
+      context.FrozenLabels = frozenLabels;
+      viskores::worklet::Keys<viskores::Id> groups;
+      groups.BuildArrays(context.Glue, viskores::worklet::KeysSortType::Stable);
+      context.GroupKeys = groups.GetUniqueKeys();
+      context.GroupOffsets = groups.GetOffsets();
+      context.GroupLabels = groups.GetSortedValuesMap();
+    }
     if (geometric)
     {
       invoke(detail::ExactlyDegenerate{},
@@ -3587,6 +4045,10 @@ void MergePhase(const SurfaceMesh& mesh,
     if (geometric)
     {
       diagnostics.Reused += verdicts.Reuse(context, clusters, pairs, memo);
+    }
+    if (geometric && parameters.FaceMerges && frozenLabels.GetNumberOfValues() > 0)
+    {
+      invoke(detail::RetestSheetMerge{}, pairs, frozenLabels, memo);
     }
     viskores::cont::ArrayHandle<viskores::Id2> committedPairs;
     // The merges deferred as culprits of a batch in this round, never tested alone.
@@ -3626,6 +4088,10 @@ void MergePhase(const SurfaceMesh& mesh,
           viskores::cont::ArrayHandle<viskores::UInt8> admissible;
           viskores::cont::ArrayHandle<Vec3> mergedPositions, lower, upper;
           EvaluateMerges(evaluated, context, admissible, mergedPositions, lower, upper);
+          if (parameters.Curves && context.FrozenLabels.GetNumberOfValues() > 0)
+          {
+            SheetMergeGlueTest(mesh, parameters, clusters, context, evaluated, admissible);
+          }
           invoke(detail::ScatterAdmissible{}, toEvaluate, admissible, memo);
           verdicts.Remember(
             context, clusters, evaluated, admissible, mergedPositions, lower, upper);

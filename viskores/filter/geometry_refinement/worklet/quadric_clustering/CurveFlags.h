@@ -36,8 +36,9 @@ namespace quadric_clustering
 ///
 /// The input polyline of an arc runs through its end junctions and its vertices; the output
 /// polyline through its ends, realised at their junction clusters, and one point per segment
-/// (the heads, in order), at the generator of its pieces; a closed arc closes back to its first
-/// point. Every point has an owner, the segment (its first vertex) or the junction it belongs to.
+/// (the alive heads, in order), at the generator of its pieces; a closed arc closes back to its
+/// first point. Every point has an owner, the segment (its first vertex) or the junction it
+/// belongs to; a vertex absorbed into a junction belongs to the junction.
 struct CurvePolylines
 {
   viskores::Id NumberOfArcs = 0;
@@ -54,8 +55,8 @@ struct CurvePolylines
   viskores::cont::ArrayHandle<Vec3> OutputPoints;
   viskores::cont::ArrayHandle<viskores::Id> OutputOwners;
   viskores::cont::ArrayHandle<viskores::Id> OutputHints;
-  /// Per position of `ArcVertices`: the local index of its output point if it is the head of a
-  /// segment, or -1.
+  /// Per position of `ArcVertices`: the local index of its output point if it is the head of an
+  /// alive segment, or -1.
   viskores::cont::ArrayHandle<viskores::Id> OutputOfPosition;
   /// Per arc: the offsets of its edge tests, the edges of its input polyline first, then those
   /// of its output polyline.
@@ -67,16 +68,29 @@ struct CurvePolylines
 namespace curve_test_detail
 {
 
-/// Whether a position of an arc is the head of a segment.
+/// Whether a position of an arc is the head of an alive segment.
 struct AliveHead : viskores::worklet::WorkletMapField
 {
-  using ControlSignature = void(FieldIn position, WholeArrayIn segmentHead, FieldOut alive);
-  using ExecutionSignature = _3(_1, _2);
+  using ControlSignature = void(FieldIn position,
+                                FieldIn arc,
+                                WholeArrayIn segmentHead,
+                                WholeArrayIn arcOffsets,
+                                WholeArrayIn absorbed,
+                                FieldOut alive);
+  using ExecutionSignature = _6(_1, _2, _3, _4, _5);
 
-  template <typename FlagPortal>
-  VISKORES_EXEC viskores::Id operator()(viskores::Id p, const FlagPortal& segmentHead) const
+  template <typename FlagPortal, typename IdPortal, typename PairPortal>
+  VISKORES_EXEC viskores::Id operator()(viskores::Id p,
+                                        viskores::Id a,
+                                        const FlagPortal& segmentHead,
+                                        const IdPortal& arcOffsets,
+                                        const PairPortal& absorbed) const
   {
-    return segmentHead.Get(p) ? 1 : 0;
+    const viskores::Id2 abs = absorbed.Get(a);
+    return (segmentHead.Get(p) && p >= arcOffsets.Get(a) + abs[0] &&
+            p < arcOffsets.Get(a + 1) - abs[1])
+      ? 1
+      : 0;
   }
 };
 
@@ -114,8 +128,8 @@ struct PolylineCounts : viskores::worklet::WorkletMapField
   }
 };
 
-/// The input point of a position of an arc, with its owner and the output point of its segment;
-/// the output point of a head.
+/// The input point of a position of an arc, with its owner and the output point of its segment
+/// (the junction's for an absorbed vertex); the output point of an alive head.
 struct PositionPoints : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn position,
@@ -168,13 +182,22 @@ struct PositionPoints : viskores::worklet::WorkletMapField
   {
     const bool isClosed = closed.Get(a) != 0;
     const viskores::Id shift = isClosed ? 0 : 1;
-    const viskores::Id start = curves.ArcOffsets.Get(a);
+    const viskores::Id start = curves.ArcOffsets.Get(a), end = curves.ArcOffsets.Get(a + 1);
+    const viskores::Id2 abs = curves.Absorbed.Get(a);
     const viskores::Id v = curves.ArcVertices.Get(p);
     const viskores::Id outputCount = outputOffsets.Get(a + 1) - outputOffsets.Get(a);
-    // The heads before p, and the output point of p's segment.
+    // The alive heads before p, and the output point of p's segment.
     const viskores::Id before = headOffset - curves.HeadOffsets.Get(start);
     viskores::Id hint;
-    if (before + alive == 0)
+    if (p < start + abs[0])
+    {
+      hint = 0;
+    }
+    else if (p >= end - abs[1])
+    {
+      hint = outputCount - 1;
+    }
+    else if (before + alive == 0)
     {
       hint = outputCount - 1; // a closed arc's last segment, which wraps around
     }
@@ -198,12 +221,14 @@ struct PositionPoints : viskores::worklet::WorkletMapField
   }
 };
 
-/// The curves in the execution environment, with the head offsets.
+/// The curves in the execution environment, with the alive-head offsets.
 struct CurvesPortals
 {
   using IdPortal = viskores::cont::ArrayHandle<viskores::Id>::ReadPortalType;
+  using PairPortal = viskores::cont::ArrayHandle<viskores::Id2>::ReadPortalType;
   IdPortal ArcOffsets;
   IdPortal ArcVertices;
+  PairPortal Absorbed;
   IdPortal Segment;
   IdPortal HeadOffsets;
 };
@@ -221,6 +246,7 @@ struct CurvesObject : viskores::cont::ExecutionObjectBase
   {
     return CurvesPortals{ this->Curves->ArcOffsets.PrepareForInput(device, token),
                           this->Curves->ArcVertices.PrepareForInput(device, token),
+                          this->Curves->Absorbed.PrepareForInput(device, token),
                           this->Curves->Segment.PrepareForInput(device, token),
                           this->HeadOffsets.PrepareForInput(device, token) };
   }
@@ -314,8 +340,13 @@ inline CurvePolylines BuildCurvePolylines(
   Algorithm::UpperBounds(viskores::cont::make_ArrayHandleView(curves.ArcOffsets, 1, numArcs),
                          viskores::cont::ArrayHandleIndex(numPositions),
                          arcOfPosition);
-  invoke(
-    cd::AliveHead{}, viskores::cont::ArrayHandleIndex(numPositions), curves.SegmentHead, alive);
+  invoke(cd::AliveHead{},
+         viskores::cont::ArrayHandleIndex(numPositions),
+         arcOfPosition,
+         curves.SegmentHead,
+         curves.ArcOffsets,
+         curves.Absorbed,
+         alive);
   Algorithm::ScanExtended(alive, headOffsets);
   viskores::cont::ArrayHandle<viskores::Id> inputCounts, outputCounts, itemCounts;
   invoke(cd::PolylineCounts{},
@@ -796,7 +827,8 @@ inline viskores::Id CurveFlags(const SurfaceMesh& mesh,
 }
 
 /// Per candidate merge of segments: its arc, the position of the head of the segment whose
-/// point it removes from the output polyline, and that of the segment whose point it moves.
+/// point it removes from the output polyline, and that of the segment whose point it moves, or
+/// -1.
 struct CurveCandidates
 {
   viskores::cont::ArrayHandle<viskores::Id> Arc;
@@ -902,7 +934,8 @@ VISKORES_EXEC CandidateChange ChangeOf(viskores::Id c,
   CandidateChange change;
   change.Arc = arcs.Get(c);
   change.Removed = polylines.OutputOfPosition.Get(removed.Get(c));
-  change.Moved = polylines.OutputOfPosition.Get(moved.Get(c));
+  const viskores::Id m = moved.Get(c);
+  change.Moved = (m >= 0) ? polylines.OutputOfPosition.Get(m) : viskores::Id(-1);
   change.MovedPoint = movedPoints.Get(c);
   change.ChangesScale = scales.Get(c) != baseScale;
   return change;
