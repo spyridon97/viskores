@@ -802,6 +802,7 @@ std::vector<HostArc> HostArcs(const viskores::worklet::quadric_clustering::Singu
   const auto ends = ToVector(curves.ArcEnds);
   const auto head = ToVector(curves.SegmentHead);
   const auto firstHead = ToVector(curves.FirstHead);
+  const auto absorbed = ToVector(curves.Absorbed);
   std::vector<HostArc> arcs(static_cast<std::size_t>(curves.NumberOfArcs));
   for (std::size_t a = 0; a < arcs.size(); ++a)
   {
@@ -810,12 +811,13 @@ std::vector<HostArc> HostArcs(const viskores::worklet::quadric_clustering::Singu
     arc.Closed = ends[a][0] < 0;
     arc.Ends = ends[a];
     arc.Vertices.assign(vertices.begin() + start, vertices.begin() + end);
-    // The heads, along an open arc or around a closed arc from its first head.
+    // The heads alive, along an open arc or around a closed arc from its first head.
     std::vector<viskores::Id> heads;
     for (viskores::Id i = 0; i < length; ++i)
     {
       const viskores::Id p = arc.Closed ? start + (firstHead[a] - start + i) % length : start + i;
-      if (head[static_cast<std::size_t>(p)])
+      if (head[static_cast<std::size_t>(p)] && p >= start + absorbed[a][0] &&
+          p < end - absorbed[a][1])
       {
         heads.push_back(p);
       }
@@ -830,7 +832,7 @@ std::vector<HostArc> HostArcs(const viskores::worklet::quadric_clustering::Singu
       }
       else
       {
-        next = (s + 1 < heads.size()) ? heads[s + 1] : end;
+        next = (s + 1 < heads.size()) ? heads[s + 1] : end - absorbed[a][1];
       }
       std::vector<viskores::Id> segment;
       for (viskores::Id p = heads[s]; p < next; ++p)

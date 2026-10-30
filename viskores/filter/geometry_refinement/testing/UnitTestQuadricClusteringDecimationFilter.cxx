@@ -66,6 +66,9 @@ void TestParameters()
                        "NoSelfIntersections without Topology should be rejected.");
   VISKORES_TEST_ASSERT(rejects([](Filter& f) { f.SetGuarantees(Filter::SingularCurves); }),
                        "SingularCurves without Topology should be rejected.");
+  VISKORES_TEST_ASSERT(
+    rejects([](Filter& f) { f.SetGuarantees(f.GetGuarantees() | Filter::Creases); }),
+    "Creases is not implemented yet.");
   VISKORES_TEST_ASSERT(!rejects([](Filter& f) { f.SetGuarantees(0); }),
                        "The geometric-only mode should run.");
   VISKORES_TEST_ASSERT(rejects(
