@@ -11,6 +11,7 @@ set(headers
   Extrusion.h
   ExtrusionLinear.h
   ExtrusionRotational.h
+  QuadricClusteringDecimation.h
   Shrink.h
   SplitSharpEdges.h
   Tetrahedralize.h
@@ -19,6 +20,7 @@ set(headers
   VertexClustering.h
   )
 
+add_subdirectory(quadric_clustering)
 add_subdirectory(tetrahedralize)
 add_subdirectory(triangulate)
 
