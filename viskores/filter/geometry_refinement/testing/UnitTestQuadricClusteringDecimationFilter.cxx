@@ -63,6 +63,8 @@ void TestParameters()
                        "Unknown guarantee bits should be rejected.");
   VISKORES_TEST_ASSERT(rejects([](Filter& f) { f.SetGuarantees(Filter::NoSelfIntersections); }),
                        "NoSelfIntersections without Topology should be rejected.");
+  VISKORES_TEST_ASSERT(!rejects([](Filter& f) { f.SetGuarantees(0); }),
+                       "The geometric-only mode should run.");
   VISKORES_TEST_ASSERT(rejects(
                          [](Filter& f)
                          {
@@ -71,6 +73,13 @@ void TestParameters()
                                            ~viskores::UInt32(Filter::TwoSidedError));
                          }),
                        "An error bound without a side should be rejected.");
+  VISKORES_TEST_ASSERT(rejects(
+                         [](Filter& f)
+                         {
+                           f.SetErrorBound(0.1);
+                           f.SetGuarantees(Filter::ErrorOutputToInput);
+                         }),
+                       "The geometric-only mode with one side should be rejected.");
   VISKORES_TEST_ASSERT(!rejects(
                          [](Filter& f)
                          {

@@ -27,6 +27,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <set>
 #include <tuple>
 
 namespace
@@ -658,6 +659,200 @@ void TestLoop()
   RunChecked(holed, Augmented());
 }
 
+/// The output cells of a run as triples of output points: a segment `(a, b, b)`, a point
+/// `(a, a, a)`.
+std::vector<viskores::Id3> OutputCells(const Decimation& decimation)
+{
+  const auto shapes = ToVector(decimation.GetOutputCellShapes());
+  const auto offsets = ToVector(decimation.GetOutputCellOffsets());
+  const auto connectivity = ToVector(decimation.GetOutputCellConnectivity());
+  std::vector<viskores::Id3> cells;
+  for (std::size_t c = 0; c < shapes.size(); ++c)
+  {
+    const std::size_t o = static_cast<std::size_t>(offsets[c]);
+    const std::size_t size = static_cast<std::size_t>(offsets[c + 1]) - o;
+    viskores::Id3 cell;
+    for (std::size_t k = 0; k < 3; ++k)
+    {
+      cell[static_cast<viskores::IdComponent>(k)] = connectivity[o + std::min(k, size - 1)];
+    }
+    cells.push_back(cell);
+  }
+  return cells;
+}
+
+Decimation::Parameters NonManifoldParameters(const Mesh& mesh)
+{
+  Decimation::Parameters p = Plain();
+  p.Embedding = true;
+  p.ErrorBound = 0.01 * LargestSide(mesh);
+  p.Merge = true;
+  p.MergeDegreeFloor = 12;
+  return p;
+}
+
+/// Theorem "Inputs that are not surfaces" on the glued output, and its size against the
+/// reference: proofs/lib/vqc.py on the cut of proofs/lib/nonmanifold.py, with the hash order
+/// of the copies.
+void TestNonManifold()
+{
+  std::cout << "Cut: two boxes sharing an edge, plain quadric, error mode" << std::endl;
+  const Mesh boxes = qcd_test::BoxesSharingAnEdge();
+  const Decimation::Parameters parameters = NonManifoldParameters(boxes);
+  Decimation decimation;
+  decimation.SetParameters(parameters);
+  decimation.Run(boxes.PointArray(), boxes.TriangleArray());
+  const auto points = ToVector(decimation.GetOutputPoints());
+  const auto triangles = ToVector(decimation.GetOutputTriangles());
+  const auto cells = OutputCells(decimation);
+  const viskores::Id k = static_cast<viskores::Id>(points.size());
+  std::cout << "  n = " << boxes.Points.size() << ", copies = " << decimation.GetMesh().NumberOfPoints
+            << ", clusters after the loop " << decimation.GetNumberOfClustersAfterLoop()
+            << ", glued output " << k << std::endl;
+  VISKORES_TEST_ASSERT(decimation.GetNumberOfClustersAfterLoop() == 168 &&
+                         decimation.GetNumberOfClusters() == 66 &&
+                         decimation.GetDiagnostics().Rounds == 16 &&
+                         decimation.GetMergeDiagnostics().Rounds == 8,
+                       "The cut run differs from the reference.");
+
+  // (ii): the singular edges and the fans at every vertex are those of the input, at the frozen
+  // vertices, which keep their positions; every other vertex is a surface vertex.
+  const auto map = ToVector(decimation.GetOutputPointMap());
+  const auto originals = ToVector(decimation.GetCopyOriginals());
+  const auto frozenCopies = ToVector(decimation.GetFrozenCopies());
+  std::set<viskores::Id> frozen;
+  for (std::size_t c = 0; c < originals.size(); ++c)
+  {
+    if (frozenCopies[c])
+    {
+      frozen.insert(originals[c]);
+    }
+  }
+  const auto in =
+    qcd_test::SingularStructure(static_cast<viskores::Id>(boxes.Points.size()), boxes.Triangles);
+  const auto out = qcd_test::SingularStructure(k, cells);
+  std::set<std::pair<viskores::Id, viskores::Id>> mapped;
+  for (const auto& e : in.first)
+  {
+    const viskores::Id a = map[static_cast<std::size_t>(e.first)];
+    const viskores::Id b = map[static_cast<std::size_t>(e.second)];
+    mapped.insert(std::make_pair(std::min(a, b), std::max(a, b)));
+  }
+  VISKORES_TEST_ASSERT(mapped == out.first, "The singular edges of the output differ.");
+  std::vector<bool> isFrozenOutput(static_cast<std::size_t>(k), false);
+  for (viskores::Id v : frozen)
+  {
+    const std::size_t o = static_cast<std::size_t>(map[static_cast<std::size_t>(v)]);
+    isFrozenOutput[o] = true;
+    VISKORES_TEST_ASSERT(std::memcmp(&points[o], &boxes.Points[static_cast<std::size_t>(v)], sizeof(Vec3)) == 0,
+                         "A frozen vertex moved.");
+    VISKORES_TEST_ASSERT(out.second[o] == in.second[static_cast<std::size_t>(v)],
+                         "A frozen vertex has another number of fans.");
+  }
+  for (std::size_t o = 0; o < static_cast<std::size_t>(k); ++o)
+  {
+    VISKORES_TEST_ASSERT(isFrozenOutput[o] || out.second[o] == 1, "A vertex that is not frozen is singular.");
+  }
+  VISKORES_TEST_ASSERT(
+    qcd_test::EulerCharacteristic(k, cells) ==
+      qcd_test::EulerCharacteristic(static_cast<viskores::Id>(boxes.Points.size()), boxes.Triangles),
+    "The glued output has another Euler characteristic.");
+
+  // (iii): an exact all-pairs test finds no improper pair of glued output triangles.
+  VISKORES_TEST_ASSERT(triangles.size() == cells.size(), "The glued output has cells that are not triangles.");
+  for (std::size_t i = 0; i < cells.size(); ++i)
+  {
+    const Vec3 p[3] = { points[static_cast<std::size_t>(cells[i][0])],
+                        points[static_cast<std::size_t>(cells[i][1])],
+                        points[static_cast<std::size_t>(cells[i][2])] };
+    VISKORES_TEST_ASSERT(!viskores::TriangleIsDegenerate(p[0], p[1], p[2]), "A degenerate output triangle.");
+    for (std::size_t j = i + 1; j < cells.size(); ++j)
+    {
+      const Vec3 q[3] = { points[static_cast<std::size_t>(cells[j][0])],
+                          points[static_cast<std::size_t>(cells[j][1])],
+                          points[static_cast<std::size_t>(cells[j][2])] };
+      VISKORES_TEST_ASSERT(!qc::exact::ImproperPair(p, cells[i], q, cells[j]), "The glued output intersects itself.");
+    }
+  }
+
+  // (iv): within epsilon_H.
+  const double hausdorff = qcd_test::SampledHausdorff(
+    boxes.Points, boxes.Triangles, points, cells, parameters.ErrorBound / 4);
+  std::cout << "  sampled Hausdorff distance " << hausdorff / parameters.ErrorBound << " epsilon_H"
+            << std::endl;
+  VISKORES_TEST_ASSERT(hausdorff <= parameters.ErrorBound, "The glued output is not within epsilon_H.");
+}
+
+Decimation::Parameters GeometricOnly(Decimation::Parameters p, double errorBound)
+{
+  p.GeometricOnly = true;
+  p.ErrorBound = errorBound;
+  p.Merge = true;
+  p.MergeDegreeFloor = 12;
+  return p;
+}
+
+/// Proposition "Geometric-only mode": the output simplices are within epsilon_H of the input
+/// with (F5'), every vertex within r_max of its generator with (F0), and at least `k*` clusters
+/// after the loop with (Fb); sizes against proofs/lib/vqc.py (GeometricVQC) with the hash order.
+void CheckGeometricOnly(const Mesh& mesh,
+                        const Decimation::Parameters& parameters,
+                        viskores::Id loop,
+                        viskores::Id merged,
+                        viskores::Id rounds,
+                        viskores::Id mergeRounds)
+{
+  Decimation decimation;
+  decimation.SetParameters(parameters);
+  decimation.Run(mesh.PointArray(), mesh.TriangleArray());
+  std::cout << "  n = " << mesh.Points.size() << ", k after the loop "
+            << decimation.GetNumberOfClustersAfterLoop() << ", k " << decimation.GetNumberOfClusters()
+            << std::endl;
+  VISKORES_TEST_ASSERT(decimation.GetNumberOfClustersAfterLoop() == loop &&
+                         decimation.GetNumberOfClusters() == merged &&
+                         decimation.GetDiagnostics().Rounds == rounds &&
+                         decimation.GetMergeDiagnostics().Rounds == mergeRounds,
+                       "The geometric-only run differs from the reference.");
+  const auto labels = ToVector(decimation.GetLabels());
+  const auto generators = GeneratorVector(decimation);
+  for (std::size_t v = 0; v < labels.size(); ++v)
+  {
+    VISKORES_TEST_ASSERT(
+      qcd_test::Norm(generators[static_cast<std::size_t>(labels[v])] - mesh.Points[v]) <=
+        parameters.MaxClusterRadius,
+      "A vertex is farther than r_max from its generator.");
+  }
+  VISKORES_TEST_ASSERT(parameters.TargetNumberOfPoints == 0 ||
+                         decimation.GetNumberOfClustersAfterLoop() >= parameters.TargetNumberOfPoints,
+                       "The loop stopped below k*.");
+  if (parameters.ErrorBound > 0)
+  {
+    const double hausdorff = qcd_test::SampledHausdorff(mesh.Points,
+                                                        mesh.Triangles,
+                                                        ToVector(decimation.GetOutputPoints()),
+                                                        OutputCells(decimation),
+                                                        parameters.ErrorBound / 4);
+    std::cout << "  sampled Hausdorff distance " << hausdorff / parameters.ErrorBound << " epsilon_H"
+              << std::endl;
+    VISKORES_TEST_ASSERT(hausdorff <= parameters.ErrorBound, "The simplices are not within epsilon_H.");
+  }
+}
+
+void TestGeometricOnly()
+{
+  const Mesh boxes = qcd_test::BoxesSharingAnEdge();
+  std::cout << "Geometric-only: two boxes sharing an edge, error mode" << std::endl;
+  CheckGeometricOnly(boxes, GeometricOnly(Plain(0), 0.01 * LargestSide(boxes)), 168, 43, 12, 13);
+  std::cout << "Geometric-only: two boxes sharing an edge, budget 30, radius cap" << std::endl;
+  CheckGeometricOnly(boxes, GeometricOnly(Plain(30, 0.16), 0), 167, 144, 13, 4);
+  std::cout << "Geometric-only: plate with two holes, error mode" << std::endl;
+  const Mesh plate = qcd_test::VoxelSolid(qcd_test::PlateWithHoles(2), 0.25);
+  CheckGeometricOnly(plate, GeometricOnly(Plain(0), 0.01 * LargestSide(plate)), 145, 39, 13, 14);
+  std::cout << "Geometric-only: sphere, error mode" << std::endl;
+  const Mesh sphere = qcd_test::Icosphere(3);
+  CheckGeometricOnly(sphere, GeometricOnly(Plain(0), 0.01 * LargestSide(sphere)), 209, 115, 10, 6);
+}
+
 /// Invariant 9: the output is bitwise identical across runs and devices.
 void CheckDeterministic(const Mesh& mesh, const Decimation::Parameters& parameters)
 {
@@ -705,6 +900,12 @@ void TestDeterminism()
 {
   std::cout << "Determinism across runs and devices: annulus, budget mode" << std::endl;
   CheckDeterministic(qcd_test::Annulus(), Augmented(40));
+  const Mesh boxes = qcd_test::BoxesSharingAnEdge();
+  std::cout << "Determinism across runs and devices: two boxes sharing an edge, cut" << std::endl;
+  CheckDeterministic(boxes, NonManifoldParameters(boxes));
+  std::cout << "Determinism across runs and devices: two boxes sharing an edge, geometric-only"
+            << std::endl;
+  CheckDeterministic(boxes, GeometricOnly(Plain(0), 0.01 * LargestSide(boxes)));
 }
 
 void TestInvalidInput()
@@ -780,6 +981,8 @@ void TestQuadricClusteringDecimationWorklet()
   TestEnvelope();
   TestErrorSides();
   TestMerge();
+  TestNonManifold();
+  TestGeometricOnly();
   TestDeterminism();
   TestInvalidInput();
 }

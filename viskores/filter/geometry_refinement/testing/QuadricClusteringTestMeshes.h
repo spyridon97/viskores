@@ -396,6 +396,77 @@ inline Mesh Genus2PlateWithOpening()
                          });
 }
 
+/// Appends the surface of the box `[lo, hi]` with an `n` by `n` grid on every face, outward, to
+/// `mesh`, sharing the points already in `index`, as `_box` of proofs/lib/nonmanifold.py.
+inline void AppendBox(const Vec3& lo,
+                      const Vec3& hi,
+                      int n,
+                      Mesh& mesh,
+                      std::map<std::array<double, 3>, viskores::Id>& index)
+{
+  auto vid = [&](const Vec3& p)
+  {
+    const std::array<double, 3> key = { p[0], p[1], p[2] };
+    const auto found = index.find(key);
+    if (found != index.end())
+    {
+      return found->second;
+    }
+    const viskores::Id id = static_cast<viskores::Id>(mesh.Points.size());
+    index.emplace(key, id);
+    mesh.Points.push_back(p);
+    return id;
+  };
+  for (int ax = 0; ax < 3; ++ax)
+  {
+    const int u = (ax + 1) % 3, w = (ax + 2) % 3;
+    for (int side = 0; side < 2; ++side)
+    {
+      std::vector<std::vector<viskores::Id>> g(static_cast<std::size_t>(n + 1),
+                                               std::vector<viskores::Id>(static_cast<std::size_t>(n + 1)));
+      for (int i = 0; i <= n; ++i)
+      {
+        for (int j = 0; j <= n; ++j)
+        {
+          Vec3 p = lo;
+          p[ax] = side ? hi[ax] : lo[ax];
+          p[u] = lo[u] + (hi[u] - lo[u]) * i / n;
+          p[w] = lo[w] + (hi[w] - lo[w]) * j / n;
+          g[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] = vid(p);
+        }
+      }
+      for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i)
+      {
+        for (std::size_t j = 0; j < static_cast<std::size_t>(n); ++j)
+        {
+          const viskores::Id a = g[i][j], b = g[i + 1][j], c = g[i + 1][j + 1], d = g[i][j + 1];
+          if (side)
+          {
+            mesh.Triangles.push_back({ a, b, c });
+            mesh.Triangles.push_back({ a, c, d });
+          }
+          else
+          {
+            mesh.Triangles.push_back({ a, c, b });
+            mesh.Triangles.push_back({ a, d, c });
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Two boxes that touch along one edge, every segment of which lies in four triangles: an
+/// embedded complex that is not a surface (proofs/lib/nonmanifold.boxes_sharing_edge).
+inline Mesh BoxesSharingAnEdge(int n = 5)
+{
+  Mesh mesh;
+  std::map<std::array<double, 3>, viskores::Id> index;
+  AppendBox(Vec3(0, 0, 0), Vec3(1, 1, 1), n, mesh, index);
+  AppendBox(Vec3(1, 1, 0), Vec3(2, 2, 1), n, mesh, index);
+  return mesh;
+}
+
 /// Two icospheres whose centres are half a radius apart: a closed surface whose components
 /// cross each other, so not embedded.
 inline Mesh OverlappingIcospheres(int level)
@@ -535,6 +606,68 @@ inline viskores::Id EulerCharacteristic(viskores::Id numVertices,
 {
   return numVertices - static_cast<viskores::Id>(EdgeCounts(triangles).size()) +
     static_cast<viskores::Id>(triangles.size());
+}
+
+/// The data a homeomorphism fixing the vertices must preserve, as `singular_structure` of
+/// proofs/lib/nonmanifold.py: the edges in three or more triangles, and the number of fans at
+/// every vertex, the triangles around it joined across its other edges.
+inline std::pair<std::set<std::pair<viskores::Id, viskores::Id>>, std::vector<int>> SingularStructure(
+  viskores::Id numVertices,
+  const std::vector<viskores::Id3>& triangles)
+{
+  std::set<std::pair<viskores::Id, viskores::Id>> singular;
+  for (const auto& e : EdgeCounts(triangles))
+  {
+    if (e.second >= 3)
+    {
+      singular.insert(e.first);
+    }
+  }
+  std::vector<int> fans(static_cast<std::size_t>(numVertices), 0);
+  std::vector<std::vector<std::size_t>> around(static_cast<std::size_t>(numVertices));
+  for (std::size_t t = 0; t < triangles.size(); ++t)
+  {
+    for (int k = 0; k < 3; ++k)
+    {
+      around[static_cast<std::size_t>(triangles[t][k])].push_back(t);
+    }
+  }
+  for (viskores::Id v = 0; v < numVertices; ++v)
+  {
+    const auto& ts = around[static_cast<std::size_t>(v)];
+    std::vector<std::size_t> parent(ts.size());
+    for (std::size_t i = 0; i < ts.size(); ++i)
+    {
+      parent[i] = i;
+    }
+    std::function<std::size_t(std::size_t)> find = [&](std::size_t x)
+    { return parent[x] == x ? x : parent[x] = find(parent[x]); };
+    for (std::size_t i = 0; i < ts.size(); ++i)
+    {
+      for (std::size_t j = i + 1; j < ts.size(); ++j)
+      {
+        // Joined across an edge at v that is not singular.
+        for (int a = 0; a < 3; ++a)
+        {
+          const viskores::Id x = triangles[ts[i]][a];
+          bool shared = false;
+          for (int b = 0; b < 3; ++b)
+          {
+            shared = shared || triangles[ts[j]][b] == x;
+          }
+          if (x != v && shared && !singular.count(std::make_pair(std::min(v, x), std::max(v, x))))
+          {
+            parent[find(i)] = find(j);
+          }
+        }
+      }
+    }
+    for (std::size_t i = 0; i < ts.size(); ++i)
+    {
+      fans[static_cast<std::size_t>(v)] += (find(i) == i) ? 1 : 0;
+    }
+  }
+  return std::make_pair(singular, fans);
 }
 
 /// Checks that `triangles` on `numVertices` vertices form a compact surface, consistently
