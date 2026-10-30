@@ -69,7 +69,7 @@ VISKORES_EXEC_CONT inline bool ImproperPair(const Vec3* p,
   }
   if (numShared == 3)
   {
-    return true; // two copies of one triangle
+    return true; // two copies of one triangle, after gluing
   }
   if (numShared == 2)
   {

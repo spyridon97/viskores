@@ -60,7 +60,7 @@ enum class MergeBlame
   Region
 };
 
-/// What the merge test and the full test of a merge check.
+/// What the merge test and the full test of a merge check, and the frozen labels.
 struct MergeParameters
 {
   bool GeometricFlags() const
@@ -76,6 +76,10 @@ struct MergeParameters
   Real ErrorBound = 0;
   /// The halves of the envelope flag (F5) in use.
   EnvelopeSides Sides = EnvelopeSides::Both;
+  /// Whether candidates must keep the discrete closed-ball property; off in the geometric-only
+  /// mode, where every pair of adjacent clusters is a candidate and the output is the set of
+  /// simplices.
+  bool Topological = true;
   /// (D2) by count of the clusters per closed component instead of by sort of the label triples.
   bool D2ByCount = false;
   /// The floor `D_0` of the degree key of the priority, or a negative value to order the
@@ -89,6 +93,12 @@ struct MergeParameters
   bool DeferFlagged = true;
   /// Which merges `DeferFlagged` defers.
   MergeBlame Blame = MergeBlame::Region;
+  /// For an input cut into surfaces, the first copy of the input vertex of every copy, which
+  /// glues the output for (F4), and the frozen copies; empty otherwise.
+  viskores::cont::ArrayHandle<viskores::Id> Canonical;
+  viskores::cont::ArrayHandle<viskores::UInt8> FrozenVertices;
+  /// The input vertex of every copy.
+  viskores::cont::ArrayHandle<viskores::Id> Original;
 };
 
 struct MergeDiagnostics
@@ -146,9 +156,20 @@ struct MergeContextPortals
     Id3Portal,
     viskores::worklet::spatialstructure::BoundingVolumeHierarchy::ExecObjectType>;
 
+  VISKORES_EXEC viskores::Id3 Glued(const viskores::Id3& t) const
+  {
+    if (!this->HasGlue)
+    {
+      return t;
+    }
+    return viskores::Id3(this->Glue.Get(t[0]), this->Glue.Get(t[1]), this->Glue.Get(t[2]));
+  }
+
   /// Calls `visit(P, labels, t)` for every triangle of `K/ij` at the merged vertex `i`, realised
   /// with `i` at `merged`: the triangles at `i` or `j`, relabelled, but not those at both, which
-  /// degenerate. They are visited in the order of the fans of `i`, then of `j`.
+  /// degenerate. They are visited in the order of the fans of `i`, then of `j`. In the
+  /// geometric-only mode the output is the set of simplices, sorted triples with repetition, and
+  /// those at both are kept as lower-dimensional simplices.
   template <typename Visit>
   VISKORES_EXEC bool ForEachNewTriangle(viskores::Id i,
                                         viskores::Id j,
@@ -168,7 +189,7 @@ struct MergeContextPortals
           hasI = hasI || labels[k] == i;
           hasJ = hasJ || labels[k] == j;
         }
-        if (hasI && hasJ)
+        if (hasI && hasJ && !this->GeometricOnly)
         {
           continue;
         }
@@ -178,6 +199,10 @@ struct MergeContextPortals
           {
             labels[k] = i;
           }
+        }
+        if (this->GeometricOnly)
+        {
+          labels = SortThree(labels);
         }
         Vec3 p[3];
         for (int k = 0; k < 3; ++k)
@@ -216,8 +241,10 @@ struct MergeContextPortals
   /// input ((F5)(i), the 3-label triangles with a vertex in the merged cluster); bit 1, the
   /// triangle against `K/ij` ((F5)(ii), the triangles with a vertex in the merged cluster and
   /// those whose box meets the box of the removed output triangles grown by epsilon). Only the
-  /// triangles with `D(t) > epsilon` are visited. `parts` selects the triangles with a vertex
-  /// in the merged cluster (bit 0) and the others (bit 1).
+  /// triangles with `D(t) > epsilon` are visited. In the geometric-only mode, both tests of
+  /// (F5') on the triangles with a vertex in the merged cluster, the second against all the
+  /// simplices of the merged labelling. `parts` selects the triangles with a vertex in the
+  /// merged cluster (bit 0) and the others (bit 1).
   template <typename Visit>
   VISKORES_EXEC void ForEachEnvelopeItem(viskores::Id i,
                                          viskores::Id j,
@@ -255,6 +282,9 @@ struct MergeContextPortals
   FlagPortal OutputDegenerate;
   Distance Input;
   Distance Output;
+  IdPortal Glue;
+  bool HasGlue;
+  bool GeometricOnly;
   Real MaxRadius;
   Real Epsilon;
   bool Embedding;
@@ -311,6 +341,10 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
       return false;
     }
   }
+  if (this->GeometricOnly)
+  {
+    return true;
+  }
   // (F4): the new triangles must be nondegenerate and meet no other triangle improperly.
   if (this->Embedding)
   {
@@ -339,7 +373,7 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
               after = true;
               return true;
             }
-            if (after && exact::ImproperPair(p, labels, q, otherLabels))
+            if (after && exact::ImproperPair(p, this->Glued(labels), q, this->Glued(otherLabels)))
             {
               bad = true;
               return false;
@@ -366,7 +400,7 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
             const Vec3 q[3] = { this->Generators.Get(other[0]),
                                 this->Generators.Get(other[1]),
                                 this->Generators.Get(other[2]) };
-            if (exact::ImproperPair(p, labels, q, other))
+            if (exact::ImproperPair(p, this->Glued(labels), q, this->Glued(other)))
             {
               bad = true;
               return false;
@@ -455,6 +489,11 @@ VISKORES_EXEC inline void MergeContextPortals::ForEachEnvelopeItem(viskores::Id 
         {
           continue;
         }
+        if (this->GeometricOnly)
+        {
+          emit(t, tri, viskores::UInt8(3));
+          continue;
+        }
         const viskores::Id a = newLabel(this->Labels.Get(tri[0]));
         const viskores::Id b = newLabel(this->Labels.Get(tri[1]));
         const viskores::Id d = newLabel(this->Labels.Get(tri[2]));
@@ -462,7 +501,7 @@ VISKORES_EXEC inline void MergeContextPortals::ForEachEnvelopeItem(viskores::Id 
       }
     }
   }
-  if ((parts & 2) == 0)
+  if (this->GeometricOnly || (parts & 2) == 0)
   {
     return;
   }
@@ -553,19 +592,22 @@ struct MergedOutputDistance
       candidates,
       complete,
       &seeds);
-    this->Context.ForEachNewTriangle(this->I,
-                                     this->J,
-                                     this->Merged,
-                                     [&](const Vec3* p, const viskores::Id3&, viskores::Id t)
-                                     {
-                                       candidates.Offer(
-                                         Norm(Sub(TriangleCentroid(p[0], p[1], p[2]), q)),
-                                         viskores::Id3(t, 0, 0),
-                                         p[0],
-                                         p[1],
-                                         p[2]);
-                                       return true;
-                                     });
+    this->Context.ForEachNewTriangle(
+      this->I,
+      this->J,
+      this->Merged,
+      [&](const Vec3* p, const viskores::Id3& labels, viskores::Id t)
+      {
+        // In the geometric-only mode, the simplex's sorted
+        // labels: its position in the sorted simplices of the
+        // merged labelling.
+        candidates.Offer(Norm(Sub(TriangleCentroid(p[0], p[1], p[2]), q)),
+                         this->Context.GeometricOnly ? labels : viskores::Id3(t, 0, 0),
+                         p[0],
+                         p[1],
+                         p[2]);
+        return true;
+      });
     seeds.Keep(candidates);
     return candidates.Passes(s, bound, margin);
   }
@@ -667,6 +709,9 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
     portals.FanOffsets = this->Complex->FanOffsets.PrepareForInput(device, token);
     portals.Fans = this->Complex->Fans.PrepareForInput(device, token);
     portals.OutputDegenerate = this->OutputDegenerate.PrepareForInput(device, token);
+    portals.Glue = this->Glue.PrepareForInput(device, token);
+    portals.HasGlue = this->Glue.GetNumberOfValues() > 0;
+    portals.GeometricOnly = this->GeometricOnly;
     portals.Input = DistanceMeshObject(this->Input).PrepareForExecution(device, token);
     portals.Output = DistanceMeshObject(this->Output).PrepareForExecution(device, token);
     portals.MaxRadius = this->MaxRadius;
@@ -682,6 +727,8 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
   const OutputComplex* Complex;
   viskores::cont::ArrayHandle<Mat3> VertexMatrices;
   viskores::cont::ArrayHandle<viskores::UInt8> OutputDegenerate;
+  viskores::cont::ArrayHandle<viskores::Id> Glue;
+  bool GeometricOnly = false;
   DistanceMesh Input;
   DistanceMesh Output;
   Real MaxRadius;
@@ -1331,6 +1378,8 @@ inline void MergeEnvelopeFlags(const SurfaceMesh& mesh,
                                const EnvelopeBases* bases,
                                EnvelopeVerdicts* verdicts)
 {
+  const EnvelopeMode mode =
+    parameters.Topological ? EnvelopeMode::Surface : EnvelopeMode::Simplices;
   const EnvelopeBase* base = bases ? &bases->Committed : nullptr;
   viskores::cont::ArrayHandle<viskores::UInt8> affected;
   if (base)
@@ -1357,6 +1406,7 @@ inline void MergeEnvelopeFlags(const SurfaceMesh& mesh,
                 triangles,
                 clusters.Sizes,
                 parameters.ErrorBound,
+                mode,
                 parameters.Sides,
                 flags,
                 &out,
@@ -1491,6 +1541,17 @@ inline OutputComplex BuildOutputComplex(const viskores::cont::ArrayHandle<viskor
 namespace detail
 {
 
+struct IsCutRecord : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn record, FieldOut cut);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_EXEC viskores::UInt8 operator()(const viskores::Id3& record) const
+  {
+    return (record[0] != 0) ? 1 : 0;
+  }
+};
+
 /// Per component of the mesh, which is a component of `K`: its clusters, and those on the
 /// boundary. Integer atomics give the same counts in any order.
 struct CountComponentClusters : viskores::worklet::WorkletMapField
@@ -1595,9 +1656,9 @@ VISKORES_EXEC_CONT inline Real Phi(const Mat3& q, const Vec3& b, Real s)
 namespace detail
 {
 
-/// Whether the edge `ij` of `K` is a candidate merge: the local test of Proposition "A merge is
-/// an edge contraction" (ii) (not a linking edge, and in no non-facial 3-cycle); and its
-/// `MergePriority`.
+/// Whether the edge `ij` of `K` is a candidate merge: the frozen-cluster rule and the glue
+/// condition, then the local test of Proposition "A merge is an edge contraction" (ii) (not a
+/// linking edge, and in no non-facial 3-cycle); and its `MergePriority`.
 struct MergeCandidate : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn edge,
@@ -1607,6 +1668,9 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
                                 WholeArrayIn neighbors,
                                 WholeArrayIn degreeOffsets,
                                 WholeArrayIn faces,
+                                WholeArrayIn frozenLabels,
+                                WholeArrayIn contactOffsets,
+                                WholeArrayIn contacts,
                                 WholeArrayIn anchors,
                                 WholeArrayIn points,
                                 WholeArrayIn q,
@@ -1614,10 +1678,16 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
                                 WholeArrayIn s,
                                 FieldOut isCandidate,
                                 FieldOut record);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14);
+  using ExecutionSignature =
+    void(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17);
 
-  VISKORES_CONT MergeCandidate(viskores::Id degreeFloor, MergeOrder order)
-    : DegreeFloor(degreeFloor)
+  VISKORES_CONT MergeCandidate(bool topological,
+                               bool hasFrozen,
+                               viskores::Id degreeFloor,
+                               MergeOrder order)
+    : Topological(topological)
+    , HasFrozen(hasFrozen)
+    , DegreeFloor(degreeFloor)
     , Order(order)
   {
   }
@@ -1635,6 +1705,9 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
                                 const IdPortal& neighbors,
                                 const IdPortal& degreeOffsets,
                                 const Id3Portal& faces,
+                                const FlagPortal& frozenLabels,
+                                const IdPortal& contactOffsets,
+                                const Id3Portal& contacts,
                                 const IdPortal& anchors,
                                 const VecPortal& points,
                                 const MatPortal& q,
@@ -1646,42 +1719,76 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
     const viskores::Id i = edge[0], j = edge[1];
     isCandidate = 0;
     record = MergePriority(0, { 0, { 0, edge } });
-    if (count == 2 && boundary.Get(i) && boundary.Get(j))
+    if (this->HasFrozen)
     {
-      return; // a linking edge
+      const bool fi = frozenLabels.Get(i) != 0, fj = frozenLabels.Get(j) != 0;
+      if (fi || fj)
+      {
+        return;
+      }
+      // The glue condition: the merged cluster touches at most one copy of every frozen input
+      // vertex. The contacts of each cluster are sorted by input vertex, then copy.
+      viskores::Id a = contactOffsets.Get(i), aEnd = contactOffsets.Get(i + 1);
+      viskores::Id c = contactOffsets.Get(j), cEnd = contactOffsets.Get(j + 1);
+      viskores::Id vertex = -1, copy = -1;
+      while (a < aEnd || c < cEnd)
+      {
+        viskores::Id3 next;
+        if (c >= cEnd || (a < aEnd && contacts.Get(a)[1] <= contacts.Get(c)[1]))
+        {
+          next = contacts.Get(a++);
+        }
+        else
+        {
+          next = contacts.Get(c++);
+        }
+        if (next[1] == vertex && next[2] != copy)
+        {
+          return;
+        }
+        vertex = next[1];
+        copy = next[2];
+      }
     }
-    // Every common neighbour x must make ijx a triangle of K.
-    viskores::Id a = neighborOffsets.Get(i), aEnd = neighborOffsets.Get(i + 1);
-    viskores::Id c = neighborOffsets.Get(j), cEnd = neighborOffsets.Get(j + 1);
-    while (a < aEnd && c < cEnd)
+    if (this->Topological)
     {
-      const viskores::Id x = neighbors.Get(a), y = neighbors.Get(c);
-      if (x < y)
+      if (count == 2 && boundary.Get(i) && boundary.Get(j))
       {
-        ++a;
+        return; // a linking edge
       }
-      else if (y < x)
+      // Every common neighbour x must make ijx a triangle of K.
+      viskores::Id a = neighborOffsets.Get(i), aEnd = neighborOffsets.Get(i + 1);
+      viskores::Id c = neighborOffsets.Get(j), cEnd = neighborOffsets.Get(j + 1);
+      while (a < aEnd && c < cEnd)
       {
-        ++c;
-      }
-      else
-      {
-        viskores::Id3 triple(i, j, x);
-        if (x < i)
+        const viskores::Id x = neighbors.Get(a), y = neighbors.Get(c);
+        if (x < y)
         {
-          triple = viskores::Id3(x, i, j);
+          ++a;
         }
-        else if (x < j)
+        else if (y < x)
         {
-          triple = viskores::Id3(i, x, j);
+          ++c;
         }
-        viskores::Id lo = LowerBound(faces, 0, faces.GetNumberOfValues(), triple);
-        if (lo == faces.GetNumberOfValues() || faces.Get(lo) != triple)
+        else
         {
-          return; // a non-facial 3-cycle
+          viskores::Id3 triple(i, j, x);
+          if (x < i)
+          {
+            triple = viskores::Id3(x, i, j);
+          }
+          else if (x < j)
+          {
+            triple = viskores::Id3(i, x, j);
+          }
+          viskores::Id lo = LowerBound(faces, 0, faces.GetNumberOfValues(), triple);
+          if (lo == faces.GetNumberOfValues() || faces.Get(lo) != triple)
+          {
+            return; // a non-facial 3-cycle
+          }
+          ++a;
+          ++c;
         }
-        ++a;
-        ++c;
       }
     }
     Vec3 o, bm;
@@ -1707,6 +1814,8 @@ struct MergeCandidate : viskores::worklet::WorkletMapField
     isCandidate = 1;
   }
 
+  bool Topological;
+  bool HasFrozen;
   viskores::Id DegreeFloor;
   MergeOrder Order;
 };
@@ -1728,6 +1837,18 @@ struct CandidatePair : viskores::worklet::WorkletMapField
   }
 };
 
+} // namespace detail
+
+/// The vertex of the glued output `K` of every label: the copies of every frozen vertex
+/// identified; empty for an input that is a surface.
+inline viskores::cont::ArrayHandle<viskores::Id> OutputGlue(const MergeParameters& parameters,
+                                                            const Clustering& clusters)
+{
+  return GlueMap(parameters.Canonical, clusters);
+}
+
+namespace detail
+{
 
 struct ExactlyDegenerate : viskores::worklet::WorkletMapField
 {
@@ -2516,10 +2637,131 @@ struct NewTriangleFlagged : viskores::worklet::WorkletMapField
   }
 };
 
+/// The group of a vertex, and whether the group's generator is at the vertex.
+struct VertexGroup : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn label,
+                                WholeArrayIn glue,
+                                WholeArrayIn generators,
+                                FieldIn point,
+                                FieldOut group,
+                                FieldOut atPoint);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+
+  template <typename IdPortal, typename VecPortal>
+  VISKORES_EXEC void operator()(viskores::Id label,
+                                const IdPortal& glue,
+                                const VecPortal& generators,
+                                const Vec3& point,
+                                viskores::Id& group,
+                                viskores::UInt8& atPoint) const
+  {
+    group = glue.Get(label);
+    atPoint = (generators.Get(group) == point) ? 1 : 0;
+  }
+};
+
+/// Whether the members of a group are copies of one input vertex, every one at the generator.
+struct GroupIsOneVertex : viskores::worklet::WorkletReduceByKey
+{
+  using ControlSignature = void(KeysIn group,
+                                ValuesIn original,
+                                ValuesIn atPoint,
+                                ReducedValuesOut one);
+  using ExecutionSignature = _4(_2, _3);
+
+  template <typename OriginalVec, typename FlagVec>
+  VISKORES_EXEC viskores::UInt8 operator()(const OriginalVec& original,
+                                           const FlagVec& atPoint) const
+  {
+    for (viskores::IdComponent i = 0; i < original.GetNumberOfComponents(); ++i)
+    {
+      if (original[i] != original[0] || !atPoint[i])
+      {
+        return 0;
+      }
+    }
+    return 1;
+  }
+};
+
+/// Whether a triangle in a violation has a corner that is not one input vertex at itself.
+struct NotInherited : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle, FieldIn involved, WholeArrayIn one, FieldOut bad);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename FlagPortal>
+  VISKORES_EXEC viskores::Id operator()(const viskores::Id3& t,
+                                        viskores::UInt8 involved,
+                                        const FlagPortal& one) const
+  {
+    return (involved && !(one.Get(t[0]) && one.Get(t[1]) && one.Get(t[2]))) ? 1 : 0;
+  }
+};
+
 } // namespace detail
 
+/// For an input cut into surfaces: whether the glued output `glued` has a degenerate triangle,
+/// or a triangle in an improper pair, that is not inherited from the input, as `new_improper` of
+/// proofs/lib/arcs.py. A triangle is inherited when every corner is a vertex of `K` made of the
+/// copies of one input vertex and realised at that vertex. (F4) flags only the clusters with two
+/// or more vertices, and misses a violation whose group is represented by a singleton label
+/// although the group is not one vertex.
+inline bool NewImproper(const SurfaceMesh& mesh,
+                        const MergeParameters& parameters,
+                        const Clustering& clusters,
+                        const viskores::cont::ArrayHandle<viskores::Id>& glue,
+                        const viskores::cont::ArrayHandle<viskores::Id3>& glued)
+{
+  using Algorithm = viskores::cont::Algorithm;
+  viskores::cont::Invoker invoke;
+  if (glued.GetNumberOfValues() == 0)
+  {
+    return false;
+  }
+  viskores::cont::ArrayHandle<Vec3> lower, upper;
+  viskores::cont::ArrayHandle<viskores::UInt8> degenerate, involved;
+  viskores::cont::ArrayHandle<viskores::Id> pairsAbove;
+  invoke(detail::RealizeTriangle{}, glued, clusters.Generators, lower, upper, degenerate);
+  const viskores::worklet::spatialstructure::BoundingVolumeHierarchy hierarchy(lower, upper);
+  invoke(detail::FindImproperPairs{},
+         glued,
+         lower,
+         upper,
+         degenerate,
+         glued,
+         degenerate,
+         clusters.Generators,
+         hierarchy,
+         involved,
+         pairsAbove);
+  if (Algorithm::Reduce(involved, viskores::Id(0)) == 0)
+  {
+    return false;
+  }
+  // Every group made of the copies of one input vertex, realised at it.
+  viskores::cont::ArrayHandle<viskores::Id> groupOfVertex;
+  viskores::cont::ArrayHandle<viskores::UInt8> atPoint;
+  invoke(detail::VertexGroup{},
+         clusters.Labels,
+         glue,
+         clusters.Generators,
+         mesh.Points,
+         groupOfVertex,
+         atPoint);
+  const viskores::worklet::Keys<viskores::Id> groups(groupOfVertex);
+  viskores::cont::ArrayHandle<viskores::UInt8> groupIsOne, one;
+  invoke(detail::GroupIsOneVertex{}, groups, parameters.Original, atPoint, groupIsOne);
+  one.AllocateAndFill(clusters.NumberOfClusters, 1);
+  invoke(ScatterValue{}, groups.GetUniqueKeys(), groupIsOne, one);
+  viskores::cont::ArrayHandle<viskores::UInt8> bad;
+  invoke(detail::NotInherited{}, glued, involved, one, bad);
+  return Algorithm::Reduce(bad, viskores::Id(0)) > 0;
+}
+
 /// Whether any flag in use fires on a placed labelling, evaluated in full: the discrete
-/// closed-ball property, (F0), (F4) and (F5). With `bases`,
+/// closed-ball property, the glue condition, (F0), (F4) and (F5). With `bases`,
 /// (F5) tests only the triangles whose verdicts can differ from a base's
 /// (`MergeEnvelopeFlags`); with `verdicts`, its verdicts are stored there, for a caller that
 /// commits the labelling or keeps it as a base.
@@ -2539,12 +2781,24 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
 {
   const viskores::Id k = clusters.NumberOfClusters;
   viskores::cont::ArrayHandle<viskores::UInt8> flags;
-  flags.AllocateAndFill(k, 0);
-  const TopologyReport report =
-    TopologyFlags(mesh, clusters.Labels, clusters.Sizes, flags, parameters.D2ByCount);
-  if (report.NumberOfD0 + report.NumberOfD1 + report.NumberOfD2 > 0)
+  if (parameters.Topological)
   {
-    return true;
+    flags.AllocateAndFill(k, 0);
+    const TopologyReport report =
+      TopologyFlags(mesh, clusters.Labels, clusters.Sizes, flags, parameters.D2ByCount);
+    if (report.NumberOfD0 + report.NumberOfD1 + report.NumberOfD2 > 0)
+    {
+      return true;
+    }
+    if (GlueFlags(mesh,
+                  clusters.Labels,
+                  parameters.FrozenVertices,
+                  parameters.Canonical,
+                  clusters.Sizes,
+                  flags) > 0)
+    {
+      return true;
+    }
   }
   if (parameters.MaxClusterRadius < std::numeric_limits<Real>::infinity())
   {
@@ -2554,24 +2808,36 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
       return true;
     }
   }
-  const viskores::cont::ArrayHandle<viskores::Id3> triangles =
-    OutputTriangles(mesh, clusters.Labels);
-  if (parameters.Embedding)
+  const viskores::cont::ArrayHandle<viskores::Id3> triangles = parameters.Topological
+    ? OutputTriangles(mesh, clusters.Labels)
+    : Simplices(mesh, clusters.Labels);
+  if (parameters.Embedding && parameters.Topological)
   {
+    const viskores::cont::ArrayHandle<viskores::Id> glue = OutputGlue(parameters, clusters);
+    const viskores::cont::ArrayHandle<viskores::Id3> glued = GlueTriangles(triangles, glue);
     if (changed)
     {
       viskores::cont::Invoker invoke;
       viskores::cont::ArrayHandle<Vec3> lower, upper;
       viskores::cont::ArrayHandle<viskores::UInt8> degenerate, isNew, flagged;
-      invoke(detail::RealizeTriangle{}, triangles, clusters.Generators, lower, upper, degenerate);
-      invoke(detail::HasChangedLabel{}, triangles, *changed, isNew);
+      invoke(detail::RealizeTriangle{}, glued, clusters.Generators, lower, upper, degenerate);
+      // The glued triangles carry the label of their group: a group changes with any member.
+      viskores::cont::ArrayHandle<viskores::UInt8> changedGroups = *changed;
+      if (glue.GetNumberOfValues() > 0)
+      {
+        viskores::cont::ArrayHandle<viskores::UInt8> groups;
+        viskores::cont::Algorithm::Copy(*changed, groups);
+        invoke(MarkIfFlagged{}, *changed, glue, groups);
+        changedGroups = groups;
+      }
+      invoke(detail::HasChangedLabel{}, glued, changedGroups, isNew);
       viskores::cont::ArrayHandle<viskores::Id> newTriangles;
       viskores::cont::Algorithm::CopyIf(
-        viskores::cont::ArrayHandleIndex(triangles.GetNumberOfValues()), isNew, newTriangles);
+        viskores::cont::ArrayHandleIndex(glued.GetNumberOfValues()), isNew, newTriangles);
       const viskores::worklet::spatialstructure::BoundingVolumeHierarchy hierarchy(lower, upper);
       invoke(detail::NewTriangleFlagged{},
              newTriangles,
-             triangles,
+             glued,
              lower,
              upper,
              degenerate,
@@ -2583,10 +2849,17 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
         return true;
       }
     }
+    else if (glue.GetNumberOfValues() > 0)
+    {
+      if (NewImproper(mesh, parameters, clusters, glue, glued))
+      {
+        return true;
+      }
+    }
     else
     {
       flags.AllocateAndFill(k, 0);
-      EmbeddingFlags(triangles, clusters.Generators, clusters.Sizes, flags);
+      EmbeddingFlags(glued, clusters.Generators, clusters.Sizes, flags);
       if (CountFlags(flags) > 0)
       {
         return true;
@@ -2615,7 +2888,7 @@ struct FailingItems
 };
 
 /// The clusters that the flags in use flag on a placed labelling, as `flagged_clusters` of
-/// proofs/lib/vqc.py: (F0), (F4) and (F5). Returns
+/// proofs/lib/vqc.py: (F0), the glue condition, (F4) and (F5). Returns
 /// false, with no flags, if the discrete closed-ball property fails, which Lemma
 /// "mergeindependent" excludes for a committed set of cluster merges. With `items`, stores the
 /// failing items that the region blame reads.
@@ -2632,12 +2905,23 @@ inline bool FlaggedClusters(const SurfaceMesh& mesh,
   const viskores::Id k = clusters.NumberOfClusters;
   flags.AllocateAndFill(k, 0);
   viskores::cont::ArrayHandle<viskores::UInt8> other;
-  other.AllocateAndFill(k, 0);
-  const TopologyReport report =
-    TopologyFlags(mesh, clusters.Labels, clusters.Sizes, other, parameters.D2ByCount);
-  if (report.NumberOfD0 + report.NumberOfD1 + report.NumberOfD2 > 0)
+  if (parameters.Topological)
   {
-    return false;
+    other.AllocateAndFill(k, 0);
+    const TopologyReport report =
+      TopologyFlags(mesh, clusters.Labels, clusters.Sizes, other, parameters.D2ByCount);
+    if (report.NumberOfD0 + report.NumberOfD1 + report.NumberOfD2 > 0)
+    {
+      return false;
+    }
+    other.AllocateAndFill(k, 0);
+    GlueFlags(mesh,
+              clusters.Labels,
+              parameters.FrozenVertices,
+              parameters.Canonical,
+              clusters.Sizes,
+              other);
+    OrFlags(flags, other);
   }
   if (parameters.MaxClusterRadius < std::numeric_limits<Real>::infinity())
   {
@@ -2645,12 +2929,16 @@ inline bool FlaggedClusters(const SurfaceMesh& mesh,
     RadiusFlags(Scan(mesh, quadrics.M, clusters), parameters.MaxClusterRadius, other);
     OrFlags(flags, other);
   }
-  const viskores::cont::ArrayHandle<viskores::Id3> triangles =
-    OutputTriangles(mesh, clusters.Labels);
-  if (parameters.Embedding)
+  const viskores::cont::ArrayHandle<viskores::Id3> triangles = parameters.Topological
+    ? OutputTriangles(mesh, clusters.Labels)
+    : Simplices(mesh, clusters.Labels);
+  if (parameters.Embedding && parameters.Topological)
   {
     other.AllocateAndFill(k, 0);
-    EmbeddingFlags(triangles, clusters.Generators, clusters.Sizes, other);
+    EmbeddingFlags(GlueTriangles(triangles, OutputGlue(parameters, clusters)),
+                   clusters.Generators,
+                   clusters.Sizes,
+                   other);
     OrFlags(flags, other);
   }
   if (parameters.ErrorBound > 0)
@@ -2916,7 +3204,7 @@ inline viskores::cont::ArrayHandle<viskores::UInt8> RegionFlags(
   baseHits.AllocateAndFill(base.NumberOfClusters, 0);
   marks.AllocateAndFill(k, 0);
   invoke(detail::MarkRegionHits{},
-         OutputTriangles(mesh, base.Labels),
+         parameters.Topological ? OutputTriangles(mesh, base.Labels) : Simplices(mesh, base.Labels),
          base.Generators,
          regions,
          lower,
@@ -2980,7 +3268,8 @@ void MergePhase(const SurfaceMesh& mesh,
     [&](EnvelopeBase& base, const Clustering& labelling, const EnvelopeVerdicts& verdictsOf)
   {
     base.Clusters = labelling;
-    base.Triangles = OutputTriangles(mesh, labelling.Labels);
+    base.Triangles = parameters.Topological ? OutputTriangles(mesh, labelling.Labels)
+                                            : Simplices(mesh, labelling.Labels);
     base.Verdicts = verdictsOf;
   };
   auto commitEnvelopeBase = [&](const Clustering& committed, const EnvelopeVerdicts& verdictsOf)
@@ -2993,7 +3282,8 @@ void MergePhase(const SurfaceMesh& mesh,
     MergeEnvelopeFlags(mesh,
                        inputDistance,
                        clusters,
-                       OutputTriangles(mesh, clusters.Labels),
+                       parameters.Topological ? OutputTriangles(mesh, clusters.Labels)
+                                              : Simplices(mesh, clusters.Labels),
                        parameters,
                        unused,
                        nullptr,
@@ -3011,8 +3301,11 @@ void MergePhase(const SurfaceMesh& mesh,
     {
       break;
     }
-    const OutputComplex complex = BuildOutputComplex(OutputTriangles(mesh, clusters.Labels), k);
-    if (k <= 3 || (k == 4 && !complex.HasBoundary))
+    const OutputComplex complex =
+      BuildOutputComplex(parameters.Topological ? OutputTriangles(mesh, clusters.Labels)
+                                                : Simplices(mesh, clusters.Labels),
+                         k);
+    if (parameters.Topological && (k <= 3 || (k == 4 && !complex.HasBoundary)))
     {
       break; // a triangle or a tetrahedron: irreducible
     }
@@ -3020,7 +3313,21 @@ void MergePhase(const SurfaceMesh& mesh,
     // Candidates in priority order.
     viskores::cont::ArrayHandle<viskores::Id2> candidateEdges = complex.Edges;
     viskores::cont::ArrayHandle<viskores::IdComponent> candidateCounts = complex.EdgeCounts;
-    if (mesh.NumberOfComponents > 1)
+    if (!parameters.Topological)
+    {
+      // Every pair of adjacent clusters: the label pairs of the cut edges of the input.
+      viskores::cont::ArrayHandle<viskores::Id2> pairs;
+      viskores::cont::ArrayHandle<viskores::Id3> records;
+      invoke(
+        detail::CutEdgeRecord{}, mesh.Edges, mesh.EdgeTriangles, clusters.Labels, pairs, records);
+      viskores::cont::ArrayHandle<viskores::UInt8> isCut;
+      invoke(detail::IsCutRecord{}, records, isCut);
+      Algorithm::CopyIf(pairs, isCut, candidateEdges);
+      Algorithm::Sort(candidateEdges);
+      Algorithm::Unique(candidateEdges);
+      candidateCounts.AllocateAndFill(candidateEdges.GetNumberOfValues(), 0);
+    }
+    else if (mesh.NumberOfComponents > 1)
     {
       // The local test decides the discrete closed-ball property only in a component of K with
       // at least four vertices that is not the boundary of a tetrahedron (Proposition "A merge
@@ -3051,13 +3358,38 @@ void MergePhase(const SurfaceMesh& mesh,
       candidateEdges = edges;
       candidateCounts = counts;
     }
-    // Two candidates conflict if they share a cluster or an edge of K joins them. The degrees of
-    // the priority are taken in the same graph.
+    // Two candidates conflict if they share a cluster or an edge of K joins them. Without the
+    // topological test, K is replaced by the adjacency of the clusters. The degrees of the
+    // priority are taken in the same graph.
     viskores::cont::ArrayHandle<viskores::Id> conflictOffsets = complex.NeighborOffsets;
     viskores::cont::ArrayHandle<viskores::Id> conflictNeighbors = complex.Neighbors;
+    if (!parameters.Topological)
+    {
+      viskores::cont::ArrayHandle<viskores::Id2> adjacency;
+      invoke(
+        BothDirections{}, candidateEdges, viskores::cont::make_ArrayHandleGroupVec<2>(adjacency));
+      BuildAdjacency(adjacency, k, conflictOffsets, conflictNeighbors);
+    }
+    // No merge involves a frozen cluster, and none joins two copies of one frozen vertex.
+    const viskores::cont::ArrayHandle<viskores::UInt8> frozenLabels =
+      FrozenLabels(parameters.FrozenVertices, clusters);
+    viskores::cont::ArrayHandle<viskores::Id> contactOffsets;
+    viskores::cont::ArrayHandle<viskores::Id3> contacts;
+    if (parameters.FrozenVertices.GetNumberOfValues() > 0)
+    {
+      contacts =
+        FrozenContacts(mesh, clusters.Labels, parameters.FrozenVertices, parameters.Canonical);
+      viskores::cont::ArrayHandle<viskores::Id> contactClusters;
+      invoke(FirstComponent{}, contacts, contactClusters);
+      Algorithm::LowerBounds(
+        contactClusters, viskores::cont::ArrayHandleIndex(k + 1), contactOffsets);
+    }
     viskores::cont::ArrayHandle<viskores::UInt8> isCandidate;
     viskores::cont::ArrayHandle<MergePriority> records, candidates;
-    invoke(detail::MergeCandidate(parameters.DegreeFloor, parameters.Order),
+    invoke(detail::MergeCandidate(parameters.Topological,
+                                  frozenLabels.GetNumberOfValues() > 0,
+                                  parameters.DegreeFloor,
+                                  parameters.Order),
            candidateEdges,
            candidateCounts,
            complex.BoundaryVertex,
@@ -3065,6 +3397,9 @@ void MergePhase(const SurfaceMesh& mesh,
            complex.Neighbors,
            conflictOffsets,
            complex.Faces,
+           frozenLabels,
+           contactOffsets,
+           contacts,
            clusters.Anchors,
            mesh.Points,
            clusters.Q,
@@ -3092,16 +3427,21 @@ void MergePhase(const SurfaceMesh& mesh,
     context.Input = inputDistance;
     context.MaxRadius = parameters.MaxClusterRadius;
     context.Epsilon = parameters.ErrorBound;
-    context.Embedding = parameters.Embedding;
+    context.Embedding = parameters.Embedding && parameters.Topological;
+    context.Glue = OutputGlue(parameters, clusters);
     context.Sides = parameters.Sides;
+    context.GeometricOnly = !parameters.Topological;
     if (geometric)
     {
       invoke(detail::ExactlyDegenerate{},
              complex.Triangles,
              clusters.Generators,
              context.OutputDegenerate);
-      // The tie keys of the single-triangle candidates: the index in K.
-      context.Output = BuildDistanceMesh(clusters.Generators, complex.Triangles);
+      // The tie keys of the single-triangle candidates: the index in K, or for the simplices of
+      // the geometric-only mode, sorted and distinct, their labels.
+      context.Output = context.GeometricOnly
+        ? BuildDistanceMesh(clusters.Generators, complex.Triangles, complex.Triangles)
+        : BuildDistanceMesh(clusters.Generators, complex.Triangles);
       // The three largest absolute coordinates, by value and then label.
       viskores::cont::ArrayHandle<detail::TopThree> tops;
       invoke(detail::GeneratorTop{}, clusters.Generators, tops);

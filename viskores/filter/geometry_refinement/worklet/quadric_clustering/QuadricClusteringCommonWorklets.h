@@ -14,8 +14,11 @@
 #include <viskores/Swap.h>
 #include <viskores/Types.h>
 #include <viskores/cont/Algorithm.h>
+#include <viskores/cont/ArrayCopy.h>
 #include <viskores/cont/ArrayHandle.h>
+#include <viskores/cont/ArrayHandleIndex.h>
 #include <viskores/cont/Invoker.h>
+#include <viskores/filter/connected_components/worklet/UnionFind.h>
 #include <viskores/worklet/ScatterCounting.h>
 #include <viskores/worklet/WorkletMapField.h>
 
@@ -69,6 +72,32 @@ inline viskores::Id CountFlags(const viskores::cont::ArrayHandle<viskores::UInt8
 {
   return viskores::cont::Algorithm::Reduce(flags, viskores::Id(0));
 }
+
+/// 1 for the first record of every run of records equal on their first `K` components.
+template <viskores::IdComponent K>
+struct FirstOfRun : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn index, WholeArrayIn records, FieldOut first);
+  using ExecutionSignature = _3(_1, _2);
+
+  template <typename RecordPortal>
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::Id i, const RecordPortal& records) const
+  {
+    if (i == 0)
+    {
+      return 1;
+    }
+    const auto a = records.Get(i), b = records.Get(i - 1);
+    for (viskores::IdComponent k = 0; k < K; ++k)
+    {
+      if (a[k] != b[k])
+      {
+        return 1;
+      }
+    }
+    return 0;
+  }
+};
 
 /// 1 where two ids are equal: an index that is its own root or representative.
 struct IsEqual : viskores::worklet::WorkletMapField
@@ -176,6 +205,32 @@ inline Real MaxAbsCoordinate(const viskores::cont::ArrayHandle<Vec3>& points)
   return viskores::cont::Algorithm::Reduce(values, Real(0), viskores::Maximum());
 }
 
+struct Unite : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn edge, AtomicArrayInOut parents);
+  using ExecutionSignature = void(_1, _2);
+
+  template <typename Parents>
+  VISKORES_EXEC void operator()(const viskores::Id2& edge, Parents& parents) const
+  {
+    viskores::worklet::connectivity::UnionFind::Unite(parents, edge[0], edge[1]);
+  }
+};
+
+/// The smallest node of the component of every node of the graph `edges` on `n` nodes: the
+/// union-find links by index, so the root of every component is its smallest node.
+inline viskores::cont::ArrayHandle<viskores::Id> SmallestRoots(
+  viskores::Id n,
+  const viskores::cont::ArrayHandle<viskores::Id2>& edges)
+{
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::Id> parents;
+  viskores::cont::ArrayCopy(viskores::cont::ArrayHandleIndex(n), parents);
+  invoke(Unite{}, edges, parents);
+  invoke(viskores::worklet::connectivity::PointerJumping{}, parents);
+  return parents;
+}
+
 /// The two components of a pair.
 struct SplitPair : viskores::worklet::WorkletMapField
 {
@@ -275,6 +330,28 @@ VISKORES_EXEC_CONT viskores::Id FindSorted(const Portal& sorted, const Value& va
   return (lo < n && sorted.Get(lo) == value) ? lo : -1;
 }
 
+template <typename Portal, typename Value>
+VISKORES_EXEC_CONT bool ContainsSorted(const Portal& sorted, const Value& value)
+{
+  return FindSorted(sorted, value) >= 0;
+}
+
+/// Writes 1 at `index` where `flag` is set; every write is a 1.
+struct MarkIfFlagged : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn flag, FieldIn index, WholeArrayInOut marks);
+  using ExecutionSignature = void(_1, _2, _3);
+
+  template <typename MarkPortal>
+  VISKORES_EXEC void operator()(viskores::UInt8 flag, viskores::Id index, MarkPortal& marks) const
+  {
+    if (flag)
+    {
+      marks.Set(index, 1);
+    }
+  }
+};
+
 /// Both directions of an edge.
 struct BothDirections : viskores::worklet::WorkletMapField
 {
@@ -325,6 +402,19 @@ VISKORES_EXEC_CONT inline viskores::Id3 SortThree(const viskores::Id3& t)
   return SortThree(t[0], t[1], t[2]);
 }
 
+/// The entries of `table` at the three corners of a triangle, sorted.
+struct GatherSortedTriple : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle, WholeArrayIn table, FieldOut sorted);
+  using ExecutionSignature = _3(_1, _2);
+
+  template <typename IdPortal>
+  VISKORES_EXEC viskores::Id3 operator()(const viskores::Id3& t, const IdPortal& table) const
+  {
+    return SortThree(table.Get(t[0]), table.Get(t[1]), table.Get(t[2]));
+  }
+};
+
 /// Writes `value` at `index`.
 struct ScatterValue : viskores::worklet::WorkletMapField
 {
@@ -335,6 +425,24 @@ struct ScatterValue : viskores::worklet::WorkletMapField
   VISKORES_EXEC void operator()(viskores::Id index, const T& value, OutPortal& values) const
   {
     values.Set(index, value);
+  }
+};
+
+/// `second[first[index]]`.
+struct GatherTwice : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn index,
+                                WholeArrayIn first,
+                                WholeArrayIn second,
+                                FieldOut value);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename IdPortal, typename Portal>
+  VISKORES_EXEC typename Portal::ValueType operator()(viskores::Id index,
+                                                      const IdPortal& first,
+                                                      const Portal& second) const
+  {
+    return second.Get(first.Get(index));
   }
 };
 
@@ -363,6 +471,19 @@ VISKORES_EXEC_CONT inline bool AllDistinct(viskores::Id a, viskores::Id b, visko
 {
   return a != b && b != c && a != c;
 }
+
+/// The first component of a record.
+struct FirstComponent : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn record, FieldOut first);
+  using ExecutionSignature = _2(_1);
+
+  template <typename Record>
+  VISKORES_EXEC viskores::Id operator()(const Record& r) const
+  {
+    return r[0];
+  }
+};
 
 /// 1 where a state equals `State`.
 struct IsState : viskores::worklet::WorkletMapField

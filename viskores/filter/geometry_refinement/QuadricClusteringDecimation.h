@@ -63,7 +63,8 @@ public:
   /// The output has at least as many points as the target and as the topology of the input
   /// needs, and exactly the target when the merges allow. If an error bound is set too, the
   /// error bound wins: the output stops above the target rather than exceed the error. Use it
-  /// for a fixed size, such as levels of detail or transmission. The default is 0.
+  /// for a fixed size, such as levels of detail or transmission. Without an error bound, an
+  /// input that is not a surface is rejected. The default is 0.
   VISKORES_CONT void SetTargetNumberOfPoints(viskores::Id target)
   {
     this->TargetNumberOfPoints = target;
@@ -75,23 +76,30 @@ public:
   enum Guarantee : viskores::UInt32
   {
     /// The output is a surface of the input's type: the same Euler characteristic and boundary
-    /// loops, consistently oriented. The input must be a consistently oriented surface. It
-    /// cannot be turned off.
+    /// loops, consistently oriented. An input that is not a surface, with edges in three or
+    /// more triangles or pinched points, is cut into surfaces, decimated and glued back. Without
+    /// it, the geometric-only mode accepts any set of triangles and guarantees only the error
+    /// bound and the target; the output is then the image of the input under the clustering,
+    /// with the segments and points that lie in no output triangle. Turn it off only for
+    /// triangle soups and inputs that intersect themselves.
     Topology = 1 << 0,
     /// Every point of the output is within the error bound of the input. It takes effect only
-    /// with an error bound. Alone, the side that WMTK and PQ-Free HD certify, it was about twice
-    /// as fast in the measurements of the paper, but the input then strayed from the output by
-    /// up to ten times the bound, at boundaries.
+    /// with an error bound. Alone, without `ErrorInputToOutput`, it requires `Topology`. Alone,
+    /// the side that WMTK and PQ-Free HD certify, it was about twice as fast in the measurements
+    /// of the paper, but the input then strayed from the output by up to ten times the bound,
+    /// at boundaries.
     ErrorOutputToInput = 1 << 1,
     /// Every point of the input is within the error bound of the output. It takes effect only
-    /// with an error bound. Alone it was 2 to 4 times slower than both sides, and the output
-    /// strayed from the input by up to 1.7 times the bound.
+    /// with an error bound. Alone, without `ErrorOutputToInput`, it requires `Topology`. Alone it
+    /// was 2 to 4 times slower than both sides, and the output strayed from the input by up to
+    /// 1.7 times the bound.
     ErrorInputToOutput = 1 << 2,
     /// Both sides of the error bound: the Hausdorff distance between input and output is at
-    /// most the bound.
+    /// most the bound, with or without `Topology`.
     TwoSidedError = ErrorOutputToInput | ErrorInputToOutput,
-    /// The output does not intersect itself; the input must not either. Use it for meshing,
-    /// simulation and 3D printing. It is the most expensive check after the error bound.
+    /// The output does not intersect itself; the input must not either. Requires `Topology`.
+    /// Use it for meshing, simulation and 3D printing. It is the most expensive check after the
+    /// error bound.
     NoSelfIntersections = 1 << 3
   };
 
@@ -120,7 +128,8 @@ public:
   /// `Curvature` places more seeds where the surface bends relative to the error bound, so the
   /// loop starts near its final size: as many as the target, or in error mode as many as the
   /// curvature asks for. Seeds are followed by Lloyd iterations. Use the others for comparison.
-  /// No guarantee depends on it. The default is `Curvature`.
+  /// Inputs that are not surfaces and the geometric-only mode always start from one cluster
+  /// per component. No guarantee depends on it. The default is `Curvature`.
   VISKORES_CONT void SetInitialization(Initialization initialization)
   {
     this->InitialClusters = initialization;

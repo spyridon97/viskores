@@ -17,6 +17,7 @@ set(headers
   ImproperPairs.h
   Initialization.h
   MergePhase.h
+  NonManifoldCut.h
   QuadricClusteringCommonWorklets.h
   SurfaceMesh.h
   TopologyFlags.h

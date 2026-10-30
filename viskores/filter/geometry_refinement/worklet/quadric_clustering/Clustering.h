@@ -149,6 +149,38 @@ inline void Place(const SurfaceMesh& mesh,
          clustering.Sizes);
 }
 
+/// For an input cut into surfaces: every label mapped to the label of the first copy of the
+/// input vertex of its anchor, which identifies the frozen copies of one vertex (Theorem
+/// "Inputs that are not surfaces", (c)). Empty when `canonical` is.
+inline viskores::cont::ArrayHandle<viskores::Id> GlueMap(
+  const viskores::cont::ArrayHandle<viskores::Id>& canonical,
+  const Clustering& clustering)
+{
+  viskores::cont::ArrayHandle<viskores::Id> glue;
+  if (canonical.GetNumberOfValues() > 0)
+  {
+    viskores::cont::Invoker invoke;
+    invoke(GatherTwice{}, clustering.Anchors, canonical, clustering.Labels, glue);
+  }
+  return glue;
+}
+
+/// The clusters whose vertex is frozen, or an empty array without frozen vertices.
+inline viskores::cont::ArrayHandle<viskores::UInt8> FrozenLabels(
+  const viskores::cont::ArrayHandle<viskores::UInt8>& frozenVertices,
+  const Clustering& clustering)
+{
+  viskores::cont::ArrayHandle<viskores::UInt8> labels;
+  if (frozenVertices.GetNumberOfValues() == 0)
+  {
+    return labels;
+  }
+  labels.AllocateAndFill(clustering.NumberOfClusters, 0);
+  viskores::cont::Invoker invoke;
+  invoke(MarkIfFlagged{}, frozenVertices, clustering.Labels, labels);
+  return labels;
+}
+
 /// The result of the scan of step (c).
 struct ClusterScan
 {

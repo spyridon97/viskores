@@ -15,16 +15,24 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EnvelopeFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Initialization.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/MergePhase.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/NonManifoldCut.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/QuadricClusteringCommonWorklets.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/SurfaceMesh.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/TopologyFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/VertexQuadrics.h>
 
 #include <viskores/BinaryPredicates.h>
+#include <viskores/CellShape.h>
 #include <viskores/cont/Algorithm.h>
+#include <viskores/cont/ArrayGetValues.h>
 #include <viskores/cont/ArrayHandle.h>
+#include <viskores/cont/ArrayHandleCast.h>
+#include <viskores/cont/ArrayHandleConstant.h>
+#include <viskores/cont/ArrayHandleCounting.h>
 #include <viskores/cont/ArrayHandleGroupVec.h>
 #include <viskores/cont/ArrayHandleIndex.h>
+#include <viskores/cont/ArrayHandlePermutation.h>
+#include <viskores/cont/ArrayHandleView.h>
 #include <viskores/cont/ErrorBadValue.h>
 #include <viskores/cont/ErrorExecution.h>
 #include <viskores/cont/Timer.h>
@@ -39,11 +47,182 @@ namespace viskores
 namespace worklet
 {
 
+/// Worklets of the initial components of `QuadricClusteringDecimation`.
+namespace component_detail
+{
+
+/// The key of a vertex for the initial components: frozen vertices apart.
+struct ComponentKey : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn frozen, FieldOut key);
+  using ExecutionSignature = _2(_1, WorkIndex);
+
+  VISKORES_EXEC viskores::Id operator()(viskores::UInt8 frozen, viskores::Id v) const
+  {
+    return frozen ? -1 - v : 0;
+  }
+};
+
+} // namespace component_detail
+
 /// Worklets of the extraction of the output of `QuadricClusteringDecimation`.
 namespace output_detail
 {
 
-/// The output point of an input point.
+/// The sorted labels of a triangle, with the triangle.
+struct SortedLabelRecord : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle, WholeArrayIn labels, FieldOut record);
+  using ExecutionSignature = _3(_1, _2, WorkIndex);
+
+  template <typename IdPortal>
+  VISKORES_EXEC viskores::Vec<viskores::Id, 4> operator()(const viskores::Id3& t,
+                                                          const IdPortal& labels,
+                                                          viskores::Id index) const
+  {
+    const viskores::Id3 s =
+      quadric_clustering::SortThree(labels.Get(t[0]), labels.Get(t[1]), labels.Get(t[2]));
+    return viskores::Vec<viskores::Id, 4>(s[0], s[1], s[2], index);
+  }
+};
+
+/// The edges of a triangle simplex, and the labels of a simplex that is not a point; -1 where
+/// there is none.
+struct SimplexFaces : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn record, FieldOut edges, FieldOut labels);
+  using ExecutionSignature = void(_1, _2, _3);
+
+  template <typename EdgeVec, typename LabelVec>
+  VISKORES_EXEC void operator()(const viskores::Vec<viskores::Id, 4>& r,
+                                EdgeVec& edges,
+                                LabelVec& labels) const
+  {
+    const bool triangle = r[0] != r[1] && r[1] != r[2];
+    edges[0] = triangle ? viskores::Id2(r[0], r[1]) : viskores::Id2(-1);
+    edges[1] = triangle ? viskores::Id2(r[1], r[2]) : viskores::Id2(-1);
+    edges[2] = triangle ? viskores::Id2(r[0], r[2]) : viskores::Id2(-1);
+    const bool point = r[0] == r[2];
+    for (viskores::IdComponent i = 0; i < 3; ++i)
+    {
+      labels[i] = point ? viskores::Id(-1) : r[i];
+    }
+  }
+};
+
+/// Whether a simplex is not contained in another: a segment not an edge of a triangle, a point
+/// not a vertex of a segment or triangle.
+struct NotContained : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn record,
+                                WholeArrayIn triangleEdges,
+                                WholeArrayIn covered,
+                                FieldOut kept);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename EdgePortal, typename LabelPortal>
+  VISKORES_EXEC viskores::UInt8 operator()(const viskores::Vec<viskores::Id, 4>& r,
+                                           const EdgePortal& triangleEdges,
+                                           const LabelPortal& covered) const
+  {
+    if (r[0] != r[1] && r[1] != r[2])
+    {
+      return 1;
+    }
+    if (r[0] == r[2])
+    {
+      return quadric_clustering::ContainsSorted(covered, r[0]) ? 0 : 1;
+    }
+    return quadric_clustering::ContainsSorted(triangleEdges, viskores::Id2(r[0], r[2])) ? 0 : 1;
+  }
+};
+
+struct RecordTriangle : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn record, FieldOut triangle);
+  using ExecutionSignature = _2(_1);
+
+  VISKORES_EXEC viskores::Id operator()(const viskores::Vec<viskores::Id, 4>& r) const
+  {
+    return r[3];
+  }
+};
+
+/// The labels of triangle `t`, without repetition, in the order of its corners.
+template <typename TrianglePortal, typename IdPortal>
+VISKORES_EXEC viskores::IdComponent DistinctLabels(viskores::Id t,
+                                                   const TrianglePortal& triangles,
+                                                   const IdPortal& labels,
+                                                   viskores::Id* ids)
+{
+  const viskores::Id3 tri = triangles.Get(t);
+  viskores::IdComponent count = 0;
+  for (viskores::IdComponent c = 0; c < 3; ++c)
+  {
+    const viskores::Id l = labels.Get(tri[c]);
+    bool seen = false;
+    for (viskores::IdComponent i = 0; i < count; ++i)
+    {
+      seen = seen || ids[i] == l;
+    }
+    if (!seen)
+    {
+      ids[count++] = l;
+    }
+  }
+  return count;
+}
+
+struct DistinctLabelCount : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                WholeArrayIn triangles,
+                                WholeArrayIn labels,
+                                FieldOut count);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename TrianglePortal, typename IdPortal>
+  VISKORES_EXEC viskores::IdComponent operator()(viskores::Id t,
+                                                 const TrianglePortal& triangles,
+                                                 const IdPortal& labels) const
+  {
+    viskores::Id ids[3];
+    return DistinctLabels(t, triangles, labels, ids);
+  }
+};
+
+/// The simplex of a triangle: its distinct labels at its offset, and its shape.
+struct WriteSimplex : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                FieldIn offset,
+                                WholeArrayIn triangles,
+                                WholeArrayIn labels,
+                                WholeArrayOut connectivity,
+                                FieldOut shape);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
+
+  template <typename TrianglePortal, typename IdPortal, typename OutPortal>
+  VISKORES_EXEC void operator()(viskores::Id t,
+                                viskores::Id offset,
+                                const TrianglePortal& triangles,
+                                const IdPortal& labels,
+                                OutPortal& connectivity,
+                                viskores::UInt8& shape) const
+  {
+    viskores::Id ids[3];
+    const viskores::IdComponent count = DistinctLabels(t, triangles, labels, ids);
+    for (viskores::IdComponent i = 0; i < count; ++i)
+    {
+      connectivity.Set(offset + i, ids[i]);
+    }
+    shape = (count == 3) ? viskores::CELL_SHAPE_TRIANGLE
+                         : ((count == 2) ? viskores::CELL_SHAPE_LINE : viskores::CELL_SHAPE_VERTEX);
+  }
+};
+
+/// The output point of an input point, through one of its copies; the copies of a point are
+/// glued, so every write is the same.
 struct MapInputPoint : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn input,
@@ -125,11 +304,14 @@ public:
     bool D2ByCount = false;
     /// The embedding flag (F4): the realised output has no self-intersections.
     bool Embedding = true;
-    /// The halves of the envelope flag (F5) with an error bound.
+    /// The halves of the envelope flag (F5) with an error bound. The geometric-only mode needs
+    /// both.
     quadric_clustering::EnvelopeSides ErrorSides = quadric_clustering::EnvelopeSides::Both;
     /// The cap `T` on the propose/commit sweeps of each assignment step, or 0 for none.
     viskores::Id MaxSweeps = 0;
-    /// The initial clusters. Seeds are followed by a Lloyd phase.
+    /// The initial clusters. Seeds are followed by a Lloyd phase. An input cut into surfaces and
+    /// the geometric-only mode always start from one cluster per component (Theorem "Inputs
+    /// that are not surfaces", (a)).
     Initialization InitialClusters = Initialization::Curvature;
     /// The cap on the alternations of assignment and placement after seeding.
     viskores::Id MaxLloydIterations = 100;
@@ -138,6 +320,10 @@ public:
     /// The merge phase after the loop, down to `k*` in budget mode and as far as the flags allow
     /// in error mode.
     bool Merge = true;
+    /// The geometric-only mode of Proposition "Geometric-only mode": any complex of triangles,
+    /// no topological or embedding flag, the graph form of the guard, and (F5') for the error
+    /// bound. The output is the set of simplices `g(t)`.
+    bool GeometricOnly = false;
     /// The floor `D_0` of the degree key of the merge priority, or a negative value to order
     /// merges by the increase of the objective alone.
     viskores::Id MergeDegreeFloor = 12;
@@ -152,6 +338,12 @@ public:
     /// changed output triangles meet the region read by a failing item that flags no merged
     /// cluster (the default).
     quadric_clustering::MergeBlame MergeBlame = quadric_clustering::MergeBlame::Region;
+    /// For an input that is not a consistently oriented surface: cut a seam too, so that every
+    /// piece is orientable. Otherwise only the singular edges are cut and
+    /// nothing is reoriented, so a piece may not be orientable (Corollary "nonorientable"); a
+    /// surface that is not orientable, such as a Moebius band, takes the cut with no edge cut
+    /// and no frozen copy.
+    bool Seams = true;
   };
 
   /// The points of the run at which an observer is called.
@@ -203,6 +395,9 @@ public:
     viskores::Id FlaggedTopology = 0;
     viskores::Id FlaggedEmbedding = 0;
     viskores::Id FlaggedEnvelope = 0;
+    /// Clusters found adjacent to two copies of a frozen vertex of a cut input, over the loop;
+    /// they are flagged with (F2) and (F3).
+    viskores::Id GlueViolations = 0;
     /// Output triangles given to (F4), and pieces examined by the envelope tests, over the run:
     /// machine-independent measures of the two most expensive steps.
     viskores::Id EmbeddingTriangles = 0;
@@ -230,7 +425,8 @@ public:
 
   /// Sets the fixed order of the commit step: vertex `u` beats `v` if its key is larger, or equal
   /// with a larger index. By default the key is a hash of the vertex index. Implementations that
-  /// are to agree must use the same order.
+  /// are to agree must use the same order. For an input that is cut into surfaces, the keys are
+  /// those of the copies, numbered as by `GetCopyOriginals()`.
   VISKORES_CONT void SetPriority(const viskores::cont::ArrayHandle<viskores::UInt64>& priority)
   {
     this->Priority = priority;
@@ -238,10 +434,12 @@ public:
 
   VISKORES_CONT void SetObserver(const Observer& observer) { this->ObserverFunction = observer; }
 
-  /// Decimates the triangles `triangles` on the points `points`. Throws `ErrorBadValue` for
-  /// degenerate triangles, points in no triangle, an input that is not a consistently oriented
-  /// surface, and, with the embedding flag, an input that is not embedded (Hypothesis
-  /// "embedded").
+  /// Decimates the triangles `triangles` on the points `points`. A complex that is not a
+  /// consistently oriented surface is cut along its singular edges and, with `Seams`, a seam
+  /// into surfaces whose copies of the cut vertices stay fixed, and glued back (Theorem "Inputs
+  /// that are not surfaces"), unless the geometric-only mode is on. Throws `ErrorBadValue` for degenerate
+  /// triangles, points in no triangle, budget mode on an input that needs the cut, and, with the
+  /// embedding flag, an input that is not embedded (Hypothesis "embedded").
   VISKORES_CONT void Run(const viskores::cont::ArrayHandle<Vec3>& points,
                          const viskores::cont::ArrayHandle<viskores::Id3>& triangles)
   {
@@ -268,19 +466,51 @@ public:
       slot += timer.GetElapsedTime();
     };
     timer.Start();
+    const bool geometric = this->Params.GeometricOnly;
     const viskores::Id budget = this->Params.TargetNumberOfPoints;
     const viskores::Id numInputPoints = points.GetNumberOfValues();
 
-    // The input: a surface.
-    qc::BuildSurfaceMesh(points, triangles, this->Mesh);
-    if (this->Params.Embedding)
+    // The input: a surface, a complex cut into surfaces, or any complex.
+    const std::string problem =
+      qc::BuildSurfaceMesh(points, triangles, false, this->Mesh, !this->Params.Seams);
+    this->Canonical.ReleaseResources();
+    this->FrozenCopies.ReleaseResources();
+    this->CopyOriginals.ReleaseResources();
+    if (this->Params.Embedding && !geometric)
     {
       this->CheckEmbedded(points, triangles);
     }
+    if (geometric && this->Params.ErrorBound > 0 &&
+        this->Params.ErrorSides != qc::EnvelopeSides::Both)
+    {
+      throw viskores::cont::ErrorBadValue("QuadricClusteringDecimation: the geometric-only mode "
+                                          "checks both sides of the error bound.");
+    }
     const qc::EnvelopeSides sides = this->Params.ErrorSides;
+    // Without seams, a surface that is not consistently oriented is cut too, along nothing, as
+    // the reference cuts it.
+    const bool unoriented = !this->Params.Seams && this->Mesh.Unoriented;
+    if (!geometric && (!problem.empty() || unoriented))
+    {
+      if (budget > 0)
+      {
+        throw viskores::cont::ErrorBadValue(
+          "QuadricClusteringDecimation: budget mode needs a surface without cut, and the input " +
+          (!problem.empty() ? "is not one: " + problem
+                            : std::string("is not consistently oriented")) +
+          ".");
+      }
+      this->CutInput(points, triangles);
+    }
     const qc::SurfaceMesh& mesh = this->Mesh;
     const viskores::Id n = mesh.NumberOfPoints;
-    const qc::QuadricParameters quadric = this->Params.Quadric;
+    qc::QuadricParameters quadric = this->Params.Quadric;
+    if (geometric)
+    {
+      // Without a surface there are no dihedral angles or boundary edges.
+      quadric.FeatureWeight = 0;
+      quadric.BoundaryWeight = 0;
+    }
     timer.Stop();
     seconds.Setup += timer.GetElapsedTime();
     timed(seconds.Quadrics, [&] { this->Quadrics = qc::ComputeVertexQuadrics(mesh, quadric); });
@@ -294,12 +524,19 @@ public:
     else if (priority.GetNumberOfValues() != n)
     {
       throw viskores::cont::ErrorBadValue("QuadricClusteringDecimation: the priority needs one key "
-                                          "per vertex of the mesh decimated.");
+                                          "per vertex of the mesh decimated, the copies of a cut "
+                                          "input included.");
     }
-    // One-rings for the guard of surfaces.
-    const viskores::cont::ArrayHandle<viskores::Id>& ringOffsets = mesh.RingOffsets;
-    const viskores::cont::ArrayHandle<viskores::Id>& rings = mesh.Rings;
-    const viskores::cont::ArrayHandle<viskores::UInt8>& isBoundary = mesh.IsBoundaryVertex;
+    // One-rings for the guard of surfaces, sorted neighbours for its graph form.
+    const viskores::cont::ArrayHandle<viskores::Id>& ringOffsets =
+      geometric ? mesh.NeighborOffsets : mesh.RingOffsets;
+    const viskores::cont::ArrayHandle<viskores::Id>& rings =
+      geometric ? mesh.Neighbors : mesh.Rings;
+    viskores::cont::ArrayHandle<viskores::UInt8> isBoundary = mesh.IsBoundaryVertex;
+    if (geometric)
+    {
+      isBoundary.AllocateAndFill(n, 0);
+    }
     const viskores::cont::ArrayHandle<viskores::Id2> ringRanges =
       qc::MakeRingRanges(ringOffsets, n);
     const Real errorBound = this->Params.ErrorBound;
@@ -308,10 +545,13 @@ public:
     {
       inputDistance = qc::BuildDistanceMesh(mesh.Points, mesh.Triangles);
     }
-    const bool embedding = this->Params.Embedding;
-    const bool topology = this->Params.Topology;
+    const bool embedding = this->Params.Embedding && !geometric;
+    const bool topology = this->Params.Topology && !geometric;
+    const qc::EnvelopeMode envelopeMode =
+      geometric ? qc::EnvelopeMode::Simplices : qc::EnvelopeMode::Surface;
     qc::Clustering& clusters = this->Clusters;
     clusters = qc::Clustering{};
+    viskores::cont::ArrayHandle<viskores::UInt8> frozenLabels;
 
     auto observe = [&](Stage stage, const State& state)
     {
@@ -341,9 +581,12 @@ public:
         qc::Assign(mesh,
                    ringRanges,
                    rings,
+                   ringOffsets,
+                   geometric,
                    isBoundary,
                    this->Quadrics.M,
                    priority,
+                   frozenLabels,
                    this->Params.MaxSweeps,
                    clusters.Labels,
                    clusters.Generators,
@@ -354,14 +597,20 @@ public:
     auto place = [&]()
     {
       qc::Place(mesh, this->Quadrics.M, clusters);
+      frozenLabels = qc::FrozenLabels(this->FrozenCopies, clusters);
       observe(Stage::Placed, State{ mesh, this->Quadrics, clusters });
     };
 
     timer.Stop();
     seconds.Setup += timer.GetElapsedTime();
     timer.Start();
-    // Initialisation: one cluster per component, or seeds and a Lloyd phase.
-    const Initialization initialization = this->Params.InitialClusters;
+    // Initialisation: one cluster per component, frozen vertices apart, or seeds and a Lloyd
+    // phase. An input cut into surfaces and the geometric-only mode start from the components.
+    Initialization initialization = this->Params.InitialClusters;
+    if (geometric || this->FrozenCopies.GetNumberOfValues() > 0)
+    {
+      initialization = Initialization::Single;
+    }
     if (initialization != Initialization::Single)
     {
       if (initialization == Initialization::Morton && budget > 0)
@@ -438,6 +687,12 @@ public:
                 topologyFlags.AllocateAndFill(k, 0);
                 topologyReport = qc::TopologyFlags(
                   mesh, clusters.Labels, clusters.Sizes, topologyFlags, this->Params.D2ByCount);
+                this->Diag.GlueViolations += qc::GlueFlags(mesh,
+                                                           clusters.Labels,
+                                                           this->FrozenCopies,
+                                                           this->Canonical,
+                                                           clusters.Sizes,
+                                                           topologyFlags);
                 this->Diag.FlaggedTopology += qc::OrFlags(flags, topologyFlags);
               });
       }
@@ -449,7 +704,10 @@ public:
         embeddingFlags.AllocateAndFill(k, 0);
         const auto outputTriangles = qc::OutputTriangles(mesh, clusters.Labels);
         this->Diag.EmbeddingTriangles += outputTriangles.GetNumberOfValues();
-        qc::EmbeddingFlags(outputTriangles, clusters.Generators, clusters.Sizes, embeddingFlags);
+        qc::EmbeddingFlags(qc::GlueTriangles(outputTriangles, this->Glue(clusters)),
+                           clusters.Generators,
+                           clusters.Sizes,
+                           embeddingFlags);
         this->Diag.FlaggedEmbedding += qc::OrFlags(flags, embeddingFlags);
         timer.Stop();
         seconds.Embedding += timer.GetElapsedTime();
@@ -466,9 +724,11 @@ public:
                             inputDistance,
                             clusters.Labels,
                             clusters.Generators,
-                            qc::OutputTriangles(mesh, clusters.Labels),
+                            geometric ? qc::Simplices(mesh, clusters.Labels)
+                                      : qc::OutputTriangles(mesh, clusters.Labels),
                             clusters.Sizes,
                             errorBound,
+                            envelopeMode,
                             sides,
                             envelopeFlags);
         this->Diag.EnvelopePieces += envelopeReport.Pieces;
@@ -495,6 +755,7 @@ public:
                                  scan,
                                  this->Params.InsertionRule == Insertion::Split2,
                                  clusters);
+              frozenLabels = qc::FrozenLabels(this->FrozenCopies, clusters);
             });
       observe(Stage::Split, State{ mesh, this->Quadrics, clusters });
     }
@@ -511,7 +772,11 @@ public:
       merge.Embedding = embedding;
       merge.ErrorBound = errorBound;
       merge.Sides = sides;
+      merge.Topological = !geometric;
       merge.D2ByCount = this->Params.D2ByCount;
+      merge.Canonical = this->Canonical;
+      merge.FrozenVertices = this->FrozenCopies;
+      merge.Original = this->CopyOriginals;
       merge.DegreeFloor = this->Params.MergeDegreeFloor;
       merge.Order = this->Params.MergeOrder;
       merge.DeferFlagged = this->Params.DeferFlaggedMerges;
@@ -527,7 +792,7 @@ public:
     }
     timer.Stop();
     seconds.Merge += timer.GetElapsedTime();
-    timed(seconds.Output, [&] { this->ExtractOutput(numInputPoints); });
+    timed(seconds.Output, [&] { this->ExtractOutput(numInputPoints, geometric); });
   }
 
   /// The cluster of every input vertex.
@@ -571,7 +836,17 @@ public:
     return this->Quadrics;
   }
 
-  /// The output cells: triangles.
+  /// The output cells: triangles, and in the geometric-only mode also segments and points that
+  /// lie in no other output cell. `GetOutputCellOffsets()` has one more entry than there are
+  /// cells.
+  VISKORES_CONT const viskores::cont::ArrayHandle<viskores::UInt8>& GetOutputCellShapes() const
+  {
+    return this->OutputCellShapes;
+  }
+  VISKORES_CONT const viskores::cont::ArrayHandle<viskores::Id>& GetOutputCellOffsets() const
+  {
+    return this->OutputCellOffsets;
+  }
   VISKORES_CONT const viskores::cont::ArrayHandle<viskores::Id>& GetOutputCellConnectivity() const
   {
     return this->OutputCellConnectivity;
@@ -590,6 +865,16 @@ public:
   VISKORES_CONT const viskores::cont::ArrayHandle<viskores::Id>& GetOutputPointMap() const
   {
     return this->OutputPointMap;
+  }
+  /// For an input that was cut into surfaces: the input point of every copy, and which copies
+  /// were frozen. Empty otherwise.
+  VISKORES_CONT const viskores::cont::ArrayHandle<viskores::Id>& GetCopyOriginals() const
+  {
+    return this->CopyOriginals;
+  }
+  VISKORES_CONT const viskores::cont::ArrayHandle<viskores::UInt8>& GetFrozenCopies() const
+  {
+    return this->FrozenCopies;
   }
 
 private:
@@ -611,8 +896,34 @@ private:
         std::to_string(report.NumberOfDegenerateTriangles) + " degenerate triangles, " +
         std::to_string(report.NumberOfImproperPairs) +
         " pairs of triangles that intersect improperly), so the embedding of the output "
-        "cannot be guaranteed; turn the embedding flag off.");
+        "cannot be guaranteed; turn the embedding flag off, or use the geometric-only mode.");
     }
+  }
+
+  /// Cuts the input along its singular edges and, with `Seams`, a seam into surfaces, and builds
+  /// the mesh of the copies, with the frozen copies and the first copy of every input point.
+  VISKORES_CONT void CutInput(const viskores::cont::ArrayHandle<Vec3>& points,
+                              const viskores::cont::ArrayHandle<viskores::Id3>& triangles)
+  {
+    namespace qc = quadric_clustering;
+    using Algorithm = viskores::cont::Algorithm;
+    const viskores::Id numPoints = points.GetNumberOfValues();
+    const qc::CutComplex cut = qc::CutAlongSingularEdges(triangles, numPoints, this->Params.Seams);
+    // The copies of a vertex are numbered consecutively; the first is canonical.
+    viskores::cont::ArrayHandle<Vec3> copyPoints;
+    Algorithm::Copy(viskores::cont::make_ArrayHandlePermutation(cut.Original, points), copyPoints);
+    Algorithm::LowerBounds(cut.Original, cut.Original, this->Canonical);
+    qc::BuildSurfaceMesh(copyPoints, cut.Triangles, true, this->Mesh, !this->Params.Seams);
+    this->FrozenCopies = cut.Frozen;
+    this->CopyOriginals = cut.Original;
+  }
+
+  /// The vertex of the glued output of every label of a cut input: the copies of every frozen
+  /// vertex identified.
+  VISKORES_CONT viskores::cont::ArrayHandle<viskores::Id> Glue(
+    const quadric_clustering::Clustering& clusters) const
+  {
+    return quadric_clustering::GlueMap(this->Canonical, clusters);
   }
 
   static bool ArraysEqual(const viskores::cont::ArrayHandle<viskores::Id>& a,
@@ -627,16 +938,27 @@ private:
     return viskores::cont::Algorithm::Reduce(differ, viskores::Id(0)) == 0;
   }
 
-  /// Keys whose equal neighbours are joined into the initial clusters: all vertices alike.
+  /// Keys whose equal neighbours are joined into the initial clusters: all vertices alike, but
+  /// every frozen vertex apart.
   VISKORES_CONT viskores::cont::ArrayHandle<viskores::Id> InitialComponentKeys(viskores::Id n) const
   {
     viskores::cont::ArrayHandle<viskores::Id> keys;
-    keys.AllocateAndFill(n, 0);
+    if (this->FrozenCopies.GetNumberOfValues() > 0)
+    {
+      viskores::cont::Invoker invoke;
+      invoke(component_detail::ComponentKey{}, this->FrozenCopies, keys);
+    }
+    else
+    {
+      keys.AllocateAndFill(n, 0);
+    }
     return keys;
   }
 
-  /// The output of Algorithm 5: the output triangles.
-  VISKORES_CONT void ExtractOutput(viskores::Id numInputPoints)
+  /// The output of Algorithm 5. For a surface, the output triangles; for a cut input, glued at
+  /// the copies of every frozen vertex and compacted; in the geometric-only mode, the simplices
+  /// `g(t)`, each a triangle, a segment or a point, without those contained in another.
+  VISKORES_CONT void ExtractOutput(viskores::Id numInputPoints, bool geometric)
   {
     namespace qc = quadric_clustering;
     namespace od = output_detail;
@@ -648,20 +970,104 @@ private:
       qc::OutputTriangles(mesh, clusters.Labels, &this->OutputTriangleSources);
     const viskores::Id k = clusters.NumberOfClusters;
     viskores::cont::ArrayHandle<viskores::Id> pointOfLabel;
-    Algorithm::Copy(viskores::cont::ArrayHandleIndex(k), pointOfLabel);
-    Algorithm::Copy(clusters.Generators, this->OutputPoints);
-    invoke(qc::GatherTriple{},
-           this->OutputTriangles,
-           pointOfLabel,
-           viskores::cont::make_ArrayHandleGroupVec<3>(this->OutputCellConnectivity));
-    Algorithm::Copy(this->OutputTriangleSources, this->OutputCellSources);
-    // The output point of every input point.
+    if (geometric)
+    {
+      // Every distinct label set, from its first input triangle, with repeated labels removed.
+      viskores::cont::ArrayHandle<viskores::Vec<viskores::Id, 4>> records;
+      invoke(od::SortedLabelRecord{}, mesh.Triangles, clusters.Labels, records);
+      Algorithm::Sort(records);
+      viskores::cont::ArrayHandle<viskores::UInt8> firstOfKey;
+      invoke(qc::FirstOfRun<3>{},
+             viskores::cont::ArrayHandleIndex(records.GetNumberOfValues()),
+             records,
+             firstOfKey);
+      viskores::cont::ArrayHandle<viskores::Vec<viskores::Id, 4>> distinct;
+      Algorithm::CopyIf(records, firstOfKey, distinct);
+      // The edges of the triangles, and the labels in a simplex that is not a point.
+      viskores::cont::ArrayHandle<viskores::Id2> triangleEdges;
+      viskores::cont::ArrayHandle<viskores::Id> covered;
+      invoke(od::SimplexFaces{},
+             distinct,
+             viskores::cont::make_ArrayHandleGroupVec<3>(triangleEdges),
+             viskores::cont::make_ArrayHandleGroupVec<3>(covered));
+      Algorithm::Sort(triangleEdges);
+      Algorithm::Unique(triangleEdges);
+      Algorithm::Sort(covered);
+      Algorithm::Unique(covered);
+      viskores::cont::ArrayHandle<viskores::UInt8> kept;
+      invoke(od::NotContained{}, distinct, triangleEdges, covered, kept);
+      // The kept simplices in the order of their first triangles.
+      viskores::cont::ArrayHandle<viskores::Id> firstTriangles;
+      invoke(od::RecordTriangle{}, distinct, firstTriangles);
+      viskores::cont::ArrayHandle<viskores::Id> cellTriangles;
+      Algorithm::CopyIf(firstTriangles, kept, cellTriangles);
+      Algorithm::Sort(cellTriangles);
+      viskores::cont::ArrayHandle<viskores::IdComponent> sizes;
+      invoke(od::DistinctLabelCount{}, cellTriangles, mesh.Triangles, clusters.Labels, sizes);
+      viskores::cont::ArrayHandle<viskores::Id> offsets;
+      Algorithm::ScanExtended(viskores::cont::make_ArrayHandleCast<viskores::Id>(sizes), offsets);
+      const viskores::Id total =
+        viskores::cont::ArrayGetValue(cellTriangles.GetNumberOfValues(), offsets);
+      this->OutputCellConnectivity.Allocate(total);
+      invoke(od::WriteSimplex{},
+             cellTriangles,
+             viskores::cont::make_ArrayHandleView(offsets, 0, cellTriangles.GetNumberOfValues()),
+             mesh.Triangles,
+             clusters.Labels,
+             this->OutputCellConnectivity,
+             this->OutputCellShapes);
+      this->OutputCellOffsets = offsets;
+      this->OutputCellSources = cellTriangles;
+      this->OutputPoints = clusters.Generators;
+      Algorithm::Copy(viskores::cont::ArrayHandleIndex(k), pointOfLabel);
+    }
+    else
+    {
+      // Only the labels that are their own glued label remain, numbered in increasing order.
+      viskores::cont::ArrayHandle<viskores::Id> glue;
+      if (this->Canonical.GetNumberOfValues() > 0)
+      {
+        glue = this->Glue(clusters);
+      }
+      else
+      {
+        Algorithm::Copy(viskores::cont::ArrayHandleIndex(k), glue);
+      }
+      viskores::cont::ArrayHandle<viskores::Id> isOwnGlue, outputPoint;
+      invoke(qc::IsEqual{}, viskores::cont::ArrayHandleIndex(k), glue, isOwnGlue);
+      Algorithm::ScanExclusive(isOwnGlue, outputPoint);
+      invoke(qc::GatherValue{}, glue, outputPoint, pointOfLabel);
+      Algorithm::CopyIf(clusters.Generators, isOwnGlue, this->OutputPoints);
+      const viskores::Id m = this->OutputTriangles.GetNumberOfValues();
+      invoke(qc::GatherTriple{},
+             this->OutputTriangles,
+             pointOfLabel,
+             viskores::cont::make_ArrayHandleGroupVec<3>(this->OutputCellConnectivity));
+      Algorithm::Copy(viskores::cont::make_ArrayHandleConstant(
+                        static_cast<viskores::UInt8>(viskores::CELL_SHAPE_TRIANGLE), m),
+                      this->OutputCellShapes);
+      Algorithm::Copy(viskores::cont::make_ArrayHandleCounting<viskores::Id>(0, 3, m + 1),
+                      this->OutputCellOffsets);
+      Algorithm::Copy(this->OutputTriangleSources, this->OutputCellSources);
+    }
+    // The output point of every input point, through any of its copies, all glued together.
     this->OutputPointMap.AllocateAndFill(numInputPoints, -1);
-    invoke(od::MapInputPoint{},
-           viskores::cont::ArrayHandleIndex(numInputPoints),
-           clusters.Labels,
-           pointOfLabel,
-           this->OutputPointMap);
+    if (this->CopyOriginals.GetNumberOfValues() > 0)
+    {
+      invoke(od::MapInputPoint{},
+             this->CopyOriginals,
+             clusters.Labels,
+             pointOfLabel,
+             this->OutputPointMap);
+    }
+    else
+    {
+      invoke(od::MapInputPoint{},
+             viskores::cont::ArrayHandleIndex(numInputPoints),
+             clusters.Labels,
+             pointOfLabel,
+             this->OutputPointMap);
+    }
   }
 
   Parameters Params;
@@ -673,10 +1079,15 @@ private:
   quadric_clustering::Clustering Clusters;
   viskores::cont::ArrayHandle<viskores::Id3> OutputTriangles;
   viskores::cont::ArrayHandle<viskores::Id> OutputTriangleSources;
+  viskores::cont::ArrayHandle<viskores::UInt8> OutputCellShapes;
+  viskores::cont::ArrayHandle<viskores::Id> OutputCellOffsets;
   viskores::cont::ArrayHandle<viskores::Id> OutputCellConnectivity;
   viskores::cont::ArrayHandle<viskores::Id> OutputCellSources;
   viskores::cont::ArrayHandle<Vec3> OutputPoints;
   viskores::cont::ArrayHandle<viskores::Id> OutputPointMap;
+  viskores::cont::ArrayHandle<viskores::UInt8> FrozenCopies;
+  viskores::cont::ArrayHandle<viskores::Id> CopyOriginals;
+  viskores::cont::ArrayHandle<viskores::Id> Canonical;
   viskores::Id ClustersAfterLoop = 0;
   Diagnostics Diag;
   quadric_clustering::MergeDiagnostics MergeDiag;

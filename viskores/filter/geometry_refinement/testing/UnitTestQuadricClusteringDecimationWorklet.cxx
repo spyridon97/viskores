@@ -273,7 +273,7 @@ Decimation RunChecked(const Mesh& mesh, const Decimation::Parameters& parameters
   double lambdaLow = std::numeric_limits<double>::infinity();
   {
     qc::SurfaceMesh surface;
-    qc::BuildSurfaceMesh(mesh.PointArray(), mesh.TriangleArray(), surface);
+    qc::BuildSurfaceMesh(mesh.PointArray(), mesh.TriangleArray(), true, surface);
     const auto quadrics = qc::ComputeVertexQuadrics(surface, parameters.Quadric);
     for (double a : ToVector(quadrics.Area))
     {

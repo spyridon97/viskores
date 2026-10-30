@@ -7,6 +7,7 @@
 //============================================================================
 
 #include <viskores/cont/ArrayCopy.h>
+#include <viskores/cont/CellSetExplicit.h>
 #include <viskores/cont/CellSetSingleType.h>
 #include <viskores/cont/ErrorFilterExecution.h>
 #include <viskores/filter/MapFieldMergeAverage.h>
@@ -92,13 +93,18 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
   {
     reject("unknown guarantee bits.");
   }
-  if (!(guarantees & Topology))
+  if (!(guarantees & Topology) && (guarantees & NoSelfIntersections))
   {
-    reject("the Topology guarantee cannot be turned off.");
+    reject("the NoSelfIntersections guarantee requires Topology.");
   }
   if (this->ErrorBound > 0 && !(guarantees & TwoSidedError))
   {
     reject("an error bound needs ErrorOutputToInput, ErrorInputToOutput or both.");
+  }
+  if (this->ErrorBound > 0 && !(guarantees & Topology) &&
+      (guarantees & TwoSidedError) != TwoSidedError)
+  {
+    reject("the geometric-only mode checks both sides of the error bound.");
   }
   if (!(this->Regularization > 0))
   {
@@ -124,6 +130,7 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
   viskores::worklet::QuadricClusteringDecimation::Parameters parameters;
   parameters.ErrorBound = this->ErrorBound;
   parameters.TargetNumberOfPoints = this->TargetNumberOfPoints;
+  parameters.GeometricOnly = !(guarantees & Topology);
   parameters.Embedding = (guarantees & NoSelfIntersections) != 0;
   using Sides = viskores::worklet::quadric_clustering::EnvelopeSides;
   const viskores::UInt32 sides = guarantees & TwoSidedError;
@@ -154,10 +161,23 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
 
   const viskores::Id numPoints = worklet.GetOutputPoints().GetNumberOfValues();
   viskores::cont::UnknownCellSet outCellSet;
-  viskores::cont::CellSetSingleType<> triangleCells;
-  triangleCells.Fill(
-    numPoints, viskores::CELL_SHAPE_TRIANGLE, 3, worklet.GetOutputCellConnectivity());
-  outCellSet = triangleCells;
+  const viskores::Id numCells = worklet.GetOutputCellShapes().GetNumberOfValues();
+  if (worklet.GetOutputCellConnectivity().GetNumberOfValues() == 3 * numCells)
+  {
+    viskores::cont::CellSetSingleType<> triangleCells;
+    triangleCells.Fill(
+      numPoints, viskores::CELL_SHAPE_TRIANGLE, 3, worklet.GetOutputCellConnectivity());
+    outCellSet = triangleCells;
+  }
+  else
+  {
+    viskores::cont::CellSetExplicit<> mixedCells;
+    mixedCells.Fill(numPoints,
+                    worklet.GetOutputCellShapes(),
+                    worklet.GetOutputCellConnectivity(),
+                    worklet.GetOutputCellOffsets());
+    outCellSet = mixedCells;
+  }
   // Every output point averages the input points mapped to it.
   viskores::worklet::Keys<viskores::Id> pointKeys;
   pointKeys.BuildArrays(worklet.GetOutputPointMap(), viskores::worklet::KeysSortType::Stable);

@@ -187,11 +187,15 @@ namespace detail
 {
 
 /// An interior edge is sharp when the oriented normals of its triangles make an angle above
-/// the feature angle, compared through cosines.
+/// the feature angle, compared through cosines. The cosine takes the sign of the edge, so that
+/// on a piece that is not orientable the two normals are oriented alike.
 struct SharpEdge : viskores::worklet::WorkletMapField
 {
-  using ControlSignature = void(FieldIn edgeTriangles, WholeArrayIn normals, FieldOut sharp);
-  using ExecutionSignature = _3(_1, _2);
+  using ControlSignature = void(FieldIn edgeTriangles,
+                                FieldIn sign,
+                                WholeArrayIn normals,
+                                FieldOut sharp);
+  using ExecutionSignature = _4(_1, _2, _3);
 
   VISKORES_CONT explicit SharpEdge(Real cosFeatureAngle)
     : CosFeatureAngle(cosFeatureAngle)
@@ -200,6 +204,7 @@ struct SharpEdge : viskores::worklet::WorkletMapField
 
   template <typename NormalsPortal>
   VISKORES_EXEC viskores::UInt8 operator()(const viskores::Id2& edgeTriangles,
+                                           viskores::Int8 sign,
                                            const NormalsPortal& normals) const
   {
     if (edgeTriangles[1] < 0)
@@ -207,7 +212,8 @@ struct SharpEdge : viskores::worklet::WorkletMapField
       return 0;
     }
     const Real c = viskores::Min(
-      viskores::Max(Dot(normals.Get(edgeTriangles[0]), normals.Get(edgeTriangles[1])), Real(-1)),
+      viskores::Max(Real(sign) * Dot(normals.Get(edgeTriangles[0]), normals.Get(edgeTriangles[1])),
+                    Real(-1)),
       Real(1));
     return (c < this->CosFeatureAngle) ? 1 : 0;
   }
@@ -375,6 +381,7 @@ inline VertexQuadrics ComputeVertexQuadrics(const SurfaceMesh& mesh,
   viskores::cont::ArrayHandle<viskores::UInt8> sharpEdges;
   invoke(detail::SharpEdge(useFeatures ? cosFeatureAngle : Real(-2)),
          mesh.EdgeTriangles,
+         mesh.EdgeSigns,
          triangleNormals,
          sharpEdges);
 

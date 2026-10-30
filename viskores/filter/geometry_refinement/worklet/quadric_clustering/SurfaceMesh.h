@@ -58,6 +58,12 @@ struct SurfaceMesh
   /// a boundary edge.
   viskores::cont::ArrayHandle<viskores::Id2> EdgeTriangles;
   viskores::cont::ArrayHandle<viskores::IdComponent> EdgeTriangleCounts;
+  /// -1 where the two smallest triangles of an edge traverse it in the same direction, which
+  /// happens only on a piece that is not orientable, +1 elsewhere: the dihedral tests negate one
+  /// normal there.
+  viskores::cont::ArrayHandle<viskores::Int8> EdgeSigns;
+  /// Whether some edge has the sign -1: the triangles are not consistently oriented.
+  bool Unoriented = false;
 
   viskores::cont::ArrayHandle<viskores::Id> VertexEdgeOffsets;
   viskores::cont::ArrayHandle<viskores::Id> VertexEdges;
@@ -76,6 +82,10 @@ struct SurfaceMesh
   viskores::Id NumberOfComponents = 0;
   viskores::cont::ArrayHandle<viskores::Id> Components;
   viskores::cont::ArrayHandle<viskores::Id> ComponentBoundaryVertices;
+
+  /// The neighbours of every vertex in increasing order, for complexes without rings.
+  viskores::cont::ArrayHandle<viskores::Id> NeighborOffsets;
+  viskores::cont::ArrayHandle<viskores::Id> Neighbors;
 };
 
 namespace detail
@@ -181,6 +191,22 @@ struct EdgeEnds : viskores::worklet::WorkletMapField
   }
 };
 
+/// The other end of every incident edge, which lists the neighbours in increasing order.
+struct OtherEnd : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn vertex, FieldIn edgeId, WholeArrayIn edges, FieldOut other);
+  using ExecutionSignature = _4(_1, _2, _3);
+
+  template <typename EdgesPortal>
+  VISKORES_EXEC viskores::Id operator()(viskores::Id vertex,
+                                        viskores::Id edgeId,
+                                        const EdgesPortal& edges) const
+  {
+    const viskores::Id2 edge = edges.Get(edgeId);
+    return (edge[0] == vertex) ? edge[1] : edge[0];
+  }
+};
+
 /// At every corner of a triangle `(a, b, c)`, the directed pair of the opposite edge: at `a`
 /// the pair `b -> c`, at `b` the pair `c -> a`, at `c` the pair `a -> b`. Corner `s` of
 /// triangle `t` is stored at `s * numTriangles + t`.
@@ -216,28 +242,76 @@ struct CornerPairs : viskores::worklet::WorkletMapField
   viskores::Id NumberOfTriangles;
 };
 
-/// Walks the one-ring of a vertex. Its star must be consistently oriented (no source and no
-/// target repeats among its successor pairs `b -> c` of the triangles `(v, b, c)`), and the pairs
+/// The neighbours of `x` in the undirected link of a vertex, in the order in which a walk over
+/// the triangles in increasing order appends them: the other end of every pair that contains
+/// `x`, by increasing triangle. Returns their number; the first two are stored.
+template <typename IdVec, typename CornerVec>
+VISKORES_EXEC viskores::IdComponent LinkNeighbors(const IdVec& from,
+                                                  const IdVec& to,
+                                                  const CornerVec& corners,
+                                                  viskores::Id numTriangles,
+                                                  viskores::Id x,
+                                                  viskores::Id neighbors[2])
+{
+  const viskores::IdComponent degree = from.GetNumberOfComponents();
+  viskores::IdComponent count = 0;
+  viskores::Id triangles[2] = { -1, -1 };
+  for (viskores::IdComponent i = 0; i < degree; ++i)
+  {
+    if (from[i] != x && to[i] != x)
+    {
+      continue;
+    }
+    if (count < 2)
+    {
+      triangles[count] = corners[i] % numTriangles;
+      neighbors[count] = (from[i] == x) ? to[i] : from[i];
+    }
+    ++count;
+  }
+  // Beyond two the link branches, and the order does not matter.
+  if (count == 2 && triangles[1] < triangles[0])
+  {
+    const viskores::Id y = neighbors[0];
+    neighbors[0] = neighbors[1];
+    neighbors[1] = y;
+  }
+  return count;
+}
+
+/// Walks the one-ring of a vertex. Where its star is consistently oriented (no source and no
+/// target repeats among its successor pairs `b -> c` of the triangles `(v, b, c)`), the pairs
 /// must form a single cycle, or a single path that starts at the one neighbour that is no
-/// pair's target. The ring has as many vertices as the link. With `Write` set, it is stored.
+/// pair's target. Elsewhere, on a piece that is not orientable, the undirected link is walked
+/// as `Mesh` of proofs/lib/vqc.py does: from its smaller end (a path) or its smallest vertex (a
+/// cycle), to the first neighbour, in the order the triangles add them, that is not the
+/// previous vertex. The ring has as many vertices as the link. With `Write` set, it is stored.
 template <bool Write>
 struct RingWalk : viskores::worklet::WorkletReduceByKey
 {
   using ControlSignature = void(KeysIn keys,
                                 ValuesIn from,
                                 ValuesIn to,
+                                ValuesIn corners,
                                 WholeArrayIn ringOffsets,
                                 WholeArrayOut rings,
                                 ReducedValuesOut ringSize,
                                 ReducedValuesOut boundary,
                                 ReducedValuesOut valid);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8, _9);
   using InputDomain = _1;
 
-  template <typename IdVec, typename OffsetsPortal, typename RingsPortal>
+  VISKORES_CONT explicit RingWalk(viskores::Id numTriangles, bool oriented)
+    : NumberOfTriangles(numTriangles)
+    , Oriented(oriented)
+  {
+  }
+
+  template <typename IdVec, typename CornerVec, typename OffsetsPortal, typename RingsPortal>
   VISKORES_EXEC void operator()(viskores::Id vertex,
                                 const IdVec& from,
                                 const IdVec& to,
+                                const CornerVec& corners,
                                 const OffsetsPortal& ringOffsets,
                                 RingsPortal& rings,
                                 viskores::Id& ringSize,
@@ -266,7 +340,12 @@ struct RingWalk : viskores::worklet::WorkletReduceByKey
     }
     if (repeated)
     {
-      valid = 0; // two triangles with the same pair: not a surface around v
+      if (this->Oriented)
+      {
+        valid = 0; // two triangles with the same pair: not a surface around v
+        return;
+      }
+      this->WalkUndirected(from, to, corners, base, rings, ringSize, boundary, valid);
       return;
     }
     viskores::IdComponent head = -1;
@@ -346,6 +425,103 @@ struct RingWalk : viskores::worklet::WorkletReduceByKey
     }
     ringSize = degree + boundary;
   }
+
+  template <typename IdVec, typename CornerVec, typename RingsPortal>
+  VISKORES_EXEC void WalkUndirected(const IdVec& from,
+                                    const IdVec& to,
+                                    const CornerVec& corners,
+                                    viskores::Id base,
+                                    RingsPortal& rings,
+                                    viskores::Id& ringSize,
+                                    viskores::UInt8& boundary,
+                                    viskores::UInt8& valid) const
+  {
+    const viskores::IdComponent degree = from.GetNumberOfComponents();
+    // The link vertices, each once: its number, its smallest vertex and its smallest end.
+    viskores::IdComponent linkSize = 0, ends = 0;
+    viskores::Id smallest = -1, firstEnd = -1;
+    for (viskores::IdComponent i = 0; i < 2 * degree; ++i)
+    {
+      const viskores::Id x = (i < degree) ? from[i] : to[i - degree];
+      bool seen = false;
+      for (viskores::IdComponent j = 0; j < i; ++j)
+      {
+        if (((j < degree) ? from[j] : to[j - degree]) == x)
+        {
+          seen = true;
+          break;
+        }
+      }
+      if (seen)
+      {
+        continue;
+      }
+      ++linkSize;
+      viskores::Id neighbors[2];
+      const viskores::IdComponent count =
+        LinkNeighbors(from, to, corners, this->NumberOfTriangles, x, neighbors);
+      if (count > 2)
+      {
+        valid = 0; // the link branches
+        return;
+      }
+      smallest = (smallest < 0) ? x : viskores::Min(smallest, x);
+      if (count == 1)
+      {
+        ++ends;
+        firstEnd = (firstEnd < 0) ? x : viskores::Min(firstEnd, x);
+      }
+    }
+    if (ends != 0 && ends != 2)
+    {
+      valid = 0; // several paths
+      return;
+    }
+    const viskores::Id start = (ends > 0) ? firstEnd : smallest;
+    viskores::Id current = start, previous = -1;
+    viskores::IdComponent length = 0;
+    while (true)
+    {
+      if (length >= linkSize)
+      {
+        valid = 0;
+        return;
+      }
+      if (Write)
+      {
+        rings.Set(base + length, current);
+      }
+      ++length;
+      viskores::Id neighbors[2];
+      const viskores::IdComponent count =
+        LinkNeighbors(from, to, corners, this->NumberOfTriangles, current, neighbors);
+      viskores::Id next = -1;
+      for (viskores::IdComponent i = 0; i < count; ++i)
+      {
+        if (neighbors[i] != previous)
+        {
+          next = neighbors[i];
+          break;
+        }
+      }
+      if (next < 0 || next == start)
+      {
+        break;
+      }
+      previous = current;
+      current = next;
+    }
+    if (length != linkSize)
+    {
+      valid = 0; // the walk misses a link vertex
+      return;
+    }
+    boundary = (ends > 0) ? 1 : 0;
+    ringSize = linkSize;
+  }
+
+  viskores::Id NumberOfTriangles;
+  bool Oriented;
 };
 
 /// Unites the ends of every edge whose ends carry the same label.
@@ -418,11 +594,16 @@ struct CountBoundaryVertices : viskores::worklet::WorkletMapField
 } // namespace detail
 
 /// Reads a triangle complex and builds its edges and incidences, and, if it is a surface, its
-/// one-rings. Throws `ErrorBadValue` if a point is in no triangle, and if the complex is not a
-/// consistently oriented surface (closed or with boundary).
-inline void BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
-                             const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
-                             SurfaceMesh& mesh)
+/// one-rings. Throws `ErrorBadValue` if a point is in no triangle, and, when `requireSurface`
+/// is set, if the complex is not a consistently oriented surface (closed or with boundary).
+/// Returns an empty string for a surface and otherwise the reason it is not one. With
+/// `acceptUnoriented`, a surface whose triangles are not consistently oriented, such as a piece that
+/// is not orientable, is a surface too (Corollary "nonorientable"); `Unoriented` tells it.
+inline std::string BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
+                                    const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
+                                    bool requireSurface,
+                                    SurfaceMesh& mesh,
+                                    bool acceptUnoriented = false)
 {
   using Algorithm = viskores::cont::Algorithm;
   viskores::cont::Invoker invoke;
@@ -448,19 +629,17 @@ inline void BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
   viskores::worklet::Keys<viskores::Id2> edgeKeys;
   edgeKeys.BuildArrays(halfEdgeKeys, viskores::worklet::KeysSortType::Unstable);
   mesh.Edges = edgeKeys.GetUniqueKeys();
-  viskores::cont::ArrayHandle<viskores::Int8> edgeSigns;
   invoke(detail::EdgeIncidence{},
          edgeKeys,
          halfEdgeIds,
          triangles,
          mesh.EdgeTriangles,
          mesh.EdgeTriangleCounts,
-         edgeSigns);
-  bool unoriented = false;
+         mesh.EdgeSigns);
   {
     viskores::cont::ArrayHandle<viskores::Id> negative;
-    invoke(detail::NegativeSign{}, edgeSigns, negative);
-    unoriented = Algorithm::Reduce(negative, viskores::Id(0)) > 0;
+    invoke(detail::NegativeSign{}, mesh.EdgeSigns, negative);
+    mesh.Unoriented = Algorithm::Reduce(negative, viskores::Id(0)) > 0;
   }
 
   // Edges of every vertex, in increasing edge order.
@@ -480,6 +659,12 @@ inline void BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
   Algorithm::Copy(
     viskores::cont::make_ArrayHandlePermutation(vertexKeys.GetSortedValuesMap(), endEdge),
     mesh.VertexEdges);
+  invoke(detail::OtherEnd{},
+         viskores::cont::make_ArrayHandlePermutation(vertexKeys.GetSortedValuesMap(), endVertex),
+         mesh.VertexEdges,
+         mesh.Edges,
+         mesh.Neighbors);
+  mesh.NeighborOffsets = mesh.VertexEdgeOffsets;
 
   // Corners of every vertex, in increasing corner order.
   viskores::cont::ArrayHandle<viskores::Id> cornerVertex, cornerFrom, cornerTo;
@@ -500,7 +685,7 @@ inline void BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
   {
     problem = "an edge lies in more than two triangles";
   }
-  else if (unoriented)
+  else if (mesh.Unoriented && !acceptUnoriented)
   {
     problem = "the triangles are not consistently oriented";
   }
@@ -510,10 +695,12 @@ inline void BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
     viskores::cont::ArrayHandle<viskores::UInt8> valid;
     viskores::cont::ArrayHandle<viskores::Id> noOffsets;
     viskores::cont::ArrayHandle<viskores::Id> noRings;
-    invoke(detail::RingWalk<false>{},
+    const viskores::cont::ArrayHandleIndex cornerIds(3 * m);
+    invoke(detail::RingWalk<false>(m, !mesh.Unoriented),
            cornerKeys,
            cornerFrom,
            cornerTo,
+           cornerIds,
            noOffsets,
            noRings,
            ringSize,
@@ -527,10 +714,11 @@ inline void BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
     {
       Algorithm::ScanExtended(ringSize, mesh.RingOffsets);
       mesh.Rings.Allocate(viskores::cont::ArrayGetValue(n, mesh.RingOffsets));
-      invoke(detail::RingWalk<true>{},
+      invoke(detail::RingWalk<true>(m, !mesh.Unoriented),
              cornerKeys,
              cornerFrom,
              cornerTo,
+             cornerIds,
              mesh.RingOffsets,
              mesh.Rings,
              ringSize,
@@ -550,11 +738,12 @@ inline void BuildSurfaceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
              mesh.ComponentBoundaryVertices);
     }
   }
-  if (!problem.empty())
+  if (requireSurface && !problem.empty())
   {
     throw viskores::cont::ErrorBadValue(
       "QuadricClusteringDecimation: the mesh is not a surface: " + problem + ".");
   }
+  return problem;
 }
 
 }

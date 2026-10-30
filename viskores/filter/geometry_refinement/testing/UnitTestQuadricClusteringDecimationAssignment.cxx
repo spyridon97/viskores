@@ -61,7 +61,7 @@ void TestGuardGrid()
                                    grid.Points[static_cast<std::size_t>(v)] };
 
   qc::SurfaceMesh surface;
-  qc::BuildSurfaceMesh(grid.PointArray(), grid.TriangleArray(), surface);
+  qc::BuildSurfaceMesh(grid.PointArray(), grid.TriangleArray(), true, surface);
   qc::QuadricParameters parameters;
   const auto quadrics = qc::ComputeVertexQuadrics(surface, parameters);
   const auto ranges = qc::MakeRingRanges(surface.RingOffsets, 20);
@@ -77,8 +77,10 @@ void TestGuardGrid()
            surface.Points,
            quadrics.M,
            surface.Rings,
+           surface.RingOffsets,
            viskores::cont::make_ArrayHandle(labels, viskores::CopyFlag::On),
            viskores::cont::make_ArrayHandle(generators, viskores::CopyFlag::On),
+           viskores::cont::ArrayHandle<viskores::UInt8>(),
            proposes,
            targets);
     const auto p = ToVector(proposes);
@@ -99,9 +101,12 @@ void TestGuardGrid()
     qc::Assign(surface,
                ranges,
                surface.Rings,
+               surface.RingOffsets,
+               false,
                surface.IsBoundaryVertex,
                quadrics.M,
                viskores::cont::make_ArrayHandle(keys, viskores::CopyFlag::On),
+               viskores::cont::ArrayHandle<viskores::UInt8>(),
                1,
                labelArray,
                viskores::cont::make_ArrayHandle(generators, viskores::CopyFlag::On),
@@ -143,15 +148,18 @@ void TestGuardBoundaryPath()
   labels[1] = labels[2] = labels[3] = 0;
   std::vector<Vec3> generators = { Vec3(2, 50, 0), Vec3(2, 0.5, 0) };
   qc::SurfaceMesh surface;
-  qc::BuildSurfaceMesh(strip.PointArray(), strip.TriangleArray(), surface);
+  qc::BuildSurfaceMesh(strip.PointArray(), strip.TriangleArray(), true, surface);
   const auto quadrics = qc::ComputeVertexQuadrics(surface, qc::QuadricParameters{});
   auto labelArray = viskores::cont::make_ArrayHandle(labels, viskores::CopyFlag::On);
   qc::Assign(surface,
              qc::MakeRingRanges(surface.RingOffsets, 15),
              surface.Rings,
+             surface.RingOffsets,
+             false,
              surface.IsBoundaryVertex,
              quadrics.M,
              qc::DefaultPriority(15),
+             viskores::cont::ArrayHandle<viskores::UInt8>(),
              0,
              labelArray,
              viskores::cont::make_ArrayHandle(generators, viskores::CopyFlag::On),

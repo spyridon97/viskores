@@ -52,6 +52,17 @@ struct DistanceMesh
   viskores::cont::ArrayHandle<viskores::Id3> Keys;
 };
 
+/// Which triangles the envelope flag tests, and against what.
+enum class EnvelopeMode
+{
+  /// (F5): the output triangles of the 3-label triangles against the input, and the input
+  /// triangles against the realised output.
+  Surface,
+  /// (F5'), the geometric-only mode: the simplex `g(t)` of every input triangle against the
+  /// input, and every input triangle against the union of the simplices.
+  Simplices
+};
+
 /// The halves of the envelope flag (F5) in use: (i) every output triangle within epsilon of the
 /// input, (ii) every input triangle within epsilon of the output.
 enum class EnvelopeSides : viskores::UInt8
@@ -475,8 +486,9 @@ VISKORES_EXEC_CONT inline Real PointTriangleDistanceUpper(const Vec3& p,
 /// The candidates of the single-triangle condition, as `single_triangle_bound` of
 /// proofs/lib/common.py: the triangles whose centroids are nearest the centroid of a piece, at
 /// most eight, by (distance, key), whatever the spatial structure. A key is the position of
-/// the triangle in the mesh the reference builds: `(index, 0, 0)`; a key offered twice is kept
-/// once.
+/// the triangle in the mesh the reference builds: `(index, 0, 0)`, or the sorted label triple
+/// of a simplex of the geometric-only mode, whose mesh is the sorted list of distinct simplices;
+/// a key offered twice is the same simplex, kept once.
 struct CentroidCandidates
 {
   static constexpr int Capacity = 8;
@@ -927,10 +939,12 @@ struct IndexKey : viskores::worklet::WorkletMapField
 
 } // namespace detail
 
-/// The `DistanceMesh` of `triangles` on `points`; the keys `(index, 0, 0)` break ties between
-/// equal centroid distances (`CentroidCandidates`).
+/// The `DistanceMesh` of `triangles` on `points`; `keys`, by default `(index, 0, 0)`, break
+/// ties between equal centroid distances (`CentroidCandidates`).
 inline DistanceMesh BuildDistanceMesh(const viskores::cont::ArrayHandle<Vec3>& points,
-                                      const viskores::cont::ArrayHandle<viskores::Id3>& triangles)
+                                      const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
+                                      const viskores::cont::ArrayHandle<viskores::Id3>& keys =
+                                        viskores::cont::ArrayHandle<viskores::Id3>{})
 {
   viskores::cont::Invoker invoke;
   DistanceMesh mesh;
@@ -942,8 +956,16 @@ inline DistanceMesh BuildDistanceMesh(const viskores::cont::ArrayHandle<Vec3>& p
   mesh.MaxAbsCoordinate = MaxAbsCoordinate(points);
   invoke(detail::CentroidOf{}, triangles, points, mesh.Centroids);
   mesh.CentroidHierarchy.Build(mesh.Centroids, mesh.Centroids);
-  invoke(
-    detail::IndexKey{}, viskores::cont::ArrayHandleIndex(triangles.GetNumberOfValues()), mesh.Keys);
+  if (keys.GetNumberOfValues() == triangles.GetNumberOfValues())
+  {
+    mesh.Keys = keys;
+  }
+  else
+  {
+    invoke(detail::IndexKey{},
+           viskores::cont::ArrayHandleIndex(triangles.GetNumberOfValues()),
+           mesh.Keys);
+  }
   return mesh;
 }
 
@@ -1018,6 +1040,7 @@ inline EnvelopeReport EnvelopeFlags(
   const viskores::cont::ArrayHandle<viskores::Id3>& outputTriangles,
   const viskores::cont::ArrayHandle<viskores::Id>& sizes,
   Real epsilon,
+  EnvelopeMode mode,
   EnvelopeSides sides,
   viskores::cont::ArrayHandle<viskores::UInt8>& flags,
   EnvelopeVerdicts* verdicts = nullptr,
@@ -1044,7 +1067,14 @@ inline EnvelopeReport EnvelopeFlags(
     return report;
   }
   viskores::cont::ArrayHandle<viskores::UInt8> testOutput;
-  invoke(detail::IsThreeLabelTriangle{}, mesh.Triangles, labels, needsTest, testOutput);
+  if (mode == EnvelopeMode::Surface)
+  {
+    invoke(detail::IsThreeLabelTriangle{}, mesh.Triangles, labels, needsTest, testOutput);
+  }
+  else
+  {
+    testOutput = needsTest;
+  }
   const Real scaleFactor = 1 + 16 * UnitRoundoff;
   // The triangles a half tests: all, or with a base of the same scale, the affected ones.
   auto restrict = [&](const viskores::cont::ArrayHandle<viskores::UInt8>& all, bool sameScale)

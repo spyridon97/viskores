@@ -41,7 +41,7 @@ void TestQuadrics()
     }
   }
   qc::SurfaceMesh surface;
-  qc::BuildSurfaceMesh(octahedron.PointArray(), octahedron.TriangleArray(), surface);
+  qc::BuildSurfaceMesh(octahedron.PointArray(), octahedron.TriangleArray(), true, surface);
   qc::QuadricParameters parameters;
   parameters.Alpha = 0.1;
   parameters.FeatureWeight = 0;

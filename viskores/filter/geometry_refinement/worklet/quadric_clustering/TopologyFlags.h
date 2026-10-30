@@ -49,23 +49,25 @@ struct TopologyReport
 namespace detail
 {
 
-/// Per-cluster counts: edges inside, triangles inside, boundary vertices, boundary edges inside.
-/// Integer atomics give the same counts in any order.
+/// Per-cluster counts: edges inside, triangles inside, boundary vertices, boundary edges inside,
+/// and the ends of the cut edges. Integer atomics give the same counts in any order.
 struct CountEdges : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn edge,
                                 FieldIn edgeTriangles,
                                 WholeArrayIn labels,
                                 AtomicArrayInOut inside,
-                                AtomicArrayInOut boundaryInside);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5);
+                                AtomicArrayInOut boundaryInside,
+                                AtomicArrayInOut leaving);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
 
   template <typename LabelsPortal, typename Atomic>
   VISKORES_EXEC void operator()(const viskores::Id2& edge,
                                 const viskores::Id2& edgeTriangles,
                                 const LabelsPortal& labels,
                                 Atomic& inside,
-                                Atomic& boundaryInside) const
+                                Atomic& boundaryInside,
+                                Atomic& leaving) const
   {
     const viskores::Id label = labels.Get(edge[0]);
     const viskores::Id other = labels.Get(edge[1]);
@@ -76,6 +78,11 @@ struct CountEdges : viskores::worklet::WorkletMapField
       {
         boundaryInside.Add(label, 1);
       }
+    }
+    else
+    {
+      leaving.Add(label, 1);
+      leaving.Add(other, 1);
     }
   }
 };
@@ -98,14 +105,17 @@ struct CountTriangles : viskores::worklet::WorkletMapField
   }
 };
 
-/// (D0): `chi(M[C]) = 1`, and the boundary vertices of `C` form at most one run:
-/// `beta_C - gamma_C = [beta_C > 0]`. Clusters are connected, which is not tested here.
+/// (D0): `chi(M[C]) = 1`, the boundary vertices of `C` form at most one run:
+/// `beta_C - gamma_C = [beta_C > 0]`, and some cut edge leaves `C`, which is then not a whole
+/// component; on a closed orientable component `chi` is even, so only a projective plane needs
+/// this rule (Corollary "nonorientable"). Clusters are connected, which is not tested here.
 VISKORES_EXEC inline bool D0Violates(viskores::Id euler,
                                      viskores::Id boundaryVertices,
-                                     viskores::Id boundaryEdgesInside)
+                                     viskores::Id boundaryEdgesInside,
+                                     viskores::Id leaving)
 {
   const viskores::Id runs = boundaryVertices - boundaryEdgesInside;
-  return euler != 1 || runs != ((boundaryVertices > 0) ? 1 : 0);
+  return euler != 1 || runs != ((boundaryVertices > 0) ? 1 : 0) || leaving == 0;
 }
 
 /// (D0) per cluster, as `D0Violates`, with its Euler characteristic.
@@ -116,20 +126,22 @@ struct D0 : viskores::worklet::WorkletMapField
                                 FieldIn trianglesInside,
                                 FieldIn boundaryVertices,
                                 FieldIn boundaryEdgesInside,
+                                FieldIn leaving,
                                 FieldOut euler,
                                 FieldOut violates);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8);
 
   VISKORES_EXEC void operator()(viskores::Id size,
                                 viskores::Id edgesInside,
                                 viskores::Id trianglesInside,
                                 viskores::Id boundaryVertices,
                                 viskores::Id boundaryEdgesInside,
+                                viskores::Id leaving,
                                 viskores::Id& euler,
                                 viskores::UInt8& violates) const
   {
     euler = size - edgesInside + trianglesInside;
-    violates = D0Violates(euler, boundaryVertices, boundaryEdgesInside) ? 1 : 0;
+    violates = D0Violates(euler, boundaryVertices, boundaryEdgesInside, leaving) ? 1 : 0;
   }
 };
 
@@ -402,13 +414,19 @@ inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
 
   // (D0)
   viskores::cont::ArrayHandle<viskores::Id> edgesInside, trianglesInside, boundaryVertices,
-    boundaryEdgesInside;
+    boundaryEdgesInside, leaving;
   edgesInside.AllocateAndFill(k, 0);
   trianglesInside.AllocateAndFill(k, 0);
   boundaryVertices.AllocateAndFill(k, 0);
   boundaryEdgesInside.AllocateAndFill(k, 0);
-  invoke(
-    detail::CountEdges{}, mesh.Edges, mesh.EdgeTriangles, labels, edgesInside, boundaryEdgesInside);
+  leaving.AllocateAndFill(k, 0);
+  invoke(detail::CountEdges{},
+         mesh.Edges,
+         mesh.EdgeTriangles,
+         labels,
+         edgesInside,
+         boundaryEdgesInside,
+         leaving);
   invoke(detail::CountTriangles{}, mesh.Triangles, labels, trianglesInside);
   invoke(detail::CountBoundaryVertices{}, mesh.IsBoundaryVertex, labels, boundaryVertices);
   viskores::cont::ArrayHandle<viskores::Id> euler;
@@ -419,6 +437,7 @@ inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
          trianglesInside,
          boundaryVertices,
          boundaryEdgesInside,
+         leaving,
          euler,
          d0);
   report.NumberOfD0 = Algorithm::Reduce(d0, viskores::Id(0));
@@ -509,6 +528,110 @@ inline TopologyReport TopologyFlags(const SurfaceMesh& mesh,
 namespace detail
 {
 
+/// For an edge with exactly one frozen end: the cluster of the other end, the first copy of the
+/// input vertex of the frozen end, and the frozen copy; otherwise `(-1, -1, -1)`.
+struct FrozenContact : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn edge,
+                                WholeArrayIn frozen,
+                                WholeArrayIn canonical,
+                                WholeArrayIn labels,
+                                FieldOut contact);
+  using ExecutionSignature = _5(_1, _2, _3, _4);
+
+  template <typename FlagPortal, typename IdPortal>
+  VISKORES_EXEC viskores::Id3 operator()(const viskores::Id2& edge,
+                                         const FlagPortal& frozen,
+                                         const IdPortal& canonical,
+                                         const IdPortal& labels) const
+  {
+    const bool a = frozen.Get(edge[0]) != 0, b = frozen.Get(edge[1]) != 0;
+    if (a == b)
+    {
+      return viskores::Id3(-1);
+    }
+    const viskores::Id u = a ? edge[1] : edge[0];
+    const viskores::Id x = a ? edge[0] : edge[1];
+    return viskores::Id3(labels.Get(u), canonical.Get(x), x);
+  }
+};
+
+} // namespace detail
+
+/// For an input cut into surfaces: the frozen copies every cluster is adjacent to in `K_X`, as
+/// sorted triples (cluster, first copy of the input vertex, copy), without repetition.
+inline viskores::cont::ArrayHandle<viskores::Id3> FrozenContacts(
+  const SurfaceMesh& mesh,
+  const viskores::cont::ArrayHandle<viskores::Id>& labels,
+  const viskores::cont::ArrayHandle<viskores::UInt8>& frozenVertices,
+  const viskores::cont::ArrayHandle<viskores::Id>& canonical)
+{
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::Id3> all, contacts;
+  invoke(detail::FrozenContact{}, mesh.Edges, frozenVertices, canonical, labels, all);
+  viskores::cont::ArrayHandle<viskores::UInt8> valid;
+  invoke(IsValidRecord{}, all, valid);
+  viskores::cont::Algorithm::CopyIf(all, valid, contacts);
+  viskores::cont::Algorithm::Sort(contacts);
+  viskores::cont::Algorithm::Unique(contacts);
+  return contacts;
+}
+
+namespace detail
+{
+
+/// A cluster with two contacts to different copies of one input vertex.
+struct DoubleContact : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn index, WholeArrayIn contacts, FieldOut cluster);
+  using ExecutionSignature = _3(_1, _2);
+
+  template <typename ContactPortal>
+  VISKORES_EXEC viskores::Id operator()(viskores::Id index, const ContactPortal& contacts) const
+  {
+    if (index == 0)
+    {
+      return -1;
+    }
+    const viskores::Id3 a = contacts.Get(index - 1), b = contacts.Get(index);
+    return (a[0] == b[0] && a[1] == b[1]) ? b[0] : viskores::Id(-1);
+  }
+};
+
+} // namespace detail
+
+/// The glue condition for an input cut into surfaces (Theorem "Inputs that are not surfaces",
+/// (d)): flags every cluster adjacent in `K_X` to two copies of one frozen input vertex, whose
+/// gluing would identify two of its edges or triangles. Returns how many clusters it finds.
+inline viskores::Id GlueFlags(const SurfaceMesh& mesh,
+                              const viskores::cont::ArrayHandle<viskores::Id>& labels,
+                              const viskores::cont::ArrayHandle<viskores::UInt8>& frozenVertices,
+                              const viskores::cont::ArrayHandle<viskores::Id>& canonical,
+                              const viskores::cont::ArrayHandle<viskores::Id>& sizes,
+                              viskores::cont::ArrayHandle<viskores::UInt8>& flags)
+{
+  if (frozenVertices.GetNumberOfValues() == 0)
+  {
+    return 0;
+  }
+  viskores::cont::Invoker invoke;
+  const viskores::cont::ArrayHandle<viskores::Id3> contacts =
+    FrozenContacts(mesh, labels, frozenVertices, canonical);
+  viskores::cont::ArrayHandle<viskores::Id> doubled, listed;
+  invoke(detail::DoubleContact{},
+         viskores::cont::ArrayHandleIndex(contacts.GetNumberOfValues()),
+         contacts,
+         doubled);
+  viskores::cont::ArrayHandle<viskores::UInt8> valid;
+  invoke(IsValidLabel{}, doubled, valid);
+  viskores::cont::Algorithm::CopyIf(doubled, valid, listed);
+  FlagClusters(listed, sizes, flags);
+  return listed.GetNumberOfValues();
+}
+
+namespace detail
+{
+
 struct FirstTriangle : viskores::worklet::WorkletReduceByKey
 {
   using ControlSignature = void(KeysIn triples, ValuesIn triangles, ReducedValuesOut first);
@@ -575,6 +698,35 @@ inline viskores::cont::ArrayHandle<viskores::Id3> OutputTriangles(
     *sources = first;
   }
   return result;
+}
+
+/// The triangles with every label `l` replaced by `glue[l]`.
+inline viskores::cont::ArrayHandle<viskores::Id3> GlueTriangles(
+  const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
+  const viskores::cont::ArrayHandle<viskores::Id>& glue)
+{
+  if (glue.GetNumberOfValues() == 0)
+  {
+    return triangles;
+  }
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::Id3> glued;
+  invoke(GatherTriple{}, triangles, glue, glued);
+  return glued;
+}
+
+/// The simplices `g(t)` of the geometric-only mode: the sorted label triple of every input
+/// triangle, once each, with labels repeated for a segment or a point.
+inline viskores::cont::ArrayHandle<viskores::Id3> Simplices(
+  const SurfaceMesh& mesh,
+  const viskores::cont::ArrayHandle<viskores::Id>& labels)
+{
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::Id3> simplices;
+  invoke(GatherSortedTriple{}, mesh.Triangles, labels, simplices);
+  viskores::cont::Algorithm::Sort(simplices);
+  viskores::cont::Algorithm::Unique(simplices);
+  return simplices;
 }
 
 /// Flags, among the clusters with at least two vertices, the cluster of every vertex of a

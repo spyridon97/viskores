@@ -135,7 +135,7 @@ void CheckCurvatureSeeds(const std::string& name, const Mesh& mesh, const Pinned
 {
   std::cout << "Curvature seeds of the " << name << std::endl;
   qc::SurfaceMesh surface;
-  qc::BuildSurfaceMesh(mesh.PointArray(), mesh.TriangleArray(), surface);
+  qc::BuildSurfaceMesh(mesh.PointArray(), mesh.TriangleArray(), true, surface);
   const qc::CurvatureDensity density =
     qc::ComputeCurvatureDensity(surface, 0.01 * LargestSide(mesh));
   const viskores::Id floor = qc::TopologicalFloor(surface);
