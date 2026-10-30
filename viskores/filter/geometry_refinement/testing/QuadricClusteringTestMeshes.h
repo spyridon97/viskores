@@ -356,6 +356,29 @@ inline Mesh Annulus()
                          { return std::abs(Centroid(sphere, t)[2]) > 0.6; });
 }
 
+/// The torus (1, 0.35, 32, 14) of the reference with one or two holes: the triangles at the
+/// vertices of angle `|phi| < 0.3` with `z > 0.15`, and for the second hole of angle
+/// `|phi - 2| < 0.3` with `z < -0.15`, removed.
+inline Mesh TorusWithHoles(int holes)
+{
+  const Mesh torus = Torus(1.0, 0.35, 32, 14);
+  std::vector<bool> inHole(torus.Points.size());
+  for (std::size_t v = 0; v < torus.Points.size(); ++v)
+  {
+    const Vec3& p = torus.Points[v];
+    const double phi = std::atan2(p[1], p[0]);
+    inHole[v] = (std::abs(phi) < 0.3 && p[2] > 0.15) ||
+      (holes > 1 && std::abs(phi - 2.0) < 0.3 && p[2] < -0.15);
+  }
+  return RemoveTriangles(torus,
+                         [&](const viskores::Id3& t)
+                         {
+                           return inHole[static_cast<std::size_t>(t[0])] ||
+                             inHole[static_cast<std::size_t>(t[1])] ||
+                             inHole[static_cast<std::size_t>(t[2])];
+                         });
+}
+
 inline Mesh Genus2PlateWithOpening()
 {
   const Mesh plate = VoxelSolid(PlateWithHoles(2), 1.0);

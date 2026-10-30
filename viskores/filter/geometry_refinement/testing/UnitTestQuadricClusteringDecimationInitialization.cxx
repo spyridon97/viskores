@@ -128,7 +128,7 @@ double LargestSide(const Mesh& mesh)
   return std::max({ hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] });
 }
 
-/// The curvature seeds with `epsilon` 1% of the largest side, against the
+/// The curvature seeds in error mode with `epsilon_H` 1% of the largest side, against the
 /// reference. The digest is the first 16 hexadecimal digits of the SHA-256 of the sorted distinct
 /// seeds, joined by commas.
 void CheckCurvatureSeeds(const std::string& name, const Mesh& mesh, const Pinned& pinned)

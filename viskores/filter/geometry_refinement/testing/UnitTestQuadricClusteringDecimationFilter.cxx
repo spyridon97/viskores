@@ -29,10 +29,12 @@ void TestParameters()
   VISKORES_TEST_ASSERT(filter.GetFeatureWeight() == 1 && filter.GetBoundaryWeight() == 1,
                        "Bad default weights.");
   VISKORES_TEST_ASSERT(filter.GetMaxSweeps() == 0, "Bad default sweep cap.");
+  VISKORES_TEST_ASSERT(filter.GetErrorBound() == 0, "Bad default error bound.");
   VISKORES_TEST_ASSERT(filter.GetMerge(), "The merge phase should run by default.");
   VISKORES_TEST_ASSERT(filter.GetInitialization() == Filter::Initialization::Curvature,
                        "Bad default initialization.");
-  VISKORES_TEST_ASSERT(filter.GetGuarantees() == Filter::Topology, "Bad default guarantees.");
+  VISKORES_TEST_ASSERT(filter.GetGuarantees() == (Filter::Topology | Filter::TwoSidedError),
+                       "Bad default guarantees.");
 
   const viskores::cont::DataSet sphere = qcd_test::Icosphere(1).ToDataSet();
   auto rejects = [&](const std::function<void(Filter&)>& set)
@@ -58,6 +60,21 @@ void TestParameters()
                        "A negative weight should be rejected.");
   VISKORES_TEST_ASSERT(rejects([](Filter& f) { f.SetGuarantees(1 << 7); }),
                        "Unknown guarantee bits should be rejected.");
+  VISKORES_TEST_ASSERT(rejects(
+                         [](Filter& f)
+                         {
+                           f.SetErrorBound(0.1);
+                           f.SetGuarantees(f.GetGuarantees() &
+                                           ~viskores::UInt32(Filter::TwoSidedError));
+                         }),
+                       "An error bound without a side should be rejected.");
+  VISKORES_TEST_ASSERT(!rejects(
+                         [](Filter& f)
+                         {
+                           f.SetErrorBound(0.1);
+                           f.SetGuarantees(Filter::Topology | Filter::ErrorOutputToInput);
+                         }),
+                       "One side of the error bound should run.");
 }
 
 void TestNonTriangles()

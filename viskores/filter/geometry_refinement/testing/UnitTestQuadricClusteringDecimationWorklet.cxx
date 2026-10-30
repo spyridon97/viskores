@@ -312,6 +312,24 @@ Decimation RunChecked(const Mesh& mesh, const Decimation::Parameters& parameters
     qcd_test::SampledHausdorff(mesh.Points, mesh.Triangles, generators, triangles, spacing);
   VISKORES_TEST_ASSERT(hausdorff <= maxRadius * (1 + 1e-12),
                        "The output is farther from the input than the largest cluster radius.");
+  if (parameters.ErrorBound > 0)
+  {
+    // Invariant 7, in error mode: within epsilon_H on the sides in use, sampled more finely.
+    const double eps = parameters.ErrorBound;
+    const double outToIn =
+      qcd_test::SampledDistance(generators, triangles, mesh.Points, mesh.Triangles, eps / 4);
+    const double inToOut =
+      qcd_test::SampledDistance(mesh.Points, mesh.Triangles, generators, triangles, eps / 4);
+    std::cout << "  sampled distances " << outToIn / eps << " (output to input) and "
+              << inToOut / eps << " (input to output) epsilon_H" << std::endl;
+    const auto sides = static_cast<viskores::UInt8>(parameters.ErrorSides);
+    VISKORES_TEST_ASSERT(
+      !(sides & static_cast<viskores::UInt8>(qc::EnvelopeSides::OutputToInput)) || outToIn <= eps,
+      "The output is not within epsilon_H of the input.");
+    VISKORES_TEST_ASSERT(
+      !(sides & static_cast<viskores::UInt8>(qc::EnvelopeSides::InputToOutput)) || inToOut <= eps,
+      "The input is not within epsilon_H of the output.");
+  }
 
   return decimation;
 }
@@ -354,7 +372,7 @@ double LargestSide(const Mesh& mesh)
 
 struct Expected
 {
-  viskores::Id Clusters, Rounds, Lloyd, Radius, Topology;
+  viskores::Id Clusters, Rounds, Lloyd, Radius, Topology, Envelope = 0;
 };
 
 void CheckExpected(const Decimation& decimation, const Expected& expected)
@@ -369,6 +387,81 @@ void CheckExpected(const Decimation& decimation, const Expected& expected)
   VISKORES_TEST_ASSERT(d.LloydIterations == expected.Lloyd, "Lloyd phase differs.");
   VISKORES_TEST_ASSERT(d.FlaggedRadius == expected.Radius, "(F0) counts differ.");
   VISKORES_TEST_ASSERT(d.FlaggedTopology == expected.Topology, "(F2)-(F3) counts differ.");
+  VISKORES_TEST_ASSERT(d.FlaggedEnvelope == expected.Envelope, "(F5) counts differ.");
+}
+
+Decimation::Parameters DefaultPath(const Mesh& mesh, bool augmented)
+{
+  Decimation::Parameters p = augmented ? Augmented() : Plain();
+  p.ErrorBound = 0.01 * LargestSide(mesh);
+  return p;
+}
+
+void TestEnvelope()
+{
+  // The default path of Section 11: (F2) to (F5), epsilon_H 1% of the largest side. The
+  // expected numbers come from proofs/lib/vqc.py with the curvature initialisation, the hash
+  // order, and the second condition of its envelope test applied to
+  // every input triangle instead of the eight with the nearest centroids.
+  std::cout << "Envelope: sphere, augmented quadric" << std::endl;
+  const Mesh sphere = qcd_test::Icosphere(3);
+  CheckExpected(RunChecked(sphere, DefaultPath(sphere, true)), { 195, 3, 4, 0, 0, 75 });
+  std::cout << "Envelope: plate with two holes, plain quadric" << std::endl;
+  const Mesh plate = qcd_test::VoxelSolid(qcd_test::PlateWithHoles(2), 0.25);
+  CheckExpected(RunChecked(plate, DefaultPath(plate, false)), { 147, 7, 5, 0, 0, 114 });
+  std::cout << "Envelope: annulus, augmented quadric" << std::endl;
+  const Mesh annulus = qcd_test::Annulus();
+  CheckExpected(RunChecked(annulus, DefaultPath(annulus, true)), { 193, 5, 6, 0, 0, 123 });
+  std::cout << "Envelope: genus-2 plate with an opening, augmented quadric" << std::endl;
+  const Mesh opening = qcd_test::Genus2PlateWithOpening();
+  CheckExpected(RunChecked(opening, DefaultPath(opening, true)), { 66, 6, 5, 0, 4, 31 });
+}
+
+void TestErrorSides()
+{
+  // The default path of proofs/cor-skip.py (vii) with the merge phase, alpha 0.02 and
+  // epsilon_H 1% of the largest side, checking both sides of the error bound, the output to
+  // the input, or the input to the output. RunChecked samples the sides in use. The expected
+  // sizes come from proofs/lib/vqc.py with error_sides both, output and input.
+  auto withSides = [](const Mesh& mesh, qc::EnvelopeSides sides)
+  {
+    Decimation::Parameters p;
+    p.Quadric.Alpha = 0.02;
+    p.ErrorBound = 0.01 * LargestSide(mesh);
+    p.ErrorSides = sides;
+    return p;
+  };
+  const struct
+  {
+    const char* Name;
+    Mesh Input;
+    viskores::Id Both, OutputOnly, InputOnly;
+  } cases[] = {
+    { "sphere", qcd_test::Icosphere(3), 114, 112, 114 },
+    { "disk", qcd_test::Disk(), 109, 107, 108 },
+    { "annulus", qcd_test::Annulus(), 107, 103, 102 },
+    { "torus with one hole", qcd_test::TorusWithHoles(1), 130, 125, 126 },
+    { "torus with two holes", qcd_test::TorusWithHoles(2), 131, 131, 128 },
+    { "genus-2 plate with an opening", qcd_test::Genus2PlateWithOpening(), 31, 26, 31 }
+  };
+  for (const auto& c : cases)
+  {
+    const std::pair<qc::EnvelopeSides, viskores::Id> runs[] = {
+      { qc::EnvelopeSides::Both, c.Both },
+      { qc::EnvelopeSides::OutputToInput, c.OutputOnly },
+      { qc::EnvelopeSides::InputToOutput, c.InputOnly }
+    };
+    for (const auto& run : runs)
+    {
+      std::cout << "Error sides " << static_cast<int>(run.first) << ": " << c.Name << std::endl;
+      const Decimation decimation = RunChecked(c.Input, withSides(c.Input, run.first));
+      VISKORES_TEST_ASSERT(decimation.GetNumberOfClusters() == run.second,
+                           "Output size differs from the reference: ",
+                           decimation.GetNumberOfClusters(),
+                           " vs ",
+                           run.second);
+    }
+  }
 }
 
 /// Checks the output size and merge rounds of a run of the merge phase against the reference,
@@ -391,7 +484,8 @@ void CheckMerged(const Mesh& mesh,
   VISKORES_TEST_ASSERT(decimation.GetMergeDiagnostics().Rounds == mergeRounds,
                        "The merge phase took another number of rounds.");
   const viskores::Id k = decimation.GetNumberOfClusters();
-  const bool geometric = parameters.MaxClusterRadius < std::numeric_limits<double>::infinity();
+  const bool geometric = parameters.ErrorBound > 0 ||
+    parameters.MaxClusterRadius < std::numeric_limits<double>::infinity();
   if (!geometric && k > parameters.TargetNumberOfPoints)
   {
     const auto triangles = ToVector(decimation.GetOutputTriangles());
@@ -415,7 +509,7 @@ Decimation::Parameters Merging(Decimation::Parameters p, viskores::Id degreeFloo
 void TestMerge()
 {
   // The expected numbers come from proofs/lib/vqc.py with the curvature initialisation and the
-  // hash order, with
+  // hash order (the envelope rule of TestEnvelope), with
   // merge_priority=None (the priority the increase of the objective, then the labels) and
   // merge_priority=12 (the degree key), and coarsen=True in error mode.
   const Mesh plate2 = qcd_test::VoxelSolid(qcd_test::PlateWithHoles(2), 1.0);
@@ -602,6 +696,8 @@ void TestInvalidInput()
 void TestQuadricClusteringDecimationWorklet()
 {
   TestLoop();
+  TestEnvelope();
+  TestErrorSides();
   TestMerge();
   TestDeterminism();
   TestInvalidInput();
