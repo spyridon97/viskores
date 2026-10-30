@@ -34,7 +34,8 @@ void TestParameters()
   VISKORES_TEST_ASSERT(filter.GetInitialization() == Filter::Initialization::Curvature,
                        "Bad default initialization.");
   VISKORES_TEST_ASSERT(filter.GetGuarantees() ==
-                         (Filter::Topology | Filter::NoSelfIntersections | Filter::TwoSidedError),
+                         (Filter::Topology | Filter::NoSelfIntersections | Filter::SingularCurves |
+                          Filter::TwoSidedError),
                        "Bad default guarantees.");
 
   const viskores::cont::DataSet sphere = qcd_test::Icosphere(1).ToDataSet();
@@ -63,6 +64,8 @@ void TestParameters()
                        "Unknown guarantee bits should be rejected.");
   VISKORES_TEST_ASSERT(rejects([](Filter& f) { f.SetGuarantees(Filter::NoSelfIntersections); }),
                        "NoSelfIntersections without Topology should be rejected.");
+  VISKORES_TEST_ASSERT(rejects([](Filter& f) { f.SetGuarantees(Filter::SingularCurves); }),
+                       "SingularCurves without Topology should be rejected.");
   VISKORES_TEST_ASSERT(!rejects([](Filter& f) { f.SetGuarantees(0); }),
                        "The geometric-only mode should run.");
   VISKORES_TEST_ASSERT(rejects(

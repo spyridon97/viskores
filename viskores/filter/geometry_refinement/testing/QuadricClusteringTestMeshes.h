@@ -467,6 +467,61 @@ inline Mesh BoxesSharingAnEdge(int n = 5)
   return mesh;
 }
 
+/// A plate `[0, L] x [0, W]` in the plane `z = 0` and a fin `[0, L] x [0, H]` in the plane
+/// `y = W / 2`, attached along the line `y = W / 2`: three sheets meet along `nx` edges of that
+/// line, a long straight singular curve (proofs/lib/arcs.t_joint).
+inline Mesh PlateWithFin(double length = 4.0,
+                         double width = 1.0,
+                         double height = 0.5,
+                         int nx = 40,
+                         int ny = 10,
+                         int nz = 5)
+{
+  Mesh mesh;
+  std::map<std::array<double, 3>, viskores::Id> index;
+  auto vid = [&](const Vec3& p)
+  {
+    const std::array<double, 3> key = { p[0], p[1], p[2] };
+    const auto found = index.find(key);
+    if (found != index.end())
+    {
+      return found->second;
+    }
+    const viskores::Id id = static_cast<viskores::Id>(mesh.Points.size());
+    index.emplace(key, id);
+    mesh.Points.push_back(p);
+    return id;
+  };
+  auto grid = [&](const Vec3& origin, const Vec3& du, const Vec3& dv, int nu, int nv)
+  {
+    std::vector<std::vector<viskores::Id>> ids(static_cast<std::size_t>(nu + 1));
+    for (int i = 0; i <= nu; ++i)
+    {
+      for (int j = 0; j <= nv; ++j)
+      {
+        Vec3 p;
+        for (int a = 0; a < 3; ++a)
+        {
+          p[a] = (origin[a] + (i * du[a]) / nu) + (j * dv[a]) / nv;
+        }
+        ids[static_cast<std::size_t>(i)].push_back(vid(p));
+      }
+    }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(nu); ++i)
+    {
+      for (std::size_t j = 0; j < static_cast<std::size_t>(nv); ++j)
+      {
+        const viskores::Id a = ids[i][j], b = ids[i + 1][j], c = ids[i + 1][j + 1], d = ids[i][j + 1];
+        mesh.Triangles.push_back({ a, b, c });
+        mesh.Triangles.push_back({ a, c, d });
+      }
+    }
+  };
+  grid(Vec3(0, 0, 0), Vec3(length, 0, 0), Vec3(0, width, 0), nx, ny);
+  grid(Vec3(0, width / 2, 0), Vec3(length, 0, 0), Vec3(0, 0, height), nx, nz);
+  return mesh;
+}
+
 /// Two icospheres whose centres are half a radius apart: a closed surface whose components
 /// cross each other, so not embedded.
 inline Mesh OverlappingIcospheres(int level)

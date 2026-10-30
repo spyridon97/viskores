@@ -28,6 +28,7 @@
 #include <numeric>
 #include <random>
 #include <set>
+#include <sstream>
 #include <tuple>
 
 namespace
@@ -681,13 +682,14 @@ std::vector<viskores::Id3> OutputCells(const Decimation& decimation)
   return cells;
 }
 
-Decimation::Parameters NonManifoldParameters(const Mesh& mesh)
+Decimation::Parameters NonManifoldParameters(const Mesh& mesh, bool decimateCurves = false)
 {
   Decimation::Parameters p = Plain();
   p.Embedding = true;
   p.ErrorBound = 0.01 * LargestSide(mesh);
   p.Merge = true;
   p.MergeDegreeFloor = 12;
+  p.DecimateSingularCurves = decimateCurves;
   return p;
 }
 
@@ -781,6 +783,208 @@ void TestNonManifold()
   std::cout << "  sampled Hausdorff distance " << hausdorff / parameters.ErrorBound << " epsilon_H"
             << std::endl;
   VISKORES_TEST_ASSERT(hausdorff <= parameters.ErrorBound, "The glued output is not within epsilon_H.");
+}
+
+/// An arc of the singular curves on the host: its ends, its interior vertices and its segments
+/// in the order of its list.
+struct HostArc
+{
+  bool Closed;
+  viskores::Id2 Ends;
+  std::vector<viskores::Id> Vertices;
+  std::vector<std::vector<viskores::Id>> Segments;
+};
+
+std::vector<HostArc> HostArcs(const viskores::worklet::quadric_clustering::SingularCurves& curves)
+{
+  const auto offsets = ToVector(curves.ArcOffsets);
+  const auto vertices = ToVector(curves.ArcVertices);
+  const auto ends = ToVector(curves.ArcEnds);
+  const auto head = ToVector(curves.SegmentHead);
+  const auto firstHead = ToVector(curves.FirstHead);
+  std::vector<HostArc> arcs(static_cast<std::size_t>(curves.NumberOfArcs));
+  for (std::size_t a = 0; a < arcs.size(); ++a)
+  {
+    HostArc& arc = arcs[a];
+    const viskores::Id start = offsets[a], end = offsets[a + 1], length = end - start;
+    arc.Closed = ends[a][0] < 0;
+    arc.Ends = ends[a];
+    arc.Vertices.assign(vertices.begin() + start, vertices.begin() + end);
+    // The heads, along an open arc or around a closed arc from its first head.
+    std::vector<viskores::Id> heads;
+    for (viskores::Id i = 0; i < length; ++i)
+    {
+      const viskores::Id p = arc.Closed ? start + (firstHead[a] - start + i) % length : start + i;
+      if (head[static_cast<std::size_t>(p)])
+      {
+        heads.push_back(p);
+      }
+    }
+    for (std::size_t s = 0; s < heads.size(); ++s)
+    {
+      viskores::Id next;
+      if (arc.Closed)
+      {
+        next = heads[(s + 1) % heads.size()];
+        next = (next <= heads[s]) ? next + length : next;
+      }
+      else
+      {
+        next = (s + 1 < heads.size()) ? heads[s + 1] : end;
+      }
+      std::vector<viskores::Id> segment;
+      for (viskores::Id p = heads[s]; p < next; ++p)
+      {
+        segment.push_back(vertices[static_cast<std::size_t>(start + (p - start) % length)]);
+      }
+      arc.Segments.push_back(segment);
+    }
+  }
+  return arcs;
+}
+
+/// Proposition "Decimating the singular curves" on the glued output, as proofs/prop-arcs.py:
+/// a simplicial complex with the Euler characteristic of the input, on which every arc of the
+/// input becomes the path through its ends and its segments, with as many triangles per edge,
+/// every junction at its input position, embedded and within epsilon_H; and its size against
+/// proofs/lib/arcs.py with the hash order of the copies.
+void CheckSingularCurves(const Mesh& mesh,
+                         viskores::Id loop,
+                         viskores::Id merged,
+                         viskores::Id segmentRounds,
+                         const std::string& expectedSegments)
+{
+  const Decimation::Parameters parameters = NonManifoldParameters(mesh, true);
+  Decimation decimation;
+  decimation.SetParameters(parameters);
+  decimation.Run(mesh.PointArray(), mesh.TriangleArray());
+  const auto points = ToVector(decimation.GetOutputPoints());
+  const auto cells = OutputCells(decimation);
+  const viskores::Id k = static_cast<viskores::Id>(points.size());
+  const auto& curves = decimation.GetSingularCurves();
+  const std::vector<HostArc> arcs = HostArcs(curves);
+  const auto segment = ToVector(curves.Segment);
+  const auto regular = ToVector(curves.Regular);
+  std::ostringstream segments;
+  for (std::size_t a = 0; a < arcs.size(); ++a)
+  {
+    segments << (a ? ";" : "");
+    for (std::size_t i = 0; i < arcs[a].Segments.size(); ++i)
+    {
+      segments << (i ? "," : "") << arcs[a].Segments[i].size();
+    }
+  }
+  std::cout << "  n = " << mesh.Points.size() << ", clusters after the loop "
+            << decimation.GetNumberOfClustersAfterLoop() << ", after merging "
+            << decimation.GetNumberOfClusters() << ", glued output " << k << ", segment rounds "
+            << decimation.GetMergeDiagnostics().SegmentRounds << ", segments " << segments.str()
+            << std::endl;
+  VISKORES_TEST_ASSERT(decimation.GetNumberOfClustersAfterLoop() == loop &&
+                         decimation.GetNumberOfClusters() == merged &&
+                         decimation.GetMergeDiagnostics().SegmentRounds == segmentRounds &&
+                         segments.str() == expectedSegments,
+                       "The run differs from the reference.");
+
+  // A simplicial complex with the Euler characteristic of the input.
+  std::set<std::array<viskores::Id, 3>> distinct;
+  for (const auto& c : cells)
+  {
+    std::array<viskores::Id, 3> t = { c[0], c[1], c[2] };
+    std::sort(t.begin(), t.end());
+    VISKORES_TEST_ASSERT(t[0] != t[1] && t[1] != t[2], "A degenerate output cell.");
+    VISKORES_TEST_ASSERT(distinct.insert(t).second, "Two output triangles on the same vertices.");
+  }
+  VISKORES_TEST_ASSERT(
+    qcd_test::EulerCharacteristic(k, cells) ==
+      qcd_test::EulerCharacteristic(static_cast<viskores::Id>(mesh.Points.size()), mesh.Triangles),
+    "The glued output has another Euler characteristic.");
+
+  // Every arc becomes the path of K through its ends and its segments, with as many triangles
+  // per edge as the arc; these are all the singular edges; the junctions keep their positions.
+  const auto map = ToVector(decimation.GetOutputPointMap());
+  const auto inputCounts = qcd_test::EdgeCounts(mesh.Triangles);
+  const auto outputCounts = qcd_test::EdgeCounts(cells);
+  auto count = [](const std::map<std::pair<viskores::Id, viskores::Id>, int>& counts,
+                  viskores::Id a,
+                  viskores::Id b)
+  {
+    const auto found = counts.find(std::make_pair(std::min(a, b), std::max(a, b)));
+    return found == counts.end() ? 0 : found->second;
+  };
+  std::size_t pathEdges = 0;
+  for (const HostArc& arc : arcs)
+  {
+    std::vector<viskores::Id> chain;
+    if (!arc.Closed)
+    {
+      chain.push_back(map[static_cast<std::size_t>(arc.Ends[0])]);
+    }
+    for (const auto& piece : arc.Segments)
+    {
+      chain.push_back(map[static_cast<std::size_t>(piece.front())]);
+    }
+    chain.push_back(arc.Closed ? chain.front() : map[static_cast<std::size_t>(arc.Ends[1])]);
+    const int perEdge = arc.Closed ? count(inputCounts, arc.Vertices[0], arc.Vertices[1])
+                                   : count(inputCounts, arc.Ends[0], arc.Vertices[0]);
+    for (std::size_t i = 0; i + 1 < chain.size(); ++i)
+    {
+      VISKORES_TEST_ASSERT(count(outputCounts, chain[i], chain[i + 1]) == perEdge,
+                           "An arc is not the path through its segments.");
+    }
+    pathEdges += chain.size() - 1;
+  }
+  std::size_t singular = 0;
+  for (const auto& e : outputCounts)
+  {
+    singular += e.second >= 3 ? 1 : 0;
+  }
+  std::size_t junctionEdges = 0;
+  for (const auto& e : inputCounts)
+  {
+    // Edges of X between two junctions are no arc, and stay.
+    const auto u = static_cast<std::size_t>(e.first.first), w = static_cast<std::size_t>(e.first.second);
+    junctionEdges +=
+      (e.second >= 3 && segment[u] >= 0 && segment[w] >= 0 && !regular[u] && !regular[w]) ? 1 : 0;
+  }
+  VISKORES_TEST_ASSERT(singular == pathEdges + junctionEdges,
+                       "The output has singular edges off the paths of the arcs.");
+  for (std::size_t v = 0; v < mesh.Points.size(); ++v)
+  {
+    if (segment[v] >= 0 && !regular[v])
+    {
+      VISKORES_TEST_ASSERT(std::memcmp(&points[static_cast<std::size_t>(map[v])], &mesh.Points[v], sizeof(Vec3)) == 0,
+                           "A junction moved.");
+    }
+  }
+
+  // Embedded, by an exact all-pairs test, and within epsilon_H.
+  for (std::size_t i = 0; i < cells.size(); ++i)
+  {
+    const Vec3 p[3] = { points[static_cast<std::size_t>(cells[i][0])],
+                        points[static_cast<std::size_t>(cells[i][1])],
+                        points[static_cast<std::size_t>(cells[i][2])] };
+    VISKORES_TEST_ASSERT(!viskores::TriangleIsDegenerate(p[0], p[1], p[2]), "A degenerate output triangle.");
+    for (std::size_t j = i + 1; j < cells.size(); ++j)
+    {
+      const Vec3 q[3] = { points[static_cast<std::size_t>(cells[j][0])],
+                          points[static_cast<std::size_t>(cells[j][1])],
+                          points[static_cast<std::size_t>(cells[j][2])] };
+      VISKORES_TEST_ASSERT(!qc::exact::ImproperPair(p, cells[i], q, cells[j]), "The glued output intersects itself.");
+    }
+  }
+  const double hausdorff =
+    qcd_test::SampledHausdorff(mesh.Points, mesh.Triangles, points, cells, parameters.ErrorBound / 4);
+  std::cout << "  sampled Hausdorff distance " << hausdorff / parameters.ErrorBound << " epsilon_H"
+            << std::endl;
+  VISKORES_TEST_ASSERT(hausdorff <= parameters.ErrorBound, "The glued output is not within epsilon_H.");
+}
+
+void TestSingularCurves()
+{
+  std::cout << "Singular curves decimated: two boxes sharing an edge" << std::endl;
+  CheckSingularCurves(qcd_test::BoxesSharingAnEdge(), 168, 54, 3, "4");
+  std::cout << "Singular curves decimated: plate with a fin" << std::endl;
+  CheckSingularCurves(qcd_test::PlateWithFin(), 491, 27, 11, "39");
 }
 
 Decimation::Parameters GeometricOnly(Decimation::Parameters p, double errorBound)
@@ -982,6 +1186,7 @@ void TestQuadricClusteringDecimationWorklet()
   TestErrorSides();
   TestMerge();
   TestNonManifold();
+  TestSingularCurves();
   TestGeometricOnly();
   TestDeterminism();
   TestInvalidInput();
