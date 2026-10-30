@@ -29,9 +29,9 @@ namespace geometry_refinement
 ///
 /// The options come in four groups. What the user asks for: an error bound, a target number of
 /// points, or both. The guarantees, as bits of
-/// `SetGuarantees`: by default the output is a surface of the input's type. Choices that
-/// change only the output size: the initialisation and the terms of the cost. How the work is
-/// done: the merge phase and the sweep cap.
+/// `SetGuarantees`: by default the output is a surface of the input's type that does not
+/// intersect itself. Choices that change only the output size: the initialisation and the
+/// terms of the cost. How the work is done: the merge phase and the sweep cap.
 ///
 /// Point fields are averaged over every cluster, and every output cell takes the cell fields
 /// of the first input triangle that produced it. The output coordinates are in double
@@ -89,12 +89,15 @@ public:
     ErrorInputToOutput = 1 << 2,
     /// Both sides of the error bound: the Hausdorff distance between input and output is at
     /// most the bound.
-    TwoSidedError = ErrorOutputToInput | ErrorInputToOutput
+    TwoSidedError = ErrorOutputToInput | ErrorInputToOutput,
+    /// The output does not intersect itself; the input must not either. Use it for meshing,
+    /// simulation and 3D printing. It is the most expensive check after the error bound.
+    NoSelfIntersections = 1 << 3
   };
 
   /// @brief The guarantees of the output, as a combination of `Guarantee` bits.
   ///
-  /// The default is `Topology | TwoSidedError`. A
+  /// The default is `Topology | TwoSidedError | NoSelfIntersections`. A
   /// combination that breaks a requirement of a bit is rejected when the filter runs.
   VISKORES_CONT void SetGuarantees(viskores::UInt32 guarantees) { this->Guarantees = guarantees; }
   /// @copydoc SetGuarantees
@@ -182,7 +185,7 @@ private:
 
   viskores::Float64 ErrorBound = 0;
   viskores::Id TargetNumberOfPoints = 0;
-  viskores::UInt32 Guarantees = Topology | TwoSidedError;
+  viskores::UInt32 Guarantees = Topology | TwoSidedError | NoSelfIntersections;
   Initialization InitialClusters = Initialization::Curvature;
   viskores::Float64 Regularization = 0.02;
   viskores::Float64 FeatureAngle = 45;

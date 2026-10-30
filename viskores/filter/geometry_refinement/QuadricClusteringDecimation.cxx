@@ -87,7 +87,7 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
     reject("the target number of points must not be negative.");
   }
   const viskores::UInt32 guarantees = this->Guarantees;
-  const viskores::UInt32 all = Topology | TwoSidedError;
+  const viskores::UInt32 all = Topology | TwoSidedError | NoSelfIntersections;
   if ((guarantees & ~all) != 0)
   {
     reject("unknown guarantee bits.");
@@ -124,6 +124,7 @@ VISKORES_CONT viskores::cont::DataSet QuadricClusteringDecimation::DoExecute(
   viskores::worklet::QuadricClusteringDecimation::Parameters parameters;
   parameters.ErrorBound = this->ErrorBound;
   parameters.TargetNumberOfPoints = this->TargetNumberOfPoints;
+  parameters.Embedding = (guarantees & NoSelfIntersections) != 0;
   using Sides = viskores::worklet::quadric_clustering::EnvelopeSides;
   const viskores::UInt32 sides = guarantees & TwoSidedError;
   parameters.ErrorSides = (sides == ErrorOutputToInput) ? Sides::OutputToInput

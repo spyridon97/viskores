@@ -11,6 +11,7 @@
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Assignment.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Clustering.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/CurvatureSeeds.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EmbeddingFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EnvelopeFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Initialization.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/MergePhase.h>
@@ -31,6 +32,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <string>
 
 namespace viskores
 {
@@ -121,6 +123,8 @@ public:
     /// the label triples. The guarantees are the same; rounds with other violations flag fewer
     /// clusters.
     bool D2ByCount = false;
+    /// The embedding flag (F4): the realised output has no self-intersections.
+    bool Embedding = true;
     /// The halves of the envelope flag (F5) with an error bound.
     quadric_clustering::EnvelopeSides ErrorSides = quadric_clustering::EnvelopeSides::Both;
     /// The cap `T` on the propose/commit sweeps of each assignment step, or 0 for none.
@@ -193,13 +197,15 @@ public:
     viskores::Id LloydIterations = 0;
     viskores::Id Sweeps = 0;
     /// Clusters flagged by each test over the whole loop, each counted once per round by the
-    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F5).
+    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F4), (F5).
     viskores::Id FlaggedRadius = 0;
     viskores::Id FlaggedBudget = 0;
     viskores::Id FlaggedTopology = 0;
+    viskores::Id FlaggedEmbedding = 0;
     viskores::Id FlaggedEnvelope = 0;
-    /// Pieces examined by the envelope tests, over the run: a machine-independent measure of
-    /// the most expensive step.
+    /// Output triangles given to (F4), and pieces examined by the envelope tests, over the run:
+    /// machine-independent measures of the two most expensive steps.
+    viskores::Id EmbeddingTriangles = 0;
     viskores::Id EnvelopePieces = 0;
     /// Wall-clock seconds spent in each step, the device synchronised.
     struct
@@ -211,6 +217,7 @@ public:
       double Placement = 0;
       double Scan = 0;
       double Topology = 0;
+      double Embedding = 0;
       double Envelope = 0;
       double InsertSplit = 0;
       double Merge = 0;
@@ -232,8 +239,9 @@ public:
   VISKORES_CONT void SetObserver(const Observer& observer) { this->ObserverFunction = observer; }
 
   /// Decimates the triangles `triangles` on the points `points`. Throws `ErrorBadValue` for
-  /// degenerate triangles, points in no triangle, and an input that is not a consistently
-  /// oriented surface.
+  /// degenerate triangles, points in no triangle, an input that is not a consistently oriented
+  /// surface, and, with the embedding flag, an input that is not embedded (Hypothesis
+  /// "embedded").
   VISKORES_CONT void Run(const viskores::cont::ArrayHandle<Vec3>& points,
                          const viskores::cont::ArrayHandle<viskores::Id3>& triangles)
   {
@@ -265,6 +273,10 @@ public:
 
     // The input: a surface.
     qc::BuildSurfaceMesh(points, triangles, this->Mesh);
+    if (this->Params.Embedding)
+    {
+      this->CheckEmbedded(points, triangles);
+    }
     const qc::EnvelopeSides sides = this->Params.ErrorSides;
     const qc::SurfaceMesh& mesh = this->Mesh;
     const viskores::Id n = mesh.NumberOfPoints;
@@ -296,6 +308,7 @@ public:
     {
       inputDistance = qc::BuildDistanceMesh(mesh.Points, mesh.Triangles);
     }
+    const bool embedding = this->Params.Embedding;
     const bool topology = this->Params.Topology;
     qc::Clustering& clusters = this->Clusters;
     clusters = qc::Clustering{};
@@ -428,6 +441,19 @@ public:
                 this->Diag.FlaggedTopology += qc::OrFlags(flags, topologyFlags);
               });
       }
+      // The embedding test is expensive, so it runs only when no cheaper flag fired.
+      if (embedding && qc::CountFlags(flags) == 0)
+      {
+        timer.Start();
+        viskores::cont::ArrayHandle<viskores::UInt8> embeddingFlags;
+        embeddingFlags.AllocateAndFill(k, 0);
+        const auto outputTriangles = qc::OutputTriangles(mesh, clusters.Labels);
+        this->Diag.EmbeddingTriangles += outputTriangles.GetNumberOfValues();
+        qc::EmbeddingFlags(outputTriangles, clusters.Generators, clusters.Sizes, embeddingFlags);
+        this->Diag.FlaggedEmbedding += qc::OrFlags(flags, embeddingFlags);
+        timer.Stop();
+        seconds.Embedding += timer.GetElapsedTime();
+      }
       // The envelope test needs the discrete closed-ball property, so it runs only when nothing
       // else is flagged, the topological flags in particular.
       if (errorBound > 0 && qc::CountFlags(flags) == 0)
@@ -482,6 +508,7 @@ public:
       qc::MergeParameters merge;
       merge.Budget = budget;
       merge.MaxClusterRadius = maxRadius;
+      merge.Embedding = embedding;
       merge.ErrorBound = errorBound;
       merge.Sides = sides;
       merge.D2ByCount = this->Params.D2ByCount;
@@ -566,6 +593,28 @@ public:
   }
 
 private:
+  /// Hypothesis "embedded", checked as Section 11 says: the test of the embedding flag applied
+  /// to the input, every triangle a singleton cluster.
+  VISKORES_CONT void CheckEmbedded(const viskores::cont::ArrayHandle<Vec3>& points,
+                                   const viskores::cont::ArrayHandle<viskores::Id3>& triangles)
+  {
+    namespace qc = quadric_clustering;
+    viskores::cont::ArrayHandle<viskores::Id> sizes;
+    sizes.AllocateAndFill(points.GetNumberOfValues(), 1);
+    viskores::cont::ArrayHandle<viskores::UInt8> flags;
+    flags.AllocateAndFill(points.GetNumberOfValues(), 0);
+    const qc::EmbeddingReport report = qc::EmbeddingFlags(triangles, points, sizes, flags);
+    if (report.NumberOfDegenerateTriangles + report.NumberOfImproperPairs > 0)
+    {
+      throw viskores::cont::ErrorBadValue(
+        "QuadricClusteringDecimation: the input is not embedded (" +
+        std::to_string(report.NumberOfDegenerateTriangles) + " degenerate triangles, " +
+        std::to_string(report.NumberOfImproperPairs) +
+        " pairs of triangles that intersect improperly), so the embedding of the output "
+        "cannot be guaranteed; turn the embedding flag off.");
+    }
+  }
+
   static bool ArraysEqual(const viskores::cont::ArrayHandle<viskores::Id>& a,
                           const viskores::cont::ArrayHandle<viskores::Id>& b)
   {

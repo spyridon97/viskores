@@ -12,7 +12,9 @@ set(headers
   Assignment.h
   Clustering.h
   CurvatureSeeds.h
+  EmbeddingFlags.h
   EnvelopeFlags.h
+  ImproperPairs.h
   Initialization.h
   MergePhase.h
   QuadricClusteringCommonWorklets.h
