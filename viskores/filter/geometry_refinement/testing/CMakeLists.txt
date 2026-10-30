@@ -11,6 +11,7 @@ set(unit_tests
   UnitTestConvertToPointCloud.cxx
   UnitTestExtrusionLinear.cxx
   UnitTestExtrusionRotational.cxx
+  UnitTestQuadricClusteringDecimationFilter.cxx
   UnitTestShrinkFilter.cxx
   UnitTestSplitSharpEdgesFilter.cxx
   UnitTestTetrahedralizeFilter.cxx
@@ -19,12 +20,20 @@ set(unit_tests
   UnitTestVertexClusteringFilter.cxx
   )
 
+set(unit_tests_device
+  UnitTestQuadricClusteringDecimationAssignment.cxx
+  UnitTestQuadricClusteringDecimationInitialization.cxx
+  UnitTestQuadricClusteringDecimationPrecomputation.cxx
+  UnitTestQuadricClusteringDecimationWorklet.cxx
+  )
+
 set(libraries
   viskores_filter_contour
   viskores_filter_field_conversion
   viskores_filter_geometry_refinement
   viskores_filter_vector_analysis
   viskores_source
+  viskores_worklet
   )
 
 if (Viskores_ENABLE_RENDERING)
@@ -39,6 +48,7 @@ endif()
 
 viskores_unit_tests(
   SOURCES ${unit_tests}
+  DEVICE_SOURCES ${unit_tests_device}
   LIBRARIES ${libraries}
   USE_VISKORES_JOB_POOL
 )
