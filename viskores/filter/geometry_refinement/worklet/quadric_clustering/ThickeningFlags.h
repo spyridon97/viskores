@@ -39,14 +39,17 @@ namespace worklet
 namespace quadric_clustering
 {
 
-// Isotopy by a certified thickening T of the input M (Theorem "Isotopy without a reach"), the image of the prism map linear on the tetrahedra of the vertex-ordered split of
+// Isotopy by a certified thickening T of the input M (Theorem "Isotopy without a reach"; for an
+// input with boundary, of its collared extension, Theorem "A homeomorphism along the fibres, with
+// boundary"), the image of the prism map linear on the tetrahedra of the vertex-ordered split of
 // the prisms over the triangles, with the stored sides B^+-_v = fl(v +- delta_v nu_v), and the
 // flag (F7) of an output, as proofs/lib/thick.py. Every decision is exact: on the stored doubles
 // by the exact orientation, and on the ends of the probes, a third of a sum of three doubles,
 // scaled by three in expansion arithmetic. The fibre flag (F8) (Theorem "A homeomorphism along
 // the fibres") reads the same prisms.
 
-/// A certified thickening, from `BuildThickening`.
+/// A certified thickening, from `BuildThickening` or, for an input with boundary,
+/// `BuildCollaredThickening`.
 struct Thickening
 {
   /// Whether (T1)-(T4) were certified; the other fields are meaningful only then.
@@ -73,6 +76,15 @@ struct Thickening
   viskores::cont::ArrayHandle<viskores::Vec<Vec3, 2>> FibreVertical;
   viskores::cont::ArrayHandle<Vec3> FibreDirection;
   viskores::worklet::spatialstructure::BoundingVolumeHierarchy FibreHierarchy;
+  /// For an input with boundary, the thickening of its collared extension (Theorem "A homeomorphism along the
+  /// fibres, with boundary"): the
+  /// component of every triangle of the boundary surface and of every input vertex, so that
+  /// the inside test reads the part over one component; empty for a closed input.
+  viskores::cont::ArrayHandle<viskores::Id> SideComponents;
+  viskores::cont::ArrayHandle<viskores::Id> VertexComponents;
+  /// With them, the largest third coordinate of the stored points, below which no ray of the
+  /// inside test may end.
+  Real Top = 0;
 };
 
 /// The directions `nu` along which a thickening offsets the vertices (Proposition "When the
@@ -352,14 +364,54 @@ struct HybridDirection : viskores::worklet::WorkletMapField
   viskores::Id NumberOfTriangles;
 };
 
+/// Whether a point of the star of a vertex moved, which is all its direction reads.
+struct StarMoved : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn vertex,
+                                WholeArrayIn cornerOffsets,
+                                WholeArrayIn corners,
+                                WholeArrayIn triangles,
+                                WholeArrayIn moved,
+                                FieldOut starMoved);
+  using ExecutionSignature = _6(_1, _2, _3, _4, _5);
+
+  VISKORES_CONT explicit StarMoved(viskores::Id numTriangles)
+    : NumberOfTriangles(numTriangles)
+  {
+  }
+
+  template <typename IdPortal, typename Id3Portal, typename FlagPortal>
+  VISKORES_EXEC viskores::UInt8 operator()(viskores::Id v,
+                                           const IdPortal& cornerOffsets,
+                                           const IdPortal& corners,
+                                           const Id3Portal& triangles,
+                                           const FlagPortal& moved) const
+  {
+    for (viskores::Id r = cornerOffsets.Get(v); r < cornerOffsets.Get(v + 1); ++r)
+    {
+      const viskores::Id3 t = triangles.Get(corners.Get(r) % this->NumberOfTriangles);
+      if (moved.Get(t[0]) || moved.Get(t[1]) || moved.Get(t[2]))
+      {
+        return 1;
+      }
+    }
+    return 0;
+  }
+
+  viskores::Id NumberOfTriangles;
+};
+
 } // namespace thickening_detail
 
 /// The directions `nu` of the vertices of `mesh`, as `build` of proofs/lib/thick.py takes them:
 /// the area-weighted normals (the cross products summed by corner slot, then triangle), or
-/// `maxmin_directions`, or `hybrid_directions`.
+/// `maxmin_directions`, or `hybrid_directions`. With `moved`, the points that moved since
+/// `directions` was computed, only the vertices with a moved point in their star are computed
+/// again; the others keep their directions, which read nothing else.
 inline void VertexDirections(const SurfaceMesh& mesh,
                              ThickeningDirections which,
-                             viskores::cont::ArrayHandle<Vec3>& directions)
+                             viskores::cont::ArrayHandle<Vec3>& directions,
+                             const viskores::cont::ArrayHandle<viskores::UInt8>* moved = nullptr)
 {
   using Algorithm = viskores::cont::Algorithm;
   namespace td = thickening_detail;
@@ -389,8 +441,23 @@ inline void VertexDirections(const SurfaceMesh& mesh,
   invoke(SplitPair{}, finiteRecords, starVertices, starTriangles);
   Algorithm::LowerBounds(starVertices, viskores::cont::ArrayHandleIndex(n + 1), starOffsets);
   viskores::cont::ArrayHandle<viskores::Id> vertices;
-  Algorithm::Copy(viskores::cont::ArrayHandleIndex(n), vertices);
-  directions.Allocate(n);
+  if (moved)
+  {
+    viskores::cont::ArrayHandle<viskores::UInt8> starMoved;
+    invoke(td::StarMoved(m),
+           viskores::cont::ArrayHandleIndex(n),
+           mesh.VertexCornerOffsets,
+           mesh.VertexCorners,
+           mesh.Triangles,
+           *moved,
+           starMoved);
+    Algorithm::CopyIf(viskores::cont::ArrayHandleIndex(n), starMoved, vertices);
+  }
+  else
+  {
+    Algorithm::Copy(viskores::cont::ArrayHandleIndex(n), vertices);
+    directions.Allocate(n);
+  }
   // The max-min directions, where they are used.
   if (which == ThickeningDirections::Hybrid)
   {
@@ -1169,11 +1236,13 @@ VISKORES_EXEC inline SegmentHit SegmentTriangle(const Vec3& a,
   return hit;
 }
 
-/// The crossings of a segment with the sides, counted, and whether all are generic.
+/// The crossings of a segment with the sides, counted, and whether all are generic; with a
+/// `component`, only those with the part of the boundary surface over that component.
 template <typename SidePortals>
 VISKORES_EXEC inline void SideCrossings(const Vec3& a,
                                         const Vec3& b,
                                         const SidePortals& sides,
+                                        viskores::Id component,
                                         viskores::Id& count,
                                         bool& generic,
                                         bool& complete,
@@ -1192,6 +1261,10 @@ VISKORES_EXEC inline void SideCrossings(const Vec3& a,
     },
     [&](viskores::Id f)
     {
+      if (component >= 0 && sides.SideComponents.Get(f) != component)
+      {
+        return true;
+      }
       const viskores::Id3 t = sides.SideTriangles.Get(f);
       const SegmentHit hit = SegmentTriangle(
         a, b, sides.Sides.Get(t[0]), sides.Sides.Get(t[1]), sides.Sides.Get(t[2]), fits);
@@ -1486,8 +1559,12 @@ struct ThickeningPortals
   using VerticalPortal = viskores::cont::ArrayHandle<viskores::Vec<Vec3, 2>>::ReadPortalType;
 
   /// Exact ray parity of `p` against the sides, as `Thickening.inside`: 1 inside T, 0 outside,
-  /// and 0 if no tried ray is generic.
-  VISKORES_EXEC bool Inside(const Vec3& p, bool& complete, bool& fits) const
+  /// and 0 if no tried ray is generic. With a `component`, against the part of the boundary
+  /// surface over that component, as `CollarThickening.inside_comp` of proofs/lib/collar.py.
+  VISKORES_EXEC bool Inside(const Vec3& p,
+                            bool& complete,
+                            bool& fits,
+                            viskores::Id component = -1) const
   {
     const Real directions[3][3] = { { 0.123, 0.317, 1.0 },
                                     { 0.711, -0.219, 0.5 },
@@ -1498,9 +1575,14 @@ struct ThickeningPortals
       const Vec3 far(p[0] + rayLength * directions[r][0],
                      p[1] + rayLength * directions[r][1],
                      p[2] + rayLength * directions[r][2]);
+      if (component >= 0 && far[2] <= this->Top)
+      {
+        // The far end must lie above every stored point.
+        continue;
+      }
       viskores::Id count;
       bool generic;
-      thickening_detail::SideCrossings(p, far, *this, count, generic, complete, fits);
+      thickening_detail::SideCrossings(p, far, *this, component, count, generic, complete, fits);
       if (generic)
       {
         return count % 2 == 1;
@@ -1690,6 +1772,8 @@ struct ThickeningPortals
   VecPortal FibreDirection;
   HierarchyPortal FibreHierarchy;
   bool Fibres = false;
+  IdPortal SideComponents;
+  Real Top = 0;
 };
 
 struct ThickeningObject : viskores::cont::ExecutionObjectBase
@@ -1715,6 +1799,8 @@ struct ThickeningObject : viskores::cont::ExecutionObjectBase
     portals.FibreDirection = this->Source->FibreDirection.PrepareForInput(device, token);
     portals.FibreHierarchy = this->Source->FibreHierarchy.PrepareForExecution(device, token);
     portals.Fibres = this->Source->Fibres;
+    portals.SideComponents = this->Source->SideComponents.PrepareForInput(device, token);
+    portals.Top = this->Source->Top;
     return portals;
   }
 
@@ -1810,7 +1896,7 @@ struct DegreeCrossings : viskores::worklet::WorkletMapField
                                 viskores::UInt8& generic) const
   {
     bool complete = true, fits = true, all = true;
-    SideCrossings(inner, outer, sides, count, all, complete, fits);
+    SideCrossings(inner, outer, sides, -1, count, all, complete, fits);
     generic = all ? 1 : 0;
     if (!complete || !fits)
     {
@@ -2630,6 +2716,11 @@ struct ThickeningRound
   viskores::cont::ArrayHandle<viskores::UInt8> InsideSecond;
   viskores::cont::ArrayHandle<viskores::Id> ProbeCrossings;
   viskores::cont::ArrayHandle<viskores::Id> ProbeNongeneric;
+  /// For an input with boundary: the smallest input vertex of every label, and the component
+  /// of the input whose part of the thickening the inside test of the label reads; empty for a
+  /// closed input.
+  viskores::cont::ArrayHandle<viskores::Id> LabelFirstVertex;
+  viskores::cont::ArrayHandle<viskores::Id> LabelComponents;
 };
 
 namespace thickening_detail
@@ -2709,20 +2800,23 @@ struct ComponentRoot : viskores::worklet::WorkletMapField
   }
 };
 
-/// Whether the generator of a label is inside T, written at the root of its component.
+/// Whether the generator of a label is inside T, written at the root of its component; for an
+/// input with boundary, inside the part of T over the input component of the label.
 struct InsideAt : viskores::worklet::WorkletMapField
 {
   using ControlSignature = void(FieldIn root,
                                 FieldIn label,
                                 WholeArrayIn generators,
+                                WholeArrayIn components,
                                 ExecObject thickening,
                                 WholeArrayOut inside);
-  using ExecutionSignature = void(_1, _2, _3, _4, _5);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6);
 
-  template <typename VecPortal, typename Thick, typename FlagPortal>
+  template <typename VecPortal, typename IdPortal, typename Thick, typename FlagPortal>
   VISKORES_EXEC void operator()(viskores::Id root,
                                 viskores::Id label,
                                 const VecPortal& generators,
+                                const IdPortal& components,
                                 const Thick& thickening,
                                 FlagPortal& inside) const
   {
@@ -2731,7 +2825,9 @@ struct InsideAt : viskores::worklet::WorkletMapField
       return;
     }
     bool complete = true, fits = true;
-    inside.Set(root, thickening.Inside(generators.Get(label), complete, fits) ? 1 : 0);
+    const viskores::Id component =
+      (components.GetNumberOfValues() > 0) ? components.Get(label) : viskores::Id(-1);
+    inside.Set(root, thickening.Inside(generators.Get(label), complete, fits, component) ? 1 : 0);
     if (!complete || !fits)
     {
       this->RaiseError("QuadricClusteringDecimation: exact evaluation out of range.");
@@ -2776,18 +2872,33 @@ struct ProbeCrossing : viskores::worklet::WorkletMapField
 } // namespace thickening_detail
 
 /// The data (F7) reads of the labelling `labels` with generators `generators` and output
-/// triangles `triangles`, as `ThickVQC.iso_pass` of proofs/lib/thick.py computes it.
+/// triangles `triangles`, as `ThickVQC.iso_pass` of proofs/lib/thick.py computes it, or for an
+/// input with boundary, `CollarThickVQC.iso_pass` of proofs/lib/collar.py.
 inline ThickeningRound PrepareThickeningRound(
   const Thickening& thickening,
   const viskores::cont::ArrayHandle<Vec3>& generators,
   const viskores::cont::ArrayHandle<viskores::Id3>& triangles,
-  viskores::Id numClusters)
+  viskores::Id numClusters,
+  const viskores::cont::ArrayHandle<viskores::Id>& labels)
 {
   using Algorithm = viskores::cont::Algorithm;
   namespace td = thickening_detail;
   viskores::cont::Invoker invoke;
   ThickeningRound round;
   const ThickeningObject thick(thickening);
+  if (thickening.VertexComponents.GetNumberOfValues() > 0)
+  {
+    // The component of a label is that of its smallest input vertex.
+    viskores::cont::ArrayHandle<viskores::Id> keys, vertices, uniqueKeys, firsts;
+    Algorithm::Copy(labels, keys);
+    Algorithm::Copy(viskores::cont::ArrayHandleIndex(labels.GetNumberOfValues()), vertices);
+    Algorithm::SortByKey(keys, vertices);
+    Algorithm::ReduceByKey(keys, vertices, uniqueKeys, firsts, viskores::Minimum());
+    round.LabelFirstVertex.AllocateAndFill(numClusters, 0);
+    invoke(ScatterValue{}, uniqueKeys, firsts, round.LabelFirstVertex);
+    invoke(
+      GatherValue{}, round.LabelFirstVertex, thickening.VertexComponents, round.LabelComponents);
+  }
   viskores::cont::ArrayHandle<viskores::Id2> edges;
   invoke(td::ComponentEdges{}, triangles, viskores::cont::make_ArrayHandleGroupVec<2>(edges));
   const viskores::cont::ArrayHandle<viskores::Id> roots = SmallestRoots(numClusters, edges);
@@ -2818,12 +2929,14 @@ inline ThickeningRound PrepareThickeningRound(
            viskores::cont::ArrayHandleIndex(numClusters),
            rootLabels,
            generators,
+           round.LabelComponents,
            thick,
            round.InsideFirst);
     invoke(td::InsideAt{},
            viskores::cont::ArrayHandleIndex(numClusters),
            round.Second,
            generators,
+           round.LabelComponents,
            thick,
            round.InsideSecond);
   }
@@ -2942,6 +3055,8 @@ struct ThickeningRoundPortals
   FlagPortal InsideSecond;
   IdPortal ProbeCrossings;
   IdPortal ProbeNongeneric;
+  IdPortal LabelFirstVertex;
+  IdPortal LabelComponents;
 };
 
 struct ThickeningRoundObject : viskores::cont::ExecutionObjectBase
@@ -2963,6 +3078,8 @@ struct ThickeningRoundObject : viskores::cont::ExecutionObjectBase
     portals.InsideSecond = this->Round->InsideSecond.PrepareForInput(device, token);
     portals.ProbeCrossings = this->Round->ProbeCrossings.PrepareForInput(device, token);
     portals.ProbeNongeneric = this->Round->ProbeNongeneric.PrepareForInput(device, token);
+    portals.LabelFirstVertex = this->Round->LabelFirstVertex.PrepareForInput(device, token);
+    portals.LabelComponents = this->Round->LabelComponents.PrepareForInput(device, token);
     return portals;
   }
 
@@ -2994,7 +3111,7 @@ inline viskores::Id ThickeningFlags(const SurfaceMesh& mesh,
   }
   ThickeningRound local;
   ThickeningRound& round = roundOut ? *roundOut : local;
-  round = PrepareThickeningRound(thickening, generators, triangles, k);
+  round = PrepareThickeningRound(thickening, generators, triangles, k, labels);
   viskores::cont::ArrayHandle<viskores::UInt8> failed;
   invoke(thickening_detail::ThickeningFailed{},
          mesh.Triangles,

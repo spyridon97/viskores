@@ -1600,8 +1600,11 @@ inline viskores::cont::ArrayHandle<viskores::UInt8> CandidateFlags(
   // (F7), on the glued output of every candidate's labelling.
   if (thickeningTest)
   {
-    const ThickeningRound round = PrepareThickeningRound(
-      *parameters.CertifiedThickening, clusters.Generators, glued, clusters.NumberOfClusters);
+    const ThickeningRound round = PrepareThickeningRound(*parameters.CertifiedThickening,
+                                                         clusters.Generators,
+                                                         glued,
+                                                         clusters.NumberOfClusters,
+                                                         clusters.Labels);
     const ThickeningRoundObject roundObject(*parameters.CertifiedThickening, round);
     // The glued output triangles at every vertex of K.
     viskores::cont::ArrayHandle<viskores::Id> appear;

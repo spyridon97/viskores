@@ -9,6 +9,7 @@
 #define viskores_worklet_quadric_clustering_MergePhase_h
 
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/Clustering.h>
+#include <viskores/filter/geometry_refinement/worklet/quadric_clustering/CollarThickening.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/CurveFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EmbeddingFlags.h>
 #include <viskores/filter/geometry_refinement/worklet/quadric_clustering/EnvelopeFlags.h>
@@ -82,6 +83,9 @@ struct MergeParameters
   EnvelopeSides Sides = EnvelopeSides::Both;
   /// The certified thickening of the flag (F7), or null without it.
   const Thickening* CertifiedThickening = nullptr;
+  /// For an input with boundary, the loops and annuli of the flag (F9) of its collared
+  /// thickening, or null.
+  const Collar* CollarLoops = nullptr;
   /// Whether candidates must keep the discrete closed-ball property; off in the geometric-only
   /// mode, where every pair of adjacent clusters is a candidate and the output is the set of
   /// simplices.
@@ -418,7 +422,16 @@ struct MergeContextPortals
         first = round.Second.Get(root);
         firstInside = round.InsideSecond.Get(root) != 0;
       }
-      inside = (first == gi) ? round.Thick.Inside(merged, complete, fits) : firstInside;
+      // For an input with boundary, the part of T over the input component of the merged
+      // cluster's smallest vertex.
+      viskores::Id component = -1;
+      if (round.LabelComponents.GetNumberOfValues() > 0)
+      {
+        component = (round.LabelFirstVertex.Get(i) < round.LabelFirstVertex.Get(j))
+          ? round.LabelComponents.Get(i)
+          : round.LabelComponents.Get(j);
+      }
+      inside = (first == gi) ? round.Thick.Inside(merged, complete, fits, component) : firstInside;
     }
     auto atI = [&](const viskores::Id3& tri) { return tri[0] == i || tri[1] == i || tri[2] == i; };
     // Whether probe p fails on the labelling with the merge: its crossings with the output
@@ -1107,6 +1120,9 @@ struct MergeContextObject : viskores::cont::ExecutionObjectBase
   EnvelopeSides Sides = EnvelopeSides::Both;
   const Thickening* CertifiedThickening = nullptr;
   const ThickeningRound* RoundThickening = nullptr;
+  /// With (F9): the loops, and what the round's labelling reads of them.
+  const Collar* CollarLoops = nullptr;
+  const CollarRound* RoundCollar = nullptr;
   MergedScale Scale;
 };
 
@@ -2849,6 +2865,18 @@ inline void EvaluateMerges(const viskores::cont::ArrayHandle<viskores::Id2>& pai
     }
   }
   invoke(detail::ClearFailed{}, failed, admissible);
+  // (F9), on the loops of the labelling with each merge.
+  if (context.CollarLoops)
+  {
+    CollarMergeTests(*context.Mesh,
+                     *context.Clusters,
+                     *context.CertifiedThickening,
+                     *context.CollarLoops,
+                     *context.RoundCollar,
+                     pairs,
+                     merged,
+                     admissible);
+  }
 }
 
 namespace detail
@@ -3448,7 +3476,7 @@ inline bool NewImproper(const SurfaceMesh& mesh,
 }
 
 /// Whether any flag in use fires on a placed labelling, evaluated in full: the discrete
-/// closed-ball property, the glue condition, (Fc), (F0), (F4), (F5), (F7) and (F8). With
+/// closed-ball property, the glue condition, (Fc), (F0), (F4), (F5), (F7), (F8) and (F9). With
 /// `bases`, (F5) tests only the triangles whose verdicts can differ from a base's
 /// (`MergeEnvelopeFlags`); with `verdicts`, its verdicts are stored there, for a caller that
 /// commits the labelling or keeps it as a base.
@@ -3612,6 +3640,18 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
     {
       return true;
     }
+    // (F9)
+    if (parameters.CollarLoops &&
+        CollarFlags(mesh,
+                    *parameters.CertifiedThickening,
+                    *parameters.CollarLoops,
+                    clusters.Labels,
+                    clusters.Generators,
+                    clusters.Sizes,
+                    flags) > 0)
+    {
+      return true;
+    }
   }
   return false;
 }
@@ -3628,7 +3668,7 @@ struct FailingItems
 };
 
 /// The clusters that the flags in use flag on a placed labelling, as `flagged_clusters` of
-/// proofs/lib/vqc.py: (F0), the glue condition, (Fc), (F4), (F5), (F7) and (F8). Returns
+/// proofs/lib/vqc.py: (F0), the glue condition, (Fc), (F4), (F5), (F7), (F8) and (F9). Returns
 /// false, with no flags, if the discrete closed-ball property fails, which Lemma
 /// "mergeindependent" excludes for a committed set of cluster merges; with `blameTopology`, for
 /// a batch of segment merges, which can break it, flags every cluster a violation names, of any
@@ -3774,6 +3814,18 @@ inline bool FlaggedClusters(const SurfaceMesh& mesh,
                  clusters.Generators,
                  clusters.Sizes,
                  other);
+      OrFlags(flags, other);
+    }
+    if (parameters.CollarLoops)
+    {
+      other.AllocateAndFill(k, 0);
+      CollarFlags(mesh,
+                  *parameters.CertifiedThickening,
+                  *parameters.CollarLoops,
+                  clusters.Labels,
+                  clusters.Generators,
+                  clusters.Sizes,
+                  other);
       OrFlags(flags, other);
     }
   }
@@ -4422,9 +4474,22 @@ void MergePhase(const SurfaceMesh& mesh,
       thickeningRound = PrepareThickeningRound(*parameters.CertifiedThickening,
                                                clusters.Generators,
                                                GlueTriangles(complex.Triangles, context.Glue),
-                                               k);
+                                               k,
+                                               clusters.Labels);
       context.CertifiedThickening = parameters.CertifiedThickening;
       context.RoundThickening = &thickeningRound;
+    }
+    CollarRound collarRound;
+    if (parameters.CollarLoops)
+    {
+      collarRound = PrepareCollarRound(mesh,
+                                       *parameters.CertifiedThickening,
+                                       *parameters.CollarLoops,
+                                       clusters.Labels,
+                                       clusters.Generators,
+                                       k);
+      context.CollarLoops = parameters.CollarLoops;
+      context.RoundCollar = &collarRound;
     }
     context.Sides = parameters.Sides;
     context.GeometricOnly = !parameters.Topological;

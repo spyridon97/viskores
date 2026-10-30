@@ -310,9 +310,13 @@ public:
     /// both.
     quadric_clustering::EnvelopeSides ErrorSides = quadric_clustering::EnvelopeSides::Both;
     /// Isotopy, an option: the flag (F7) of Theorem I, the output isotopic to the input through a
-    /// certified thickening of it (proofs/lib/thick.py). Needs a closed surface,
+    /// certified thickening of it (proofs/lib/thick.py). Needs a surface,
     /// the topological flags, (F4) and an error bound. With `Creases`, the thickening is that of
-    /// the input before the cut, and (F7) reads the glued output (Corollary "creasesiso").
+    /// the input before the cut, and (F7) reads the glued output (Corollary "creasesiso"). A
+    /// surface with boundary needs `Fibres`, and neither `Creases` nor a cut: the thickening is
+    /// that of the input extended by a collar beyond its boundary, and (F9) keeps every
+    /// boundary loop of the output over an annulus around the input loop, turning once
+    /// (Theorem B, proofs/lib/collar.py).
     ///
     /// - `Standard`: a wide thickening, offsets from three times the error bound, not capped,
     ///   and (F5) as `ErrorSides` says, so the output is within the error bound by (F5).
@@ -348,7 +352,7 @@ public:
       quadric_clustering::ThickeningDirections::Hybrid;
     /// With the thickening, the fibre flag (F8) of Theorem "fibres": every output triangle
     /// meets the fibres of the thickening transversally, in its orientation (K3). Closed inputs,
-    /// also with `Creases` (Corollary "creasesfibres").
+    /// also with `Creases` (Corollary "creasesfibres"), and inputs with boundary, with (F9).
     /// Off with the thickening when none is certified.
     bool Fibres = false;
     /// The cap `T` on the propose/commit sweeps of each assignment step, or 0 for none.
@@ -455,7 +459,7 @@ public:
     viskores::Id LloydIterations = 0;
     viskores::Id Sweeps = 0;
     /// Clusters flagged by each test over the whole loop, each counted once per round by the
-    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F4), (F5), (F7), (F8).
+    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F4), (F5), (F7), (F8), (F9).
     viskores::Id FlaggedRadius = 0;
     viskores::Id FlaggedBudget = 0;
     viskores::Id FlaggedTopology = 0;
@@ -463,6 +467,7 @@ public:
     viskores::Id FlaggedEnvelope = 0;
     viskores::Id FlaggedThickening = 0;
     viskores::Id FlaggedFibres = 0;
+    viskores::Id FlaggedLoops = 0;
     /// With the thickening: whether a certified one was found, so that (F7) ran and the output
     /// is isotopic to the input, and the rounds of halving of its offsets.
     bool ThickeningCertified = false;
@@ -568,10 +573,10 @@ public:
     const bool thickeningRequested = this->Params.Thickening != Parameters::ThickeningMode::Off;
     if (thickeningRequested &&
         (geometric || !this->Params.Topology || !this->Params.Embedding ||
-         !(this->Params.ErrorBound > 0) || !problem.empty() || this->Mesh.HasBoundary))
+         !(this->Params.ErrorBound > 0) || !problem.empty()))
     {
       throw viskores::cont::ErrorBadValue(
-        "QuadricClusteringDecimation: the thickening flag needs a closed surface, the "
+        "QuadricClusteringDecimation: the thickening flag needs a surface, the "
         "topological and embedding flags and an error bound.");
     }
     if (thickeningRequested && this->Mesh.Unoriented)
@@ -579,6 +584,13 @@ public:
       throw viskores::cont::ErrorBadValue(
         "QuadricClusteringDecimation: the thickening flag needs a consistently oriented input; "
         "no result covers a piece that is not orientable.");
+    }
+    if (thickeningRequested && this->Mesh.HasBoundary &&
+        (!this->Params.Fibres || this->Params.Creases))
+    {
+      throw viskores::cont::ErrorBadValue(
+        "QuadricClusteringDecimation: the thickening flag on a surface with boundary needs the "
+        "fibre flag, and no creases.");
     }
     if (this->Params.Fibres && !thickeningRequested)
     {
@@ -589,6 +601,8 @@ public:
     // keeps its triangles in order (Corollary "creasesiso"); without one, the default path. The
     // fast setting turns (F5) off, which (F7) then replaces.
     qc::Thickening thick;
+    qc::Collar loops;
+    const bool collared = thickeningRequested && this->Mesh.HasBoundary;
     qc::EnvelopeSides sides = this->Params.ErrorSides;
     if (thickeningRequested)
     {
@@ -600,11 +614,20 @@ public:
       {
         delta0 = this->Params.ThickeningOffset * bound;
       }
-      thick = qc::BuildThickening(
-        this->Mesh, delta0, bound, fast, asymmetric, this->Params.ThickeningDirections);
+      if (collared)
+      {
+        // Symmetric offsets only; the fibres come with it.
+        thick = qc::BuildCollaredThickening(
+          this->Mesh, delta0, bound, fast, loops, this->Params.ThickeningDirections);
+      }
+      else
+      {
+        thick = qc::BuildThickening(
+          this->Mesh, delta0, bound, fast, asymmetric, this->Params.ThickeningDirections);
+      }
       this->Diag.ThickeningCertified = thick.Valid;
       this->Diag.ThickeningHalvings = thick.Halvings;
-      if (thick.Valid && this->Params.Fibres)
+      if (thick.Valid && this->Params.Fibres && !collared)
       {
         qc::AddFibres(this->Mesh, thick);
       }
@@ -931,10 +954,22 @@ public:
           qc::FibreFlags(
             mesh, thick, clusters.Labels, clusters.Generators, clusters.Sizes, fibreFlags);
         }
+        // (F9), with them.
+        viskores::cont::ArrayHandle<viskores::UInt8> loopFlags;
+        if (collared)
+        {
+          loopFlags.AllocateAndFill(k, 0);
+          qc::CollarFlags(
+            mesh, thick, loops, clusters.Labels, clusters.Generators, clusters.Sizes, loopFlags);
+        }
         this->Diag.FlaggedThickening += qc::OrFlags(flags, thickeningFlags);
         if (thick.Fibres)
         {
           this->Diag.FlaggedFibres += qc::OrFlags(flags, fibreFlags);
+        }
+        if (collared)
+        {
+          this->Diag.FlaggedLoops += qc::OrFlags(flags, loopFlags);
         }
         timer.Stop();
         seconds.Thickening += timer.GetElapsedTime();
@@ -973,6 +1008,7 @@ public:
       merge.Budget = budget;
       merge.MaxClusterRadius = maxRadius;
       merge.CertifiedThickening = thickening ? &thick : nullptr;
+      merge.CollarLoops = (thickening && collared) ? &loops : nullptr;
       merge.Embedding = embedding;
       merge.ErrorBound = errorBound;
       merge.Sides = sides;
