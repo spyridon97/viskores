@@ -9,6 +9,7 @@
 
 set(headers
   BoundingIntervalHierarchy.h
+  BoundingVolumeHierarchy.h
   )
 
 viskores_declare_headers(${headers})
