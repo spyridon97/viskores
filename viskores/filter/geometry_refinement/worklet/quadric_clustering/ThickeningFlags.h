@@ -43,7 +43,8 @@ namespace quadric_clustering
 // the prisms over the triangles, with the stored sides B^+-_v = fl(v +- delta_v nu_v), and the
 // flag (F7) of an output, as proofs/lib/thick.py. Every decision is exact: on the stored doubles
 // by the exact orientation, and on the ends of the probes, a third of a sum of three doubles,
-// scaled by three in expansion arithmetic.
+// scaled by three in expansion arithmetic. The fibre flag (F8) (Theorem "A homeomorphism along
+// the fibres") reads the same prisms.
 
 /// A certified thickening, from `BuildThickening`.
 struct Thickening
@@ -64,6 +65,14 @@ struct Thickening
   /// The largest side of the bounding box of M, and the largest absolute coordinate involved.
   Real Span = 0;
   Real MaxAbsCoordinate = 0;
+  /// With the fibre flag (F8): the images of the tetrahedra of the vertex-ordered split of the
+  /// prisms, both layers, the images of the lower and upper ends of the vertical edge of each
+  /// (`w_tau` is their difference) and its rounded value, and a hierarchy over their boxes.
+  bool Fibres = false;
+  viskores::cont::ArrayHandle<viskores::Vec<Vec3, 4>> FibreTetrahedra;
+  viskores::cont::ArrayHandle<viskores::Vec<Vec3, 2>> FibreVertical;
+  viskores::cont::ArrayHandle<Vec3> FibreDirection;
+  viskores::worklet::spatialstructure::BoundingVolumeHierarchy FibreHierarchy;
 };
 
 /// The directions `nu` along which a thickening offsets the vertices (Proposition "When the
@@ -889,7 +898,7 @@ VISKORES_EXEC inline int FSign(const Filtered& x)
 /// What `SegmentTriangleBig` finds for the probe from `ends[0] + ends[1] + ends[2]` to
 /// `ends[3] + ends[4] + ends[5]` and the triangle `3 p`, decided in doubles where every sign it
 /// reads is certain: 0 for no hit, 1 for a generic hit, -1 if the exact test must decide. A
-/// floating-point filter: every quantity is a polynomial in the doubles given,
+/// floating-point filter as in `FibresFail`: every quantity is a polynomial in the doubles given,
 /// evaluated at most fifteen operations deep, so its computed value is within `15u / (1 - 15u)`
 /// of the same polynomial on absolute values, below `1e-14` times its computed value (Higham,
 /// "Accuracy and Stability of Numerical Algorithms", Section 3.1). With every nonzero coordinate
@@ -1215,6 +1224,253 @@ VISKORES_EXEC inline bool TrianglesMeet(const Vec3* p, const Vec3* q, bool& fits
   return false;
 }
 
+/// The exact helpers of (K3), Definition "Fibre flag".
+namespace fibres
+{
+
+VISKORES_EXEC inline bool IsZeroVector(const big::BigPoint& p)
+{
+  return big::Sign(p.X[0]) == 0 && big::Sign(p.X[1]) == 0 && big::Sign(p.X[2]) == 0;
+}
+
+/// Whether the plane orthogonal to `n` weakly separates the points `x` from the points `y`: all
+/// of `x` on one closed side, all of `y` on the other.
+VISKORES_EXEC inline bool Separates(const big::BigPoint& n,
+                                    const big::BigPoint* x,
+                                    int nx,
+                                    const big::BigPoint* y,
+                                    int ny,
+                                    bool& fits)
+{
+  big::Big vx[4], vy[4];
+  for (int i = 0; i < nx; ++i)
+  {
+    vx[i] = big::Dot(n, x[i]);
+    fits = fits && !vx[i].Overflow;
+  }
+  for (int i = 0; i < ny; ++i)
+  {
+    vy[i] = big::Dot(n, y[i]);
+    fits = fits && !vy[i].Overflow;
+  }
+  int xLow = 0, xHigh = 0, yLow = 0, yHigh = 0;
+  for (int i = 1; i < nx; ++i)
+  {
+    xLow = (big::Sign(big::Sub(vx[i], vx[xLow])) < 0) ? i : xLow;
+    xHigh = (big::Sign(big::Sub(vx[i], vx[xHigh])) > 0) ? i : xHigh;
+  }
+  for (int i = 1; i < ny; ++i)
+  {
+    yLow = (big::Sign(big::Sub(vy[i], vy[yLow])) < 0) ? i : yLow;
+    yHigh = (big::Sign(big::Sub(vy[i], vy[yHigh])) > 0) ? i : yHigh;
+  }
+  return big::Sign(big::Sub(vx[xHigh], vy[yLow])) <= 0 ||
+    big::Sign(big::Sub(vy[yHigh], vx[xLow])) <= 0;
+}
+
+/// Whether two coplanar nondegenerate triangles with plane normal `n` have intersecting
+/// relative interiors: no edge normal in the plane separates them.
+VISKORES_EXEC inline bool CoplanarInteriorsMeet(const big::BigPoint* p,
+                                                const big::BigPoint* q,
+                                                const big::BigPoint& n,
+                                                bool& fits)
+{
+  for (int which = 0; which < 2; ++which)
+  {
+    const big::BigPoint* r = (which == 0) ? p : q;
+    for (int i = 0; i < 3; ++i)
+    {
+      const big::BigPoint m = big::Cross(n, big::Sub(r[(i + 1) % 3], r[i]));
+      if (Separates(m, p, 3, q, 3, fits))
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/// Whether some plane among those `MeetsInTwoDimensions` tries certainly separates the
+/// triangle `tri` from the tetrahedron `tet` strictly, by the filter of `ProbeHitFilter`: the
+/// products with a normal are polynomials of degree three evaluated six operations deep, within
+/// `1e-14` times their absolute-value polynomials, and with every nonzero coordinate between
+/// `1e-20` and `1e20` the absolute term covers any underflow. A strict separation in exact
+/// arithmetic is a weak one.
+VISKORES_EXEC inline bool CertainlySeparated(const Vec3* tri, const Vec3* tet)
+{
+  for (int i = 0; i < 4; ++i)
+  {
+    for (int c = 0; c < 3; ++c)
+    {
+      const Real a = viskores::Abs(tet[i][c]), b = viskores::Abs(tri[i % 3][c]);
+      if ((a != 0 && !(a >= Real(1e-20) && a <= Real(1e20))) ||
+          (b != 0 && !(b >= Real(1e-20) && b <= Real(1e20))))
+      {
+        return false;
+      }
+    }
+  }
+  using F3 = Filtered[3];
+  auto value = [](Real x) { return Filtered{ x, viskores::Abs(x) }; };
+  F3 t[3], p[4];
+  for (int c = 0; c < 3; ++c)
+  {
+    for (int i = 0; i < 3; ++i)
+    {
+      t[i][c] = value(tri[i][c]);
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+      p[i][c] = value(tet[i][c]);
+    }
+  }
+  auto sub = [](const F3& x, const F3& y, F3& out)
+  {
+    for (int c = 0; c < 3; ++c)
+    {
+      out[c] = FSub(x[c], y[c]);
+    }
+  };
+  auto cross = [](const F3& x, const F3& y, F3& out)
+  {
+    out[0] = FSub(FMul(x[1], y[2]), FMul(x[2], y[1]));
+    out[1] = FSub(FMul(x[2], y[0]), FMul(x[0], y[2]));
+    out[2] = FSub(FMul(x[0], y[1]), FMul(x[1], y[0]));
+  };
+  // Every product with `n` is within `bound` of its exact value.
+  auto separates = [&](const F3& n)
+  {
+    Real tLow = std::numeric_limits<Real>::infinity(), tHigh = -tLow;
+    Real pLow = tLow, pHigh = -tLow;
+    auto extend = [&](const F3& x, Real& low, Real& high)
+    {
+      const Filtered d = FAdd(FAdd(FMul(n[0], x[0]), FMul(n[1], x[1])), FMul(n[2], x[2]));
+      const Real bound = Real(2e-14) * d.A + Real(1e-150);
+      low = viskores::Min(low, d.V - bound);
+      high = viskores::Max(high, d.V + bound);
+    };
+    for (int i = 0; i < 3; ++i)
+    {
+      extend(t[i], tLow, tHigh);
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+      extend(p[i], pLow, pHigh);
+    }
+    return tHigh < pLow || pHigh < tLow;
+  };
+  F3 e[3], u, v, n;
+  sub(t[1], t[0], e[0]);
+  sub(t[2], t[1], e[1]);
+  sub(t[0], t[2], e[2]);
+  sub(t[2], t[0], u);
+  cross(e[0], u, n);
+  if (separates(n))
+  {
+    return true;
+  }
+  const int faces[4][3] = { { 1, 2, 3 }, { 0, 2, 3 }, { 0, 1, 3 }, { 0, 1, 2 } };
+  for (const auto& f : faces)
+  {
+    sub(p[f[1]], p[f[0]], u);
+    sub(p[f[2]], p[f[0]], v);
+    cross(u, v, n);
+    if (separates(n))
+    {
+      return true;
+    }
+  }
+  const int edges[6][2] = { { 0, 1 }, { 0, 2 }, { 0, 3 }, { 1, 2 }, { 1, 3 }, { 2, 3 } };
+  for (int i = 0; i < 3; ++i)
+  {
+    for (const auto& ed : edges)
+    {
+      sub(p[ed[1]], p[ed[0]], u);
+      cross(e[i], u, n);
+      if (separates(n))
+      {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// Whether the closed triangle `tri` meets the closed tetrahedron `tet` in a set with nonempty
+/// interior relative to `tri`, a triangle in the plane of a face included, as `meets_in_2d` of
+/// proofs/lib/thick.py: the open triangle meets the open tetrahedron, or the triangle lies in
+/// the plane of a face and meets it in the interiors of both. Decided exactly by separating
+/// planes: two convex polytopes have intersecting relative interiors iff no plane among the
+/// face planes and the planes of pairs of edges weakly separates them.
+VISKORES_EXEC inline bool MeetsInTwoDimensions(const Vec3* tri, const Vec3* tet, bool& fits)
+{
+  const int faces[4][3] = { { 1, 2, 3 }, { 0, 2, 3 }, { 0, 1, 3 }, { 0, 1, 2 } };
+  auto inFacePlane = [&](const int* f)
+  {
+    return viskores::Orient3D(tet[f[0]], tet[f[1]], tet[f[2]], tri[0]) == 0 &&
+      viskores::Orient3D(tet[f[0]], tet[f[1]], tet[f[2]], tri[1]) == 0 &&
+      viskores::Orient3D(tet[f[0]], tet[f[1]], tet[f[2]], tri[2]) == 0;
+  };
+  // Outside the planes of the faces, the answer is that no plane separates them, or a
+  // degenerate triangle: a plane that certainly does settles it.
+  if (!inFacePlane(faces[0]) && !inFacePlane(faces[1]) && !inFacePlane(faces[2]) &&
+      !inFacePlane(faces[3]) && CertainlySeparated(tri, tet))
+  {
+    return false;
+  }
+  big::BigPoint t[3], p[4];
+  for (int i = 0; i < 3; ++i)
+  {
+    t[i] = big::PointOf(tri[i], 1);
+  }
+  for (int i = 0; i < 4; ++i)
+  {
+    p[i] = big::PointOf(tet[i], 1);
+  }
+  const big::BigPoint e[3] = { big::Sub(t[1], t[0]), big::Sub(t[2], t[1]), big::Sub(t[0], t[2]) };
+  const big::BigPoint nt = big::Cross(e[0], big::Sub(t[2], t[0]));
+  if (IsZeroVector(nt))
+  {
+    return false; // a degenerate triangle has no area
+  }
+  for (const auto& f : faces)
+  {
+    if (inFacePlane(f))
+    {
+      // In the plane of a face, which supports the tetrahedron.
+      const big::BigPoint q[3] = { p[f[0]], p[f[1]], p[f[2]] };
+      return CoplanarInteriorsMeet(t, q, nt, fits);
+    }
+  }
+  if (Separates(nt, t, 3, p, 4, fits))
+  {
+    return false;
+  }
+  for (const auto& f : faces)
+  {
+    const big::BigPoint n = big::Cross(big::Sub(p[f[1]], p[f[0]]), big::Sub(p[f[2]], p[f[0]]));
+    if (Separates(n, t, 3, p, 4, fits))
+    {
+      return false;
+    }
+  }
+  const int edges[6][2] = { { 0, 1 }, { 0, 2 }, { 0, 3 }, { 1, 2 }, { 1, 3 }, { 2, 3 } };
+  for (int i = 0; i < 3; ++i)
+  {
+    for (const auto& ed : edges)
+    {
+      const big::BigPoint n = big::Cross(e[i], big::Sub(p[ed[1]], p[ed[0]]));
+      if (!IsZeroVector(n) && Separates(n, t, 3, p, 4, fits))
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+} // namespace fibres
+
 } // namespace thickening_detail
 
 /// The sides of a thickening in the execution environment, and its probes.
@@ -1226,6 +1482,8 @@ struct ThickeningPortals
   using ProbePortal = viskores::cont::ArrayHandle<viskores::Vec<Vec3, 6>>::ReadPortalType;
   using HierarchyPortal =
     viskores::worklet::spatialstructure::BoundingVolumeHierarchy::ExecObjectType;
+  using TetrahedronPortal = viskores::cont::ArrayHandle<viskores::Vec<Vec3, 4>>::ReadPortalType;
+  using VerticalPortal = viskores::cont::ArrayHandle<viskores::Vec<Vec3, 2>>::ReadPortalType;
 
   /// Exact ray parity of `p` against the sides, as `Thickening.inside`: 1 inside T, 0 outside,
   /// and 0 if no tried ray is generic.
@@ -1367,6 +1625,59 @@ struct ThickeningPortals
     return meets;
   }
 
+  /// Whether the triangle `p`, in its orientation, fails (K3) of Definition "Fibre flag", as
+  /// `k3_fails` of proofs/lib/thick.py: some tetrahedron whose image it meets in two
+  /// dimensions has `det[b - a, c - a, w_tau] <= 0`. A sign the floating-point filter certifies
+  /// positive needs nothing else; the others are decided exactly.
+  VISKORES_EXEC bool FibresFail(const Vec3* p, bool& complete, bool& fits) const
+  {
+    Vec3 lo, hi;
+    TriangleBounds(p[0], p[1], p[2], lo, hi);
+    const Vec3 d1 = Sub(p[1], p[0]), d2 = Sub(p[2], p[0]);
+    const Vec3 x = Cross(d1, d2);
+    const Vec3 xbar(
+      viskores::Abs(d1[1]) * viskores::Abs(d2[2]) + viskores::Abs(d1[2]) * viskores::Abs(d2[1]),
+      viskores::Abs(d1[2]) * viskores::Abs(d2[0]) + viskores::Abs(d1[0]) * viskores::Abs(d2[2]),
+      viskores::Abs(d1[0]) * viskores::Abs(d2[1]) + viskores::Abs(d1[1]) * viskores::Abs(d2[0]));
+    bool fails = false;
+    const bool done = this->FibreHierarchy.ForEachOverlap(
+      lo,
+      hi,
+      [&](viskores::Id tau)
+      {
+        const Vec3 wf = this->FibreDirection.Get(tau);
+        const Real e = Dot(x, wf);
+        const Real ebar =
+          Dot(xbar, Vec3(viskores::Abs(wf[0]), viskores::Abs(wf[1]), viskores::Abs(wf[2])));
+        if (viskores::Abs(e) > Real(1e-14) * ebar && ebar > Real(1e-280) && e > 0)
+        {
+          return true;
+        }
+        namespace big = thickening_detail::big;
+        const viskores::Vec<Vec3, 2> vertical = this->FibreVertical.Get(tau);
+        const big::BigPoint a = big::PointOf(p[0], 1);
+        const big::BigPoint n =
+          big::Cross(big::Sub(big::PointOf(p[1], 1), a), big::Sub(big::PointOf(p[2], 1), a));
+        const big::Big sign =
+          big::Dot(n, big::Sub(big::PointOf(vertical[1], 1), big::PointOf(vertical[0], 1)));
+        fits = fits && !sign.Overflow;
+        if (big::Sign(sign) > 0)
+        {
+          return true;
+        }
+        const viskores::Vec<Vec3, 4> tet = this->FibreTetrahedra.Get(tau);
+        const Vec3 q[4] = { tet[0], tet[1], tet[2], tet[3] };
+        if (thickening_detail::fibres::MeetsInTwoDimensions(p, q, fits))
+        {
+          fails = true;
+          return false;
+        }
+        return true;
+      });
+    complete = complete && done;
+    return fails;
+  }
+
   VecPortal Sides;
   Id3Portal SideTriangles;
   HierarchyPortal SideHierarchy;
@@ -1374,6 +1685,11 @@ struct ThickeningPortals
   ProbePortal ProbePoints;
   Real Span;
   Real MaxAbsCoordinate;
+  TetrahedronPortal FibreTetrahedra;
+  VerticalPortal FibreVertical;
+  VecPortal FibreDirection;
+  HierarchyPortal FibreHierarchy;
+  bool Fibres = false;
 };
 
 struct ThickeningObject : viskores::cont::ExecutionObjectBase
@@ -1394,6 +1710,11 @@ struct ThickeningObject : viskores::cont::ExecutionObjectBase
     portals.ProbePoints = this->Source->ProbePoints.PrepareForInput(device, token);
     portals.Span = this->Source->Span;
     portals.MaxAbsCoordinate = this->Source->MaxAbsCoordinate;
+    portals.FibreTetrahedra = this->Source->FibreTetrahedra.PrepareForInput(device, token);
+    portals.FibreVertical = this->Source->FibreVertical.PrepareForInput(device, token);
+    portals.FibreDirection = this->Source->FibreDirection.PrepareForInput(device, token);
+    portals.FibreHierarchy = this->Source->FibreHierarchy.PrepareForExecution(device, token);
+    portals.Fibres = this->Source->Fibres;
     return portals;
   }
 
@@ -2192,6 +2513,110 @@ inline Thickening BuildThickening(const SurfaceMesh& mesh,
   return result;
 }
 
+namespace thickening_detail
+{
+
+/// The six tetrahedra of the vertex-ordered split of the prism over a triangle, as
+/// `prism_tets` of proofs/lib/thick.py, lower layer (from `B^-` to M) then upper layer (from M
+/// to `B^+`): their images, the images of the ends of their vertical edges, the rounded
+/// difference of these, and their boxes.
+struct FibreTetrahedra : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                WholeArrayIn points,
+                                WholeArrayIn sides,
+                                FieldOut tetrahedra,
+                                FieldOut vertical,
+                                FieldOut direction,
+                                FieldOut lower,
+                                FieldOut upper);
+  using ExecutionSignature = void(_1, _2, _3, _4, _5, _6, _7, _8);
+
+  VISKORES_CONT explicit FibreTetrahedra(viskores::Id numPoints)
+    : NumberOfPoints(numPoints)
+  {
+  }
+
+  template <typename VecPortal,
+            typename TetVec,
+            typename VerticalVec,
+            typename DirectionVec,
+            typename BoxVec>
+  VISKORES_EXEC void operator()(const viskores::Id3& t,
+                                const VecPortal& points,
+                                const VecPortal& sides,
+                                TetVec& tetrahedra,
+                                VerticalVec& vertical,
+                                DirectionVec& direction,
+                                BoxVec& lower,
+                                BoxVec& upper) const
+  {
+    const viskores::Id3 v = SortThree(t[0], t[1], t[2]);
+    // Per tetrahedron, its corners as (vertex index in v, level), and its vertical vertex.
+    const int corners[3][4][2] = { { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 2, 1 } },
+                                   { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 2, 1 } },
+                                   { { 0, 0 }, { 0, 1 }, { 1, 1 }, { 2, 1 } } };
+    const int verticals[3] = { 2, 1, 0 };
+    for (int layer = 0; layer < 2; ++layer)
+    {
+      auto at = [&](int k, int level)
+      {
+        const viskores::Id x = v[k];
+        if (layer == 0)
+        {
+          return (level == 0) ? sides.Get(this->NumberOfPoints + x) : points.Get(x);
+        }
+        return (level == 0) ? points.Get(x) : sides.Get(x);
+      };
+      for (int r = 0; r < 3; ++r)
+      {
+        const int out = 3 * layer + r;
+        viskores::Vec<Vec3, 4> tet;
+        Vec3 lo, hi;
+        for (int c = 0; c < 4; ++c)
+        {
+          tet[c] = at(corners[r][c][0], corners[r][c][1]);
+          for (int a = 0; a < 3; ++a)
+          {
+            lo[a] = (c == 0) ? tet[c][a] : viskores::Min(lo[a], tet[c][a]);
+            hi[a] = (c == 0) ? tet[c][a] : viskores::Max(hi[a], tet[c][a]);
+          }
+        }
+        tetrahedra[out] = tet;
+        const Vec3 bottom = at(verticals[r], 0), top = at(verticals[r], 1);
+        vertical[out] = viskores::Vec<Vec3, 2>(bottom, top);
+        direction[out] = Sub(top, bottom);
+        lower[out] = lo;
+        upper[out] = hi;
+      }
+    }
+  }
+
+  viskores::Id NumberOfPoints;
+};
+
+} // namespace thickening_detail
+
+/// Adds to a certified thickening of `mesh` what the fibre flag (F8) reads: the tetrahedra of
+/// the prisms, as `FibreTets` of proofs/lib/thick.py.
+inline void AddFibres(const SurfaceMesh& mesh, Thickening& thickening)
+{
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<Vec3> lower, upper;
+  invoke(thickening_detail::FibreTetrahedra(mesh.NumberOfPoints),
+         mesh.Triangles,
+         mesh.Points,
+         thickening.Sides,
+         viskores::cont::make_ArrayHandleGroupVec<6>(thickening.FibreTetrahedra),
+         viskores::cont::make_ArrayHandleGroupVec<6>(thickening.FibreVertical),
+         viskores::cont::make_ArrayHandleGroupVec<6>(thickening.FibreDirection),
+         viskores::cont::make_ArrayHandleGroupVec<6>(lower),
+         viskores::cont::make_ArrayHandleGroupVec<6>(upper));
+  thickening.FibreHierarchy =
+    viskores::worklet::spatialstructure::BoundingVolumeHierarchy(lower, upper);
+  thickening.Fibres = true;
+}
+
 /// What (F7) reads of a labelling besides its 3-label triangles: the component of the output
 /// complex of every label (its smallest label, or -1 for a label in no output triangle) and
 /// whether its first label's generator is inside T; the second smallest label of every
@@ -2578,6 +3003,67 @@ inline viskores::Id ThickeningFlags(const SurfaceMesh& mesh,
          GlueOrIdentity(glue, k),
          generators,
          ThickeningRoundObject(thickening, round),
+         failed);
+  return FlagClustersOfTriangles(mesh, labels, failed, sizes, flags);
+}
+
+namespace thickening_detail
+{
+
+/// (K3) on an input triangle: 1 if it is a 3-label triangle whose output triangle, in the
+/// orientation of the input triangle, fails.
+struct FibresFailed : viskores::worklet::WorkletMapField
+{
+  using ControlSignature = void(FieldIn triangle,
+                                WholeArrayIn labels,
+                                WholeArrayIn generators,
+                                ExecObject thickening,
+                                FieldOut failed);
+  using ExecutionSignature = _5(_1, _2, _3, _4);
+
+  template <typename IdPortal, typename VecPortal, typename Thick>
+  VISKORES_EXEC viskores::UInt8 operator()(const viskores::Id3& triangle,
+                                           const IdPortal& labels,
+                                           const VecPortal& generators,
+                                           const Thick& thickening) const
+  {
+    const viskores::Id l[3] = { labels.Get(triangle[0]),
+                                labels.Get(triangle[1]),
+                                labels.Get(triangle[2]) };
+    if (!AllDistinct(l[0], l[1], l[2]))
+    {
+      return 0;
+    }
+    const Vec3 p[3] = { generators.Get(l[0]), generators.Get(l[1]), generators.Get(l[2]) };
+    bool complete = true, fits = true;
+    const bool failed = thickening.FibresFail(p, complete, fits);
+    if (!complete || !fits)
+    {
+      this->RaiseError("QuadricClusteringDecimation: exact evaluation out of range.");
+    }
+    return failed ? 1 : 0;
+  }
+};
+
+} // namespace thickening_detail
+
+/// The fibre flag (F8) of Definition "Fibre flag": flags the clusters with at least two vertices
+/// of every 3-label input triangle whose output triangle, in the orientation of the input
+/// triangle, fails (K3) (Theorem "A homeomorphism along the fibres"). Returns the number of triangles that fail.
+inline viskores::Id FibreFlags(const SurfaceMesh& mesh,
+                               const Thickening& thickening,
+                               const viskores::cont::ArrayHandle<viskores::Id>& labels,
+                               const viskores::cont::ArrayHandle<Vec3>& generators,
+                               const viskores::cont::ArrayHandle<viskores::Id>& sizes,
+                               viskores::cont::ArrayHandle<viskores::UInt8>& flags)
+{
+  viskores::cont::Invoker invoke;
+  viskores::cont::ArrayHandle<viskores::UInt8> failed;
+  invoke(thickening_detail::FibresFailed{},
+         mesh.Triangles,
+         labels,
+         generators,
+         ThickeningObject(thickening),
          failed);
   return FlagClustersOfTriangles(mesh, labels, failed, sizes, flags);
 }

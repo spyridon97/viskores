@@ -723,9 +723,9 @@ struct CandidateThickening : viskores::worklet::WorkletMapField
   }
 };
 
-/// (F7) on the input triangles at the two glue groups of a candidate: whether one is a 3-label
-/// triangle of its labelling whose output triangle meets a side of the thickening; these are the
-/// only triangles whose output triangles change.
+/// (F7) and (F8) on the input triangles at the two glue groups of a candidate: whether one is a
+/// 3-label triangle of its labelling whose output triangle meets a side of the thickening, or,
+/// with the fibres, fails (K3); these are the only triangles whose output triangles change.
 struct IncidentThickeningFires : viskores::worklet::WorkletMapField
 {
   using ControlSignature =
@@ -754,7 +754,9 @@ struct IncidentThickeningFires : viskores::worklet::WorkletMapField
                         region.Generator(c, l[1]),
                         region.Generator(c, l[2]) };
     bool complete = true, fits = true;
-    const bool meets = round.Thick.MeetsSides(p, complete, fits);
+    // (F8): (K3) on the triangle in the orientation of its input triangle.
+    const bool meets = round.Thick.MeetsSides(p, complete, fits) ||
+      (round.Thick.Fibres && round.Thick.FibresFail(p, complete, fits));
     if (!complete || !fits)
     {
       this->RaiseError("QuadricClusteringDecimation: exact evaluation out of range.");
@@ -1350,7 +1352,7 @@ struct FiredFlag : viskores::worklet::WorkletMapField
 /// (d') at its merged group, (F0) on its moved generators, (F4) on its output triangles at the
 /// merged group, which are never inherited, (F5) on the triangles whose tests it can change, or
 /// on every triangle if it changes a scale of the test, (Fc) on the output polyline of its arc,
-/// and (F7) on its glued output.
+/// and (F7)/(F8) on its glued output.
 inline viskores::cont::ArrayHandle<viskores::UInt8> CandidateFlags(
   const SurfaceMesh& mesh,
   const DistanceMesh& inputDistance,

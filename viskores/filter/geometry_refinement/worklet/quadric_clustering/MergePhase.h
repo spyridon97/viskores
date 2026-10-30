@@ -531,7 +531,8 @@ struct MergeContextPortals
           {
             p[a] = (labels[a] == i) ? merged : this->Generators.Get(labels[a]);
           }
-          bad = !inside || round.Thick.MeetsSides(p, complete, fits);
+          bad = !inside || round.Thick.MeetsSides(p, complete, fits) ||
+            (round.Thick.Fibres && round.Thick.FibresFail(p, complete, fits));
           for (viskores::Id q = 0; q < numProbes && !bad; ++q)
           {
             if (!fails(q))
@@ -555,8 +556,8 @@ struct MergeContextPortals
   }
 
   /// The local test of a merge of Section 11.5 but for the envelope: (F0) on the merged
-  /// cluster, (F4) on the pairs with a triangle at the merged vertex, and (F7) on the 3-label
-  /// input triangles with a vertex in the merged cluster. Sets `merged` to the position of the
+  /// cluster, (F4) on the pairs with a triangle at the merged vertex, and (F7), with (F8) when
+  /// the fibres are on, on the 3-label input triangles with a vertex in the merged cluster. Sets `merged` to the position of the
   /// merged generator; a sheet cluster joining a frozen cluster leaves its generator in place.
   /// (d') of such a merge is tested by `SheetMergeGlueTest`.
   VISKORES_EXEC bool Admissible(viskores::Id i, viskores::Id j, Vec3& merged, bool& complete) const;
@@ -762,8 +763,8 @@ VISKORES_EXEC inline bool MergeContextPortals::Admissible(viskores::Id i,
       return false;
     }
   }
-  // (F7) on the 3-label triangles with a vertex in the merged cluster, on the labelling with
-  // the merge (`ThickVQC.iso_pass`).
+  // (F7), and (F8) with the fibres, on the 3-label triangles with a vertex in the merged
+  // cluster, on the labelling with the merge (`ThickVQC.iso_pass`).
   if (this->HasThickening && !this->ThickeningAdmissible(i, j, merged, complete))
   {
     return false;
@@ -3447,8 +3448,8 @@ inline bool NewImproper(const SurfaceMesh& mesh,
 }
 
 /// Whether any flag in use fires on a placed labelling, evaluated in full: the discrete
-/// closed-ball property, the glue condition, (Fc), (F0), (F4), (F5) and (F7). With `bases`,
-/// (F5) tests only the triangles whose verdicts can differ from a base's
+/// closed-ball property, the glue condition, (Fc), (F0), (F4), (F5), (F7) and (F8). With
+/// `bases`, (F5) tests only the triangles whose verdicts can differ from a base's
 /// (`MergeEnvelopeFlags`); with `verdicts`, its verdicts are stored there, for a caller that
 /// commits the labelling or keeps it as a base.
 ///
@@ -3600,6 +3601,17 @@ inline bool FlagsFire(const SurfaceMesh& mesh,
     {
       return true;
     }
+    // (F8)
+    if (parameters.CertifiedThickening->Fibres &&
+        FibreFlags(mesh,
+                   *parameters.CertifiedThickening,
+                   clusters.Labels,
+                   clusters.Generators,
+                   clusters.Sizes,
+                   flags) > 0)
+    {
+      return true;
+    }
   }
   return false;
 }
@@ -3616,7 +3628,7 @@ struct FailingItems
 };
 
 /// The clusters that the flags in use flag on a placed labelling, as `flagged_clusters` of
-/// proofs/lib/vqc.py: (F0), the glue condition, (Fc), (F4), (F5) and (F7). Returns
+/// proofs/lib/vqc.py: (F0), the glue condition, (Fc), (F4), (F5), (F7) and (F8). Returns
 /// false, with no flags, if the discrete closed-ball property fails, which Lemma
 /// "mergeindependent" excludes for a committed set of cluster merges; with `blameTopology`, for
 /// a batch of segment merges, which can break it, flags every cluster a violation names, of any
@@ -3753,6 +3765,17 @@ inline bool FlaggedClusters(const SurfaceMesh& mesh,
       items->Glue = GlueOrIdentity(glue, k);
     }
     OrFlags(flags, other);
+    if (parameters.CertifiedThickening->Fibres)
+    {
+      other.AllocateAndFill(k, 0);
+      FibreFlags(mesh,
+                 *parameters.CertifiedThickening,
+                 clusters.Labels,
+                 clusters.Generators,
+                 clusters.Sizes,
+                 other);
+      OrFlags(flags, other);
+    }
   }
   return true;
 }

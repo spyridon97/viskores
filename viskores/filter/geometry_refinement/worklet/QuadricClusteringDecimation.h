@@ -346,6 +346,11 @@ public:
     /// triangle at the vertex, and the max-min direction elsewhere.
     quadric_clustering::ThickeningDirections ThickeningDirections =
       quadric_clustering::ThickeningDirections::Hybrid;
+    /// With the thickening, the fibre flag (F8) of Theorem "fibres": every output triangle
+    /// meets the fibres of the thickening transversally, in its orientation (K3). Closed inputs,
+    /// also with `Creases` (Corollary "creasesfibres").
+    /// Off with the thickening when none is certified.
+    bool Fibres = false;
     /// The cap `T` on the propose/commit sweeps of each assignment step, or 0 for none.
     viskores::Id MaxSweeps = 0;
     /// The initial clusters. Seeds are followed by a Lloyd phase. An input cut into surfaces and
@@ -450,13 +455,14 @@ public:
     viskores::Id LloydIterations = 0;
     viskores::Id Sweeps = 0;
     /// Clusters flagged by each test over the whole loop, each counted once per round by the
-    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F4), (F5), (F7).
+    /// first test that flagged it, in the order (F0), (Fb), (F2)-(F3), (F4), (F5), (F7), (F8).
     viskores::Id FlaggedRadius = 0;
     viskores::Id FlaggedBudget = 0;
     viskores::Id FlaggedTopology = 0;
     viskores::Id FlaggedEmbedding = 0;
     viskores::Id FlaggedEnvelope = 0;
     viskores::Id FlaggedThickening = 0;
+    viskores::Id FlaggedFibres = 0;
     /// With the thickening: whether a certified one was found, so that (F7) ran and the output
     /// is isotopic to the input, and the rounds of halving of its offsets.
     bool ThickeningCertified = false;
@@ -574,6 +580,11 @@ public:
         "QuadricClusteringDecimation: the thickening flag needs a consistently oriented input; "
         "no result covers a piece that is not orientable.");
     }
+    if (this->Params.Fibres && !thickeningRequested)
+    {
+      throw viskores::cont::ErrorBadValue(
+        "QuadricClusteringDecimation: the fibre flag needs the thickening flag.");
+    }
     // With (F7), the certified thickening of the input, before a cut along its creases, which
     // keeps its triangles in order (Corollary "creasesiso"); without one, the default path. The
     // fast setting turns (F5) off, which (F7) then replaces.
@@ -593,6 +604,10 @@ public:
         this->Mesh, delta0, bound, fast, asymmetric, this->Params.ThickeningDirections);
       this->Diag.ThickeningCertified = thick.Valid;
       this->Diag.ThickeningHalvings = thick.Halvings;
+      if (thick.Valid && this->Params.Fibres)
+      {
+        qc::AddFibres(this->Mesh, thick);
+      }
       if (thick.Valid && fast)
       {
         sides = qc::EnvelopeSides::None;
@@ -908,7 +923,19 @@ public:
                             clusters.Sizes,
                             thickeningFlags,
                             this->Glue(clusters));
+        // (F8) with (F7), as one test of each triangle.
+        viskores::cont::ArrayHandle<viskores::UInt8> fibreFlags;
+        if (thick.Fibres)
+        {
+          fibreFlags.AllocateAndFill(k, 0);
+          qc::FibreFlags(
+            mesh, thick, clusters.Labels, clusters.Generators, clusters.Sizes, fibreFlags);
+        }
         this->Diag.FlaggedThickening += qc::OrFlags(flags, thickeningFlags);
+        if (thick.Fibres)
+        {
+          this->Diag.FlaggedFibres += qc::OrFlags(flags, fibreFlags);
+        }
         timer.Stop();
         seconds.Thickening += timer.GetElapsedTime();
       }
